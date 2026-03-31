@@ -1,0 +1,11 @@
+aiohttp>=3.9
+anthropic>=0.25
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv>=1.0
+structlog>=24.0
+rich>=13.7
+aiosqlite>=0.20
+feedparser>=6.0
+cryptography>=42.0
+tavily-python>=0.3  # optional, for richer news
