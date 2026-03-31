@@ -20,10 +20,10 @@ class Settings(BaseSettings):
     # Risk parameters
     min_confidence: float = 0.60        # slightly tighter than before
     min_edge_pct: float = 0.05
-    max_position_pct: float = 0.02      # 2% of portfolio per market
-    daily_loss_limit_usd: float = 50.0
-    min_trade_usd: float = 2.0
-    max_trade_usd: float = 100.0
+    max_position_pct: float = 0.10      # 10% of portfolio per market
+    daily_loss_limit_usd: float = 5.0
+    min_trade_usd: float = 1.0
+    max_trade_usd: float = 5.0
 
     scan_interval: int = 60             # seconds between scans
     top_markets_count: int = 20
@@ -47,13 +47,13 @@ class Settings(BaseSettings):
     def base_url(self) -> str:
         if self.use_demo_api:
             return "https://demo-api.kalshi.co/trade-api/v2/"
-        return "https://trading-api.kalshi.com/trade-api/v2/"
+        return "https://api.elections.kalshi.com/trade-api/v2/"
 
     @property
     def ws_url(self) -> str:
         if self.use_demo_api:
             return "wss://demo-api.kalshi.co/trade-api/ws/v2"
-        return "wss://trading-api.kalshi.com/trade-api/ws/v2"
+        return "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
     @property
     def is_live(self) -> bool:

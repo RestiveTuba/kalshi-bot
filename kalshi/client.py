@@ -53,7 +53,7 @@ class KalshiClient:
             msg.encode(),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
+                salt_length=padding.PSS.MAX_LENGTH,
             ),
             hashes.SHA256(),
         )
@@ -96,18 +96,19 @@ class KalshiClient:
         path = path.lstrip("/")
         qs = "?" + urlencode(params) if params else ""
         full_path = path + qs
-        headers = self.auth_headers("GET", "/" + full_path)
-        return await self._request("GET", full_path, headers=headers)
+        sign_path = "/trade-api/v2/" + path
+        return await self._request("GET", full_path, sign_path=sign_path)
 
     async def post(self, path: str, body: dict) -> dict[str, Any]:
         import json
         path = path.lstrip("/")
         body_str = json.dumps(body)
-        headers = self.auth_headers("POST", "/" + path, body_str)
-        return await self._request("POST", path, headers=headers, json=body)
+        sign_path = "/trade-api/v2/" + path
+        return await self._request("POST", path, sign_path=sign_path, body_str=body_str, json=body)
 
     async def _request(
-        self, method: str, path: str, *, headers: dict, json: Optional[dict] = None
+        self, method: str, path: str, *, sign_path: str,
+        body_str: str = "", json: Optional[dict] = None
     ) -> dict[str, Any]:
         session = await self._get_session()
         backoff = _BASE_BACKOFF
@@ -115,6 +116,8 @@ class KalshiClient:
 
         for attempt in range(_MAX_RETRIES):
             try:
+                # Regenerate auth headers on every attempt so the timestamp is fresh
+                headers = self.auth_headers(method, sign_path, body_str)
                 async with session.request(
                     method, path, headers=headers, json=json
                 ) as resp:

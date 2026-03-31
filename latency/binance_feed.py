@@ -1,7 +1,7 @@
 """
-latency/binance_feed.py — Real-time BTC/USDT price feed from Binance WebSocket.
+latency/binance_feed.py — Real-time BTC/USD price feed from Coinbase Advanced Trade WebSocket.
 
-Connects to Binance's public ticker stream (no API key needed).
+Uses Coinbase's public ticker stream (no API key needed, US-accessible).
 Pushes price updates every ~100ms.
 Calculates 90-second momentum to determine directional bias.
 """
@@ -13,13 +13,17 @@ import time
 from collections import deque
 from typing import Optional
 
+import ssl
+
+import certifi
 import websockets
 import structlog
 
 log = structlog.get_logger(__name__)
 
-# Binance public WebSocket — no auth required
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+# Coinbase Advanced Trade WebSocket — no auth required, not geo-blocked in US
+COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com/ws/public"
+COINBASE_PRODUCT_ID = "BTC-USD"
 
 # How many seconds of price history to keep for momentum calculation
 MOMENTUM_WINDOW_SECS = 90
@@ -29,6 +33,8 @@ MIN_MOMENTUM_PCT = 0.3
 
 
 class BinanceFeed:
+    """BTC price feed — backed by Coinbase Advanced Trade WebSocket."""
+
     def __init__(self):
         self._price: Optional[float] = None
         self._history: deque = deque()  # (timestamp, price) tuples
@@ -100,7 +106,7 @@ class BinanceFeed:
         """Start the WebSocket feed in the background."""
         self._running = True
         self._ws_task = asyncio.create_task(self._run())
-        log.info("binance_feed_starting")
+        log.info("coinbase_feed_starting", product=COINBASE_PRODUCT_ID)
 
     async def stop(self):
         self._running = False
@@ -110,19 +116,28 @@ class BinanceFeed:
                 await self._ws_task
             except asyncio.CancelledError:
                 pass
-        log.info("binance_feed_stopped")
+        log.info("coinbase_feed_stopped")
 
     async def _run(self):
         """Main WebSocket loop with auto-reconnect."""
         backoff = 1.0
         while self._running:
             try:
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
                 async with websockets.connect(
-                    BINANCE_WS_URL,
+                    COINBASE_WS_URL,
                     ping_interval=20,
                     ping_timeout=10,
+                    ssl=ssl_ctx,
                 ) as ws:
-                    log.info("binance_feed_connected")
+                    # Subscribe to ticker channel for BTC-USD
+                    subscribe_msg = json.dumps({
+                        "type": "subscribe",
+                        "product_ids": [COINBASE_PRODUCT_ID],
+                        "channel": "ticker",
+                    })
+                    await ws.send(subscribe_msg)
+                    log.info("coinbase_feed_connected", product=COINBASE_PRODUCT_ID)
                     backoff = 1.0  # reset on successful connect
                     async for raw in ws:
                         if not self._running:
@@ -130,10 +145,10 @@ class BinanceFeed:
                         self._handle_message(raw)
             except (websockets.exceptions.ConnectionClosed,
                     websockets.exceptions.WebSocketException) as exc:
-                log.warning("binance_feed_disconnected", error=str(exc),
+                log.warning("coinbase_feed_disconnected", error=str(exc),
                             reconnect_in=backoff)
             except Exception as exc:
-                log.error("binance_feed_error", error=str(exc))
+                log.error("coinbase_feed_error", error=str(exc))
 
             if self._running:
                 await asyncio.sleep(backoff)
@@ -142,15 +157,22 @@ class BinanceFeed:
     def _handle_message(self, raw: str):
         try:
             data = json.loads(raw)
-            # Binance ticker: "c" = last price, "E" = event time
-            price_str = data.get("c") or data.get("p")
-            if price_str:
-                price = float(price_str)
-                ts = time.time()
-                self._price = price
-                self._history.append((ts, price))
+            # Coinbase Advanced Trade ticker event structure:
+            # {"channel": "ticker", "events": [{"tickers": [{"price": "...", ...}]}]}
+            channel = data.get("channel")
+            if channel == "ticker":
+                for event in data.get("events", []):
+                    for ticker in event.get("tickers", []):
+                        price_str = ticker.get("price")
+                        if price_str:
+                            price = float(price_str)
+                            ts = time.time()
+                            self._price = price
+                            self._history.append((ts, price))
+                            return
+            # Also handle legacy/heartbeat/subscriptions messages silently
         except Exception as exc:
-            log.warning("binance_feed_parse_error", error=str(exc))
+            log.warning("coinbase_feed_parse_error", error=str(exc))
 
 
 # Global singleton — shared across the latency module

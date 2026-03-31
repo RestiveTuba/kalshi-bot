@@ -178,3 +178,5 @@ class GapDetector:
 
         except Exception as exc:
             log.error("gap_detector_refresh_error", error=str(exc))
+            # Back off 30s on failure so we don't hammer the API every 2 seconds
+            self._last_contract_refresh = time.time() - 270  # retry in 30s
