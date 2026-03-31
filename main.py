@@ -2,16 +2,15 @@
 main.py — Entry point for the Kalshi AI trading bot.
 
 Usage:
-    python main.py --paper          # paper mode (default, safe)
-    python main.py --live           # requires all three LIVE flags in .env
+    python main.py --paper          # paper mode (safe, no real orders)
+    python main.py --live           # live trading (requires .env flags)
     python main.py --backtest --days 30
 
-The agent loop (CLAUDE.md §"How the agent loop works"):
-    Every SCAN_INTERVAL seconds:
-      1. scanner fetches top markets by volume
-      2. feeds checks RSS / Tavily for breaking news
-      3. For each market: analyst → decision → risk_gate → (size +) order
-      4. Dashboard refreshes
+Agent loop (every SCAN_INTERVAL seconds):
+    1. scanner fetches target markets (crypto brackets + Fed/macro)
+    2. feeds checks RSS / Tavily for breaking news
+    3. For each market: analyst → decision → risk_gate → (size +) order
+    4. Dashboard refreshes every second with live spinner
 """
 from __future__ import annotations
 
@@ -27,10 +26,6 @@ from config import settings
 log = structlog.get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Kalshi AI Trading Bot")
     mode = p.add_mutually_exclusive_group()
@@ -40,10 +35,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--days", type=int, default=30, help="Days to backtest")
     return p.parse_args()
 
-
-# ---------------------------------------------------------------------------
-# Safety check before any live activity
-# ---------------------------------------------------------------------------
 
 def _check_live_safety() -> None:
     if not settings.is_live:
@@ -58,31 +49,38 @@ def _check_live_safety() -> None:
     log.warning("LIVE_TRADING_ACTIVE — real money at risk")
 
 
-# ---------------------------------------------------------------------------
-# Agent loop
-# ---------------------------------------------------------------------------
+async def _get_portfolio_value(kalshi_client) -> float:
+    """Pull real balance from Kalshi API. Falls back to $1000 if unavailable."""
+    try:
+        data = await kalshi_client.get("/portfolio/balance")
+        balance = data.get("balance", 0)
+        # Kalshi returns balance in cents
+        value = balance / 100.0
+        log.info("portfolio_balance_fetched", value=value)
+        return value if value > 0 else 1000.0
+    except Exception as exc:
+        log.warning("portfolio_balance_failed", error=str(exc))
+        return 1000.0
 
-async def agent_loop(
-    scanner,
-    analyst,
-    kalshi_client,
-    portfolio_value: float,
-    daily_trades: list,
-) -> None:
-    """Single iteration of the scan → analyse → decide → act cycle."""
+
+async def agent_loop(scanner, analyst, kalshi_client, portfolio_value_ref, daily_trades):
     from agent.decision import make_decision
     from agent.sizing import compute_size
     from data import db, feeds
     from strategy.risk_gate import approve_trade, is_kill_switch_active
     import dashboard.terminal as dash
 
-    # Kill-switch check before doing any work
     if await is_kill_switch_active():
         log.warning("kill_switch_active_skipping_scan")
         dash.set_error("KILL SWITCH ACTIVE — daily loss limit breached")
         return
 
-    # 1. Fetch top markets
+    # Refresh real portfolio balance each loop
+    portfolio_value = await _get_portfolio_value(kalshi_client)
+    portfolio_value_ref[0] = portfolio_value
+    dash.set_portfolio_value(portfolio_value)
+
+    dash.set_status("Scanning target markets...")
     try:
         markets = await scanner.top_markets()
     except Exception as exc:
@@ -93,20 +91,19 @@ async def agent_loop(
     dash.update_markets(markets)
     dash.set_error(None)
 
-    # 2. Process each market
-    for market in markets:
+    for i, market in enumerate(markets):
+        dash.set_status(f"Analysing {market.ticker} ({i+1}/{len(markets)})")
         try:
             await _process_market(
-                market=market,
-                analyst=analyst,
-                kalshi_client=kalshi_client,
-                portfolio_value=portfolio_value,
-                daily_trades=daily_trades,
+                market=market, analyst=analyst, kalshi_client=kalshi_client,
+                portfolio_value=portfolio_value, daily_trades=daily_trades
             )
         except Exception as exc:
             log.error("market_process_error", ticker=market.ticker, error=str(exc))
+        dash.increment_analysed()
 
-    # 3. Refresh dashboard P&L
+    dash.set_status(None)
+
     daily_pnl = await db.get_daily_pnl()
     daily_loss = await db.get_daily_loss()
     positions = await db.get_positions()
@@ -114,24 +111,18 @@ async def agent_loop(
 
     dash.update_portfolio(
         portfolio_value=portfolio_value,
-        starting_value=portfolio_value,   # TODO: persist starting value
+        starting_value=portfolio_value,
         daily_pnl=daily_pnl,
         total_pnl=daily_pnl,
         daily_loss=daily_loss,
         kill_switch=daily_loss >= settings.daily_loss_limit_usd,
     )
     dash.update_positions([
-        {
-            "ticker": p["ticker"],
-            "side": p["side"],
-            "qty": p["quantity"],
-            "avg_price": p["avg_price_cents"],
-            "cur_price": p["cur_price_cents"],
-        }
+        {"ticker": p["ticker"], "side": p["side"], "qty": p["quantity"],
+         "avg_price": p["avg_price_cents"], "cur_price": p["cur_price_cents"]}
         for p in positions
     ])
     for d in recent[:5]:
-        # Convert timestamp string back to datetime for the dashboard
         if isinstance(d.get("timestamp"), str):
             try:
                 d["timestamp"] = datetime.fromisoformat(d["timestamp"])
@@ -140,96 +131,67 @@ async def agent_loop(
         dash.add_decision(d)
 
 
-async def _process_market(
-    market,
-    analyst,
-    kalshi_client,
-    portfolio_value: float,
-    daily_trades: list,
-) -> None:
-    """Run the full pipeline for a single market."""
+async def _process_market(market, analyst, kalshi_client, portfolio_value, daily_trades):
     from agent.decision import make_decision
     from agent.sizing import compute_size
     from data import db, feeds
     from strategy.risk_gate import approve_trade
     import dashboard.terminal as dash
 
-    # 2a. Get news context
     news = await feeds.get_news_summary(market.title, market.ticker)
 
-    # 2b. Get orderbook (from WS cache if available, else skip)
     try:
         from kalshi import websocket as ws
         orderbook = ws.get_book(market.ticker)
     except Exception:
         orderbook = market.orderbook
 
-    # 2c. Analyst
     result = await analyst.analyse(market, news, orderbook)
     if result is None:
         log.warning("analyst_returned_none", ticker=market.ticker)
         return
 
-    # 2d. Sizing (using HOLD size = 0 as placeholder before gate)
     size = compute_size(
-        signal="BUY_YES",           # tentative; decision may flip to BUY_NO
-        probability_yes=result.probability_yes,
-        market_price=market.mid_price,
-        portfolio_value=portfolio_value,
+        signal="BUY_YES", probability_yes=result.probability_yes,
+        market_price=market.mid_price, portfolio_value=portfolio_value
     )
-
-    # 2e. Decision
     decision = make_decision(market, result, size)
 
-    # Recompute size for the actual chosen signal direction
     if decision.signal != "HOLD":
         size = compute_size(
-            signal=decision.signal,
-            probability_yes=result.probability_yes,
-            market_price=market.mid_price,
-            portfolio_value=portfolio_value,
+            signal=decision.signal, probability_yes=result.probability_yes,
+            market_price=market.mid_price, portfolio_value=portfolio_value
         )
         decision = decision.model_copy(update={"position_size_usd": size})
 
-    # 2f. Risk gate
     approved, reason = await approve_trade(decision, portfolio_value)
-    decision = decision.model_copy(
-        update={"approved": approved, "reject_reason": None if approved else reason}
-    )
+    decision = decision.model_copy(update={
+        "approved": approved,
+        "reject_reason": None if approved else reason,
+    })
 
-    # RULE: log to DB BEFORE acting, even in paper mode
     await db.log_decision(decision)
     dash.add_decision(decision.model_dump())
 
     if not approved or decision.signal == "HOLD":
         return
 
-    # 2g. Place order (paper or live)
     if settings.is_live:
         await _place_live_order(kalshi_client, market, decision)
     else:
         _record_paper_trade(market, decision, daily_trades)
 
 
-def _record_paper_trade(market, decision, daily_trades: list) -> None:
-    log.info(
-        "paper_trade",
-        ticker=market.ticker,
-        signal=decision.signal,
-        size=decision.position_size_usd,
-        prob=decision.probability_yes,
-        edge=decision.edge,
-    )
+def _record_paper_trade(market, decision, daily_trades):
+    log.info("paper_trade", ticker=market.ticker, signal=decision.signal,
+             size=decision.position_size_usd, prob=decision.probability_yes, edge=decision.edge)
     daily_trades.append(decision)
 
 
-async def _place_live_order(kalshi_client, market, decision) -> None:
-    """Place a real limit order via the Kalshi REST API."""
+async def _place_live_order(kalshi_client, market, decision):
     side = "yes" if decision.signal == "BUY_YES" else "no"
     price_cents = market.yes_bid if side == "yes" else (100 - market.yes_ask)
-    # Convert USD size to number of contracts (each contract = $1 face)
     contracts = max(1, int(decision.position_size_usd))
-
     body = {
         "ticker": market.ticker,
         "client_order_id": f"bot_{market.ticker}_{int(datetime.utcnow().timestamp())}",
@@ -238,11 +200,9 @@ async def _place_live_order(kalshi_client, market, decision) -> None:
         "side": side,
         "count": contracts,
         "yes_price": price_cents if side == "yes" else None,
-        "no_price":  price_cents if side == "no"  else None,
+        "no_price": price_cents if side == "no" else None,
     }
-    # Remove None fields
     body = {k: v for k, v in body.items() if v is not None}
-
     try:
         resp = await kalshi_client.post("/portfolio/orders", body)
         log.info("live_order_placed", ticker=market.ticker, order=resp)
@@ -250,19 +210,13 @@ async def _place_live_order(kalshi_client, market, decision) -> None:
         log.error("live_order_failed", ticker=market.ticker, error=str(exc))
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-async def main(args: argparse.Namespace) -> None:
+async def main(args):
     import structlog
-    structlog.configure(
-        processors=[
-            structlog.stdlib.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.JSONRenderer(),
-        ]
-    )
+    structlog.configure(processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ])
 
     from data import db
     from agent.analyst import Analyst
@@ -270,30 +224,27 @@ async def main(args: argparse.Namespace) -> None:
     from strategy.scanner import MarketScanner
     import dashboard.terminal as dash
 
-    # Enforce live safety gate
     if args.live:
         _check_live_safety()
-    elif not args.paper and not args.backtest:
-        # Default to paper
-        pass
 
     mode = "LIVE" if (args.live and settings.is_live) else "PAPER"
-    log.info("bot_starting", mode=mode, scan_interval=settings.scan_interval)
+    log.info("bot_starting", mode=mode, scan_interval=settings.scan_interval,
+             api="DEMO" if settings.use_demo_api else "PRODUCTION")
 
-    # Initialize DB
     await db.init_db()
 
-    # Seed portfolio snapshot for today
-    portfolio_value = 1000.0  # TODO: fetch real balance from Kalshi API
-    await db.ensure_portfolio_snapshot(portfolio_value)
-
-    # Instantiate core objects
     kalshi_client = KalshiClient()
     scanner = MarketScanner(client=kalshi_client)
     analyst = Analyst()
-    daily_trades: list = []
+    daily_trades = []
 
-    # Start WebSocket stream (non-blocking — populates orderbook cache)
+    # Pull real balance immediately
+    portfolio_value = await _get_portfolio_value(kalshi_client)
+    portfolio_value_ref = [portfolio_value]
+    await db.ensure_portfolio_snapshot(portfolio_value)
+    dash.set_portfolio_value(portfolio_value)
+
+    # Start WebSocket for real-time orderbook (production API only)
     initial_markets = await scanner.top_markets()
     tickers = [m.ticker for m in initial_markets]
     try:
@@ -308,17 +259,14 @@ async def main(args: argparse.Namespace) -> None:
         print("Backtest mode coming soon.")
         return
 
-    # Run dashboard + agent loop concurrently
+    # Dashboard runs as background task — refreshes every second
     dash_task = asyncio.create_task(dash.run(refresh_rate=1.0))
 
     try:
         while True:
             await agent_loop(
-                scanner=scanner,
-                analyst=analyst,
-                kalshi_client=kalshi_client,
-                portfolio_value=portfolio_value,
-                daily_trades=daily_trades,
+                scanner=scanner, analyst=analyst, kalshi_client=kalshi_client,
+                portfolio_value_ref=portfolio_value_ref, daily_trades=daily_trades
             )
             await asyncio.sleep(settings.scan_interval)
     except (KeyboardInterrupt, asyncio.CancelledError):

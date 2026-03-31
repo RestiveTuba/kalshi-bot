@@ -4,42 +4,39 @@ from pydantic import Field
 
 
 class Settings(BaseSettings):
-    # Kalshi credentials
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = "./kalshi_private_key.pem"
-    use_demo_api: bool = True
+    use_demo_api: bool = False          # ← PRODUCTION by default now
 
-    # Safety flags — all three required to go live
-    paper_trading: bool = True
+    paper_trading: bool = True          # still safe until you explicitly go live
     live_trading_confirmed: str = ""
     live_trading_amount_confirmed: str = ""
 
-    # Anthropic
     anthropic_api_key: str = ""
     claude_model: str = "claude-sonnet-4-20250514"
 
-    # Optional news enrichment
     tavily_api_key: str = ""
 
     # Risk parameters
-    min_confidence: float = 0.55
+    min_confidence: float = 0.60        # slightly tighter than before
     min_edge_pct: float = 0.05
-    max_position_pct: float = 0.02
+    max_position_pct: float = 0.02      # 2% of portfolio per market
     daily_loss_limit_usd: float = 50.0
     min_trade_usd: float = 2.0
     max_trade_usd: float = 100.0
 
-    # Scheduler
-    scan_interval: int = 60  # seconds
+    scan_interval: int = 60             # seconds between scans
     top_markets_count: int = 20
 
-    # RSS feeds (comma-separated)
+    # Crypto + macro news feeds for better signal on our target markets
     rss_feeds: str = (
-        "https://feeds.npr.org/1001/rss.xml,"
-        "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"
+        "https://feeds.feedburner.com/CoinDesk,"                        # crypto
+        "https://cointelegraph.com/rss,"                                # crypto
+        "https://decrypt.co/feed,"                                      # crypto
+        "https://feeds.npr.org/1001/rss.xml,"                          # general
+        "https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml"     # macro/Fed
     )
 
-    # Database
     db_path: str = "./kalshi_bot.db"
 
     class Config:
