@@ -23,7 +23,7 @@ log = structlog.get_logger(__name__)
 
 # Minimum gap (in probability points) to trigger a trade signal
 # e.g. 0.05 = Kalshi shows 50% but true prob is >55% or <45%
-MIN_GAP_PCT = 0.05
+MIN_GAP_PCT = 0.03
 
 # Poll Kalshi contracts this often (seconds)
 POLL_INTERVAL = 2.0
