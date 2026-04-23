@@ -26,41 +26,15 @@ log = structlog.get_logger(__name__)
 # Update this list periodically as markets expire and new ones open.
 # Format: Kalshi ticker string (find these at kalshi.com/markets)
 
-CRYPTO_TICKERS = [
-    # Bitcoin weekly close brackets
-    "KXBTC-24DEC3100",   # BTC above/below weekly levels
-    "KXBTC-24DEC3200",
-    "KXBTC-24DEC3300",
-    "KXBTC-24DEC3400",
-    "KXBTC-24DEC3500",
-    # Ethereum weekly
-    "KXETH-24DEC",
-    # Generic BTC/ETH markets (always active)
-    "BTCZ-24DEC",
-    "ETHZ-24DEC",
-]
+CRYPTO_TICKERS =[]
 
-FED_MACRO_TICKERS = [
-    # Fed rate decisions
-    "FED-24DEC",
-    "FEDRATE-24DEC",
-    "FEDFUNDS-24DEC",
-    # CPI / inflation
-    "CPI-24DEC",
-    "CPIM-24DEC",
-    # Jobs
-    "JOBS-24DEC",
-    "UNEMP-24DEC",
-]
+FED_MACRO_TICKERS = []
 
 # Fallback: search these series prefixes if curated tickers return no data
 SERIES_PREFIXES = [
-    "KXBTC",   # Bitcoin price brackets
-    "KXETH",   # Ethereum price brackets
-    "FED",     # Federal Reserve
-    "CPI",     # Consumer Price Index
-    "BTCZ",    # Bitcoin end-of-week
-    "ETHZ",    # Ethereum end-of-week
+    "KXBTCD",  # Bitcoin daily above/below — most liquid ($913k vol)
+    "KXETHD",  # Ethereum daily above/below — second ($136k vol)
+    "KXSOLD",  # Solana daily above/below — third ($34k vol)
 ]
 
 ALL_CURATED = CRYPTO_TICKERS + FED_MACRO_TICKERS
@@ -84,7 +58,7 @@ class MarketScanner:
 
         # If curated list returns too few (tickers expired), fall back to
         # series prefix search which is still fast (1 page per prefix)
-        if len(markets) < 10:
+        if len(markets) < 100:
             log.warning("scanner_curated_thin", count=len(markets),
                         msg="Falling back to series prefix search")
             dash.set_status("Curated thin — searching series prefixes...")
@@ -92,6 +66,8 @@ class MarketScanner:
 
         if min_volume > 0:
             markets = [m for m in markets if m.volume >= min_volume]
+        # Filter out illiquid/OTM markets - require real two-sided market
+        markets = [m for m in markets if m.yes_bid >= 5 and m.yes_ask <= 95]
 
         markets.sort(key=lambda m: m.volume, reverse=True)
         top = markets[:n]
@@ -160,15 +136,22 @@ class MarketScanner:
 
 def _parse_market(raw: dict) -> Optional[Market]:
     try:
+        yes_bid = float(raw.get("yes_bid_dollars") or raw.get("yes_bid") or 0) * 100
+        yes_ask = float(raw.get("yes_ask_dollars") or raw.get("yes_ask") or 0) * 100
+        volume = float(raw.get("volume_fp") or raw.get("volume") or 0)
+        open_interest = float(raw.get("open_interest_fp") or raw.get("open_interest") or 0)
+        status = raw.get("status", "active")
+        if status == "active":
+            status = "open"
         return Market(
             ticker=raw["ticker"],
             title=raw.get("title", raw.get("subtitle", raw["ticker"])),
-            yes_bid=raw.get("yes_bid", 0),
-            yes_ask=raw.get("yes_ask", 0),
-            volume=float(raw.get("volume", 0)),
-            open_interest=float(raw.get("open_interest", 0)),
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            volume=volume,
+            open_interest=open_interest,
             close_time=raw.get("close_time"),
-            status=raw.get("status", "open"),
+            status=status,
         )
     except Exception as exc:
         log.warning("scanner_parse_error", ticker=raw.get("ticker"), error=str(exc))

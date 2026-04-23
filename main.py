@@ -18,6 +18,8 @@ from datetime import datetime
 
 import structlog
 
+from paper_tracker import PaperTracker
+
 from config import settings
 
 log = structlog.get_logger(__name__)
@@ -62,7 +64,7 @@ async def _get_portfolio_value(kalshi_client) -> float:
         return 1000.0
 
 
-async def agent_loop(scanner, analyst, kalshi_client, portfolio_value_ref, daily_trades):
+async def agent_loop(scanner, analyst, kalshi_client, portfolio_value_ref, daily_trades, paper_tracker=None):
     from agent.decision import make_decision
     from agent.sizing import compute_size
     from data import db, feeds
@@ -94,11 +96,11 @@ async def agent_loop(scanner, analyst, kalshi_client, portfolio_value_ref, daily
         try:
             await _process_market(
                 market=market, analyst=analyst, kalshi_client=kalshi_client,
-                portfolio_value=portfolio_value, daily_trades=daily_trades
+                portfolio_value=portfolio_value, daily_trades=daily_trades,
+                paper_tracker=paper_tracker,
             )
         except Exception as exc:
             log.error("market_process_error", ticker=market.ticker, error=str(exc))
-        dash.increment_analysed()
 
     dash.set_status(None)
 
@@ -126,7 +128,7 @@ async def agent_loop(scanner, analyst, kalshi_client, portfolio_value_ref, daily
         dash.add_decision(d)
 
 
-async def _process_market(market, analyst, kalshi_client, portfolio_value, daily_trades):
+async def _process_market(market, analyst, kalshi_client, portfolio_value, daily_trades, paper_tracker=None):
     from agent.decision import make_decision
     from agent.sizing import compute_size
     from data import db, feeds
@@ -170,6 +172,8 @@ async def _process_market(market, analyst, kalshi_client, portfolio_value, daily
         await _place_live_order(kalshi_client, market, decision)
     else:
         daily_trades.append(decision)
+        if paper_tracker:
+            paper_tracker.add_trade(decision, market)
 
 
 async def _place_live_order(kalshi_client, market, decision):
@@ -190,6 +194,20 @@ async def _place_live_order(kalshi_client, market, decision):
 
 
 async def main(args):
+    # -- File logging (latency.log) captures all structlog output --------
+    import logging as _logging
+    import logging.handlers as _handlers
+    import os as _os
+    _log_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "latency.log")
+    _fh = _handlers.RotatingFileHandler(
+        _log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _fh.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _logging.root.addHandler(_fh)
+    if _logging.root.level == _logging.WARNING or _logging.root.level == 0:
+        _logging.root.setLevel(_logging.INFO)
+    print(f"Latency log: {_log_path}")
+    # ---------------------------------------------------------------------
     structlog.configure(processors=[
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
@@ -220,6 +238,8 @@ async def main(args):
 
     # ── Dashboard task ────────────────────────────────────────────────────────
     tasks.append(asyncio.create_task(dash.run(refresh_rate=1.0)))
+    tasks.append(asyncio.create_task(dash.run(refresh_rate=1.0)))
+
 
     # ── Latency arb task (Path B) ─────────────────────────────────────────────
     if not args.no_latency:
@@ -234,7 +254,10 @@ async def main(args):
         scanner = MarketScanner(client=kalshi_client)
         analyst = Analyst()
         daily_trades = []
-
+        paper_tracker = PaperTracker(kalshi_client, scanner)
+        paper_tracker = PaperTracker(kalshi_client, scanner)
+        if not settings.is_live:
+            tasks.append(asyncio.create_task(paper_tracker.start()))
         initial_markets = await scanner.top_markets()
         tickers = [m.ticker for m in initial_markets]
         try:
@@ -250,6 +273,7 @@ async def main(args):
                     kalshi_client=kalshi_client,
                     portfolio_value_ref=portfolio_value_ref,
                     daily_trades=daily_trades,
+                    paper_tracker=paper_tracker,
                 )
                 await asyncio.sleep(settings.scan_interval)
 

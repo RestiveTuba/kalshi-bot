@@ -17,8 +17,8 @@ class Orderbook(BaseModel):
 class Market(BaseModel):
     ticker: str
     title: str
-    yes_bid: int = 0   # cents
-    yes_ask: int = 0
+    yes_bid: float  = 0   # cents
+    yes_ask: float = 0
     volume: float = 0.0
     open_interest: float = 0.0
     close_time: Optional[datetime] = None

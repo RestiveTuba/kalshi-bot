@@ -37,7 +37,7 @@ async def approve_trade(
         return False, reason
 
     # --- 2. Minimum edge ---
-    if abs(decision.edge) < settings.min_edge_pct:
+    if decision.edge < settings.min_edge_pct:
         reason = (
             f"edge {decision.edge:+.3f} < "
             f"min {settings.min_edge_pct:.3f}"

@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
 
     # Risk parameters
-    min_confidence: float = 0.60        # slightly tighter than before
+    min_confidence: float = 0.25        # slightly tighter than before
     min_edge_pct: float = 0.05
     max_position_pct: float = 0.10      # 10% of portfolio per market
     daily_loss_limit_usd: float = 5.0

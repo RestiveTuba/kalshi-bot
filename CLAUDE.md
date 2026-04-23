@@ -1,86 +1,64 @@
 # Kalshi AI Trading Bot — Project Status
 
-## Status: Running (needs billing credits)
+## Status: Production — Running Live
 
-The bot is fully built and operational. All modules import cleanly, the Kalshi demo API connects and authenticates, and the full agent loop runs end-to-end in paper mode.
+Both strategies are operational against the production Kalshi API (`api.elections.kalshi.com`).
+Account balance: **$10.00**. Bot is running with conservative risk params sized for this balance.
 
 ## What's Working
 
-- **All imports** — every module in `agent/`, `data/`, `kalshi/`, `strategy/`, `dashboard/` loads without errors
-- **Kalshi REST API** — authenticates with RSA-PSS, fetches markets, paginates correctly
-- **Kalshi WebSocket** — connects (401 on demo API; falls back to REST orderbook gracefully)
-- **Scanner** — fetches and sorts all open markets by volume, selects top 20
-- **Analyst** — calls Claude API per market with prompt contract below
-- **Decision + Sizing** — edge calculation, half-Kelly sizing
+- **Kalshi REST API** — RSA-PSS auth against `api.elections.kalshi.com` (migrated from `trading-api.kalshi.com`)
+- **Latency arb loop** — Coinbase WebSocket BTC/USD feed, gap detection, quarter-Kelly sizing, 2s scan cycle
+- **News-driven loop** — Claude analysis, RSS feeds, risk gate, half-Kelly sizing, 60s scan cycle
+- **Scanner** — curated ticker list (KXBTC, KXETH, FED, CPI) + series prefix fallback, ~1s scan time
+- **Dashboard** — Rich live terminal UI with spinner, status bar, P&L, positions, decisions
+- **DB** — SQLite via aiosqlite; all decisions and positions logged before acting
 - **Risk gate** — confidence, edge, exposure, and daily-loss kill-switch checks
-- **DB** — SQLite via aiosqlite; decisions, positions, and portfolio snapshots all write correctly
-- **Dashboard** — Rich live terminal UI runs as async task alongside the trading loop
-- **Paper trading** — fully wired; no real orders placed
 
-## Blocking Issue
+## Known Issues / Watch Points
 
-**Anthropic account has no billing credits.**
-Add credits at: https://console.anthropic.com → Plans & Billing
+- **Anthropic billing** — Claude analysis requires credits at console.anthropic.com. Key is valid; add credits to enable news-driven loop.
+- **Process management** — always kill with `kill $(pgrep -f "main.py")`. The `pkill -f "python3 main.py"` pattern misses the capital-P `Python` binary on macOS and leaves zombie processes.
+- **Coinbase keepalive** — Coinbase WS drops every ~20 min with "keepalive ping timeout". Auto-reconnects cleanly; no action needed.
 
-The API key (`ANTHROPIC_API_KEY` in `.env`) is valid and authenticated. Claude calls fail with `credit balance too low`, not an auth error.
+## Two Strategies
 
-## Next Steps
-
-1. **Add billing credits** — unblocks Claude analysis immediately
-2. **Fix scanner pagination** — currently fetches all ~54k open markets to sort by volume (~2 min per scan). Limit to 200 markets per scan instead (single page). The Kalshi API doesn't support server-side sort-by-volume, so options are:
-   - Fetch one page (200 markets) and accept that they may not be the highest-volume ones
-   - Use a curated ticker list of known liquid markets
-   - Cache the full scan result and only re-paginate every N hours
-3. **WebSocket auth** — demo API returns 401 on WS upgrade; investigate correct signing path or skip WS for demo mode
-
-## How the Agent Loop Works
-
-Every `SCAN_INTERVAL` seconds (default: 60s):
-
-1. `strategy/scanner.py` — fetches top markets by volume
-2. `data/feeds.py` — checks RSS / Tavily for breaking news per market
-3. For each market:
-   - `agent/analyst.py` — calls Claude with market data + news, gets probability estimate
-   - `agent/sizing.py` — half-Kelly position size
-   - `agent/decision.py` — computes edge, picks BUY_YES / BUY_NO / HOLD
-   - `strategy/risk_gate.py` — confidence, edge, exposure, kill-switch checks
-   - `data/db.py` — logs decision to SQLite before acting
-   - Paper: logs the trade; Live: places limit order via Kalshi REST
-4. `dashboard/terminal.py` — refreshes Rich live UI
-
-## Prompt Contract (analyst.py)
-
-Claude receives:
-- Market title and ticker
-- YES bid price and percentage
-- Volume and close date
-- Recent news summary (Tavily or RSS)
-- Orderbook snapshot (top 5 levels each side)
-
-Claude returns JSON only:
-```json
-{
-  "probability_yes": 0.0–1.0,
-  "confidence": 0.0–1.0,
-  "reasoning": "≤200 chars",
-  "key_factors": ["max 3 items"],
-  "time_sensitivity": "high|medium|low"
-}
+### Path A — News-Driven (Claude)
+Runs every 60s. Requires Anthropic billing credits.
 ```
+scanner → feeds (RSS/Tavily) → analyst (Claude) → decision → risk_gate → order
+```
+
+### Path B — Latency Arb
+Runs every 2s. Fully operational now.
+```
+Coinbase WS (BTC price) → gap_detector → executor (quarter-Kelly) → order
+tracker monitors open positions for early exit
+```
+
+## Latency Module (`latency/`)
+
+| File | Purpose |
+|------|---------|
+| `latency/binance_feed.py` | Coinbase Advanced Trade WebSocket BTC/USD feed (despite filename) |
+| `latency/gap_detector.py` | Compares Coinbase momentum to Kalshi contract prices; signals gaps |
+| `latency/executor.py` | Sizes and places latency arb orders (quarter-Kelly, max $5/trade) |
+| `latency/tracker.py` | Monitors open latency positions for early profit/loss exit |
+| `latency/loop.py` | Orchestrates the 2s scan cycle |
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Entry point, arg parsing, agent loop |
+| `main.py` | Entry point; `--latency-only`, `--paper`, `--live` flags |
 | `config.py` | All settings via pydantic-settings + `.env` |
-| `kalshi/client.py` | Async REST client with RSA-PSS auth |
+| `kalshi/client.py` | Async REST client with RSA-PSS auth (MAX_LENGTH salt, fresh headers per retry) |
 | `kalshi/websocket.py` | Real-time orderbook streaming |
 | `kalshi/models.py` | `Market`, `Orderbook`, `TradeDecision` models |
 | `agent/analyst.py` | Claude API calls, JSON parsing |
 | `agent/decision.py` | Signal selection (BUY_YES/BUY_NO/HOLD) |
 | `agent/sizing.py` | Half-Kelly position sizing |
-| `strategy/scanner.py` | Market fetching and ranking |
+| `strategy/scanner.py` | Curated ticker fetch + series prefix fallback |
 | `strategy/risk_gate.py` | Pre-trade safety checks |
 | `data/db.py` | SQLite schema and query helpers |
 | `data/feeds.py` | RSS + Tavily news enrichment |
@@ -89,33 +67,41 @@ Claude returns JSON only:
 ## Running the Bot
 
 ```bash
-# Paper mode (safe, no real orders)
-python3 main.py --paper
+# Latency arb only (operational now, no Claude needed)
+kill $(pgrep -f "main.py") 2>/dev/null
+python3 main.py --latency-only
 
-# Live mode (requires all three flags in .env)
-python3 main.py --live
+# Both strategies (requires Anthropic credits)
+python3 main.py --paper    # paper mode
+python3 main.py --live     # live mode (requires all three LIVE flags in .env)
+
+# View logs
+cat /tmp/kalshi-bot.log
 ```
 
-## Environment (.env)
+## API Endpoints
 
-```
-PAPER_TRADING=true
-KALSHI_API_KEY_ID=<uuid>
-KALSHI_PRIVATE_KEY_PATH=./kalshi_private_key.pem
-USE_DEMO_API=true
-ANTHROPIC_API_KEY=<key>
-TAVILY_API_KEY=           # optional, enriches news
-LIVE_TRADING_CONFIRMED=   # set to "yes" for live
-LIVE_TRADING_AMOUNT_CONFIRMED=  # set to "yes" for live
-```
+| Environment | REST | WebSocket |
+|-------------|------|-----------|
+| Production | `https://api.elections.kalshi.com/trade-api/v2/` | `wss://api.elections.kalshi.com/trade-api/ws/v2` |
+| Demo | `https://demo-api.kalshi.co/trade-api/v2/` | `wss://demo-api.kalshi.co/trade-api/ws/v2` |
 
-## Risk Parameters (config.py defaults)
+## Risk Parameters (current)
 
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `min_confidence` | 0.55 | Skip if Claude confidence < 55% |
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `min_confidence` | 0.60 | Skip if Claude confidence < 60% |
 | `min_edge_pct` | 0.05 | Skip if edge < 5% |
-| `max_position_pct` | 2% | Max portfolio % per market |
-| `daily_loss_limit_usd` | $50 | Kill switch threshold |
-| `min_trade_usd` | $2 | Minimum order size |
-| `max_trade_usd` | $100 | Maximum order size |
+| `max_position_pct` | 10% | Max portfolio % per market |
+| `daily_loss_limit_usd` | $5 | Kill switch threshold |
+| `min_trade_usd` | $1 | Minimum order size |
+| `max_trade_usd` | $5 | Maximum order size |
+
+Latency arb module has its own limits: max $50/trade, max 3 open positions, $30 daily loss limit (independent of main risk gate).
+
+## Auth Notes
+
+- Key ID and private key must match — registered on production site (kalshi.com), not demo
+- Private key format: PKCS#1 (`BEGIN RSA PRIVATE KEY`) — both formats work via `cryptography` lib
+- Signing: RSA-PSS, SHA-256, `salt_length=MAX_LENGTH`, message = `timestamp_ms + METHOD + /trade-api/v2/path`
+- Auth headers are regenerated fresh on every retry attempt to avoid stale timestamps

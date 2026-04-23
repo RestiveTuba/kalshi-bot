@@ -30,7 +30,7 @@ POLL_INTERVAL = 2.0
 
 # Kalshi series ticker for 15-minute BTC contracts
 # Adjust if Kalshi changes their ticker format
-BTC_SERIES = "KXBTC"
+BTC_SERIES = "KXBTC15M"
 
 
 @dataclass
@@ -147,36 +147,50 @@ class GapDetector:
         )
 
     async def _refresh_contracts(self):
-        """Fetch active 15-minute BTC contracts from Kalshi."""
+        """Fetch currently open 15-minute BTC contracts from Kalshi."""
         try:
+            from datetime import datetime, timezone
             params = {
                 "series_ticker": BTC_SERIES,
-                "status": "open",
-                "limit": 50,
+                "limit": 100,
             }
             data = await self._client.get("/markets", params=params)
             markets = data.get("markets", [])
 
-            # Filter to short-duration contracts only
-            # These have "15" or "1H" in their ticker or title
-            short_duration = []
-            for m in markets:
-                ticker = m.get("ticker", "")
-                title = m.get("title", "").lower()
-                # Include markets that resolve within ~2 hours
-                if any(x in ticker.upper() for x in ["15", "1H", "30"]):
-                    short_duration.append(m)
-                elif "15 minute" in title or "15min" in title or "1 hour" in title:
-                    short_duration.append(m)
+            def parse_dt(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except Exception:
+                    return None
 
-            # If filter is too aggressive, take all BTC contracts
-            self._active_contracts = short_duration if short_duration else markets[:10]
+            now = datetime.now(timezone.utc)
+            # Select markets currently open: open_time <= now < close_time
+            active = [
+                m for m in markets
+                if parse_dt(m.get("open_time")) is not None
+                and parse_dt(m.get("open_time")) <= now
+                and parse_dt(m.get("close_time")) is not None
+                and parse_dt(m.get("close_time")) > now
+            ]
+            # Normalise price fields: API returns *_dollars; convert to cents
+            for m in active:
+                for field, dollars_field in [("yes_bid", "yes_bid_dollars"),
+                                              ("yes_ask", "yes_ask_dollars"),
+                                              ("no_bid",  "no_bid_dollars"),
+                                              ("no_ask",  "no_ask_dollars")]:
+                    if field not in m and dollars_field in m:
+                        try:
+                            m[field] = float(m[dollars_field]) * 100
+                        except (TypeError, ValueError):
+                            m[field] = 0
+
+            self._active_contracts = active
             self._last_contract_refresh = time.time()
-
             log.info("gap_detector_contracts_refreshed",
-                     total=len(markets), short_duration=len(self._active_contracts))
-
+                     total=len(markets), active=len(active))
         except Exception as exc:
             log.error("gap_detector_refresh_error", error=str(exc))
-            # Back off 30s on failure so we don't hammer the API every 2 seconds
+            # Back off 30s on failure
             self._last_contract_refresh = time.time() - 270  # retry in 30s
