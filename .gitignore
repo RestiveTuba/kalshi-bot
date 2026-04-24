@@ -4,3 +4,12 @@ __pycache__/
 *.pyc
 *.db
 .DS_Store
+
+# Runtime logs
+bot.log
+latency.log
+momentum.log
+momentum.log.1
+
+# Generated backtest output
+backtest_trades.jsonl
