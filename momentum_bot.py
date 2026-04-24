@@ -21,6 +21,7 @@ import asyncio
 import json
 import sys
 import os
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -81,6 +82,9 @@ MIN_SECS_FOR_ENTRY     = 90     # only enter if >= 90s remain (avoids gap-risk n
 MAX_TRADES_PER_SESSION = 3      # cap per series per 15-min window
 CONTRACTS              = 1
 PAPER_MODE             = True   # always True until you explicitly flip
+
+MOMENTUM_HISTORY_LEN   = 90     # deque entries; 90 × 700ms ≈ 63s of price history
+CORR_WINDOW_SECS       = 2.0    # two series must both signal within this window to confirm
 
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
@@ -347,6 +351,11 @@ class SessionState:
     trade_count: int = 0                   # trades completed this session
     session_trades_entered: int = 0        # entries taken this session (for cap)
     active: bool = False
+    # Momentum detection: rolling price history for crossing filter
+    yes_bid_history: deque = field(default_factory=lambda: deque(maxlen=MOMENTUM_HISTORY_LEN))
+    no_bid_history:  deque = field(default_factory=lambda: deque(maxlen=MOMENTUM_HISTORY_LEN))
+    # Correlation filter: True while waiting for a second series to confirm
+    corr_waiting: bool = False
 
 
 def _close_position(
@@ -394,6 +403,43 @@ def _close_position(
 
 
 # ---------------------------------------------------------------------------
+# Momentum detection helpers
+# ---------------------------------------------------------------------------
+
+def _has_crossed_up(history: deque, threshold: float) -> bool:
+    """
+    Return True if price has recently crossed UP through threshold.
+    Requires: current price >= threshold  AND  min of history < threshold.
+    This distinguishes a fresh breakout from a price that has been sitting
+    above threshold the whole time.
+    """
+    if len(history) < 2:
+        return False
+    return min(history) < threshold
+
+
+# ---------------------------------------------------------------------------
+# Correlation filter (shared mutable state — safe under asyncio single-thread)
+# ---------------------------------------------------------------------------
+
+# series -> (side: "YES"|"NO", unix_ts: float)
+_pending_signals: dict[str, tuple[str, float]] = {}
+
+
+def _register_signal(series: str, side: str) -> None:
+    _pending_signals[series] = (side, time.time())
+
+
+def _check_correlation(series: str, side: str) -> bool:
+    """Return True if ≥1 OTHER series has the same side signal within CORR_WINDOW_SECS."""
+    now = time.time()
+    for s, (sig_side, sig_ts) in _pending_signals.items():
+        if s != series and sig_side == side and (now - sig_ts) <= CORR_WINDOW_SECS:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Core momentum logic per series
 # ---------------------------------------------------------------------------
 
@@ -435,6 +481,10 @@ async def run_series(client: _SimpleClient, series: str):
                 state.session_pnl = 0.0
                 state.active = False
                 state.session_trades_entered = 0
+                state.yes_bid_history.clear()
+                state.no_bid_history.clear()
+                state.corr_waiting = False
+                _pending_signals.pop(series, None)
                 log.info(f"[{series}] New session: {ticker}")
 
             secs_left = seconds_until_close(raw)
@@ -442,6 +492,11 @@ async def run_series(client: _SimpleClient, series: str):
             yes_bid, yes_ask = parse_prices(raw)
             no_bid = 100.0 - yes_ask
             no_ask = 100.0 - yes_bid
+
+            # Always feed price history (even outside activation window) so
+            # the crossing filter has context when the window opens.
+            state.yes_bid_history.append(yes_bid)
+            state.no_bid_history.append(no_bid)
 
             # Activation window check
             in_window = (
@@ -516,33 +571,65 @@ async def run_series(client: _SimpleClient, series: str):
                         f"[{ts}] [{series}] NO ENTRY — below min secs floor "
                         f"({secs_left:.0f}s < {MIN_SECS_FOR_ENTRY}s)"
                     )
-                elif yes_bid >= ENTRY_THRESHOLD:
-                    state.position_side = "YES"
-                    state.entry_price = yes_bid
-                    state.entry_time = datetime.now(timezone.utc).isoformat()
-                    state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                    state.session_trades_entered += 1
-                    log.info(
-                        f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
-                        f"[{'PAPER' if PAPER_MODE else 'LIVE'}] | "
-                        f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                        f"{mins_left:.1f} min left"
-                    )
-                elif no_bid >= ENTRY_THRESHOLD:
-                    state.position_side = "NO"
-                    state.entry_price = no_bid
-                    state.entry_time = datetime.now(timezone.utc).isoformat()
-                    state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                    state.session_trades_entered += 1
-                    log.info(
-                        f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
-                        f"[{'PAPER' if PAPER_MODE else 'LIVE'}] | "
-                        f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                        f"{mins_left:.1f} min left"
-                    )
+                elif yes_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.yes_bid_history, ENTRY_THRESHOLD):
+                    # Momentum confirmed (price crossed up recently) — check correlation
+                    _register_signal(series, "YES")
+                    if _check_correlation(series, "YES"):
+                        state.position_side = "YES"
+                        state.entry_price = yes_bid
+                        state.entry_time = datetime.now(timezone.utc).isoformat()
+                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
+                        state.session_trades_entered += 1
+                        state.corr_waiting = False
+                        _pending_signals.pop(series, None)
+                        log.info(
+                            f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
+                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR] | "
+                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
+                            f"{mins_left:.1f} min left"
+                        )
+                    else:
+                        if not state.corr_waiting:
+                            log.info(
+                                f"[{ts}] [{series}] YES {yes_bid:.0f}c "
+                                f"[MOM ✓ | awaiting correlation] | {mins_left:.1f} min left"
+                            )
+                            state.corr_waiting = True
+                elif no_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.no_bid_history, ENTRY_THRESHOLD):
+                    # Momentum confirmed for NO side
+                    _register_signal(series, "NO")
+                    if _check_correlation(series, "NO"):
+                        state.position_side = "NO"
+                        state.entry_price = no_bid
+                        state.entry_time = datetime.now(timezone.utc).isoformat()
+                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
+                        state.session_trades_entered += 1
+                        state.corr_waiting = False
+                        _pending_signals.pop(series, None)
+                        log.info(
+                            f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
+                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR] | "
+                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
+                            f"{mins_left:.1f} min left"
+                        )
+                    else:
+                        if not state.corr_waiting:
+                            log.info(
+                                f"[{ts}] [{series}] NO {no_bid:.0f}c "
+                                f"[MOM ✓ | awaiting correlation] | {mins_left:.1f} min left"
+                            )
+                            state.corr_waiting = True
                 else:
+                    # No signal or price not a fresh cross — clear pending state
+                    _pending_signals.pop(series, None)
+                    state.corr_waiting = False
+                    no_cross_note = (
+                        " (sitting, no fresh cross)"
+                        if (yes_bid >= ENTRY_THRESHOLD or no_bid >= ENTRY_THRESHOLD)
+                        else ""
+                    )
                     log.info(
-                        f"[{ts}] [{series}] WATCHING | YES bid={yes_bid:.0f}c "
+                        f"[{ts}] [{series}] WATCHING{no_cross_note} | YES bid={yes_bid:.0f}c "
                         f"NO bid={no_bid:.0f}c | {mins_left:.1f} min left"
                     )
             else:
@@ -575,6 +662,8 @@ async def main():
     stop_desc = f"{STOP_LOSS_THRESHOLD}c" if STOP_LOSS_THRESHOLD is not None else "disabled"
     log.info(f"Poll: {POLL_INTERVAL_S*1000:.0f}ms | Entry: {ENTRY_THRESHOLD}c | Stop: {stop_desc} | Min secs: {MIN_SECS_FOR_ENTRY}s")
     log.info(f"Hard close: {HARD_CLOSE_SECS}s before expiry | Session cap: {MAX_TRADES_PER_SESSION} entries/series")
+    log.info(f"Momentum filter: crossing detection over {MOMENTUM_HISTORY_LEN} polls (~{MOMENTUM_HISTORY_LEN*POLL_INTERVAL_S:.0f}s window)")
+    log.info(f"Correlation filter: requires 2-of-3 series same direction within {CORR_WINDOW_SECS}s")
     log.info(f"Activation window: last {ACTIVATE_MINS_BEFORE_CLOSE} min of each 15-min contract")
     log.info(f"Trade log: {_TRADE_LOG_PATH}")
     log.info("=" * 60)
