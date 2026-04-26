@@ -75,7 +75,7 @@ def _write_trade_record(record: dict) -> None:
 SERIES = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 POLL_INTERVAL_S        = 0.70   # 700 ms
 ACTIVATE_MINS_BEFORE_CLOSE = 8
-ENTRY_THRESHOLD        = 92     # cents — raised from 85 (500-session backtest)
+ENTRY_THRESHOLD        = 87     # cents — lowered from 92; live data shows best trades entered at 86-89¢
 STOP_LOSS_THRESHOLD    = None   # disabled — no stop-loss (500-session backtest)
 HARD_CLOSE_SECS        = 30     # exit any open position with this many seconds left
 MIN_SECS_FOR_ENTRY     = 90     # only enter if >= 90s remain (avoids gap-risk near expiry)
@@ -84,7 +84,7 @@ CONTRACTS              = 1
 PAPER_MODE             = True   # always True until you explicitly flip
 
 MOMENTUM_HISTORY_LEN   = 90     # deque entries; 90 × 700ms ≈ 63s of price history
-CORR_WINDOW_SECS       = 2.0    # two series must both signal within this window to confirm
+CORR_WINDOW_SECS       = 90.0   # two series must both signal within this window to confirm (live data: signals stagger ~125s)
 
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
