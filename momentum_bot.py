@@ -85,6 +85,7 @@ PAPER_MODE             = True   # always True until you explicitly flip
 
 MOMENTUM_HISTORY_LEN   = 90     # deque entries; 90 × 700ms ≈ 63s of price history
 CORR_WINDOW_SECS       = 90.0   # two series must both signal within this window to confirm (live data: signals stagger ~125s)
+TRAILING_STOP_CENTS    = 5.0    # exit if price drops >5¢ below the highest price seen since entry
 
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
@@ -356,6 +357,8 @@ class SessionState:
     no_bid_history:  deque = field(default_factory=lambda: deque(maxlen=MOMENTUM_HISTORY_LEN))
     # Correlation filter: True while waiting for a second series to confirm
     corr_waiting: bool = False
+    # Trailing stop: highest price seen since entry; stop fires if price drops >TRAILING_STOP_CENTS below this
+    peak_price: float = 0.0
 
 
 def _close_position(
@@ -399,6 +402,7 @@ def _close_position(
     state.entry_price = 0.0
     state.entry_time = ""
     state.entry_secs_left = 0.0
+    state.peak_price = 0.0
     return pnl
 
 
@@ -534,15 +538,20 @@ async def run_series(client: _SimpleClient, series: str):
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
 
-            # ── Stop-loss check (disabled when STOP_LOSS_THRESHOLD is None) ──
-            if STOP_LOSS_THRESHOLD is not None and state.position_side is not None:
+            # ── Trailing stop (5¢ from peak price since entry) ────────────────
+            if state.position_side is not None:
                 held_price = yes_bid if state.position_side == "YES" else no_bid
-                if held_price < STOP_LOSS_THRESHOLD:
-                    pnl = _close_position(state, held_price, "STOP_LOSS", secs_left)
+                # Ratchet peak up whenever price improves
+                if held_price > state.peak_price:
+                    state.peak_price = held_price
+                trail_level = state.peak_price - TRAILING_STOP_CENTS
+                if held_price < trail_level:
+                    pnl = _close_position(state, held_price, "TRAIL_STOP", secs_left)
                     log.warning(
-                        f"[{ts}] [{series}] STOP_LOSS exit={held_price:.0f}c "
-                        f"P&L=${pnl:+.2f} | session P&L=${state.session_pnl:+.2f} | "
-                        f"trades this session: {state.trade_count}"
+                        f"[{ts}] [{series}] TRAIL_STOP "
+                        f"held={held_price:.0f}c peak={state.peak_price:.0f}c "
+                        f"level={trail_level:.0f}c P&L=${pnl:+.2f} | "
+                        f"session P&L=${state.session_pnl:+.2f}"
                     )
                     await asyncio.sleep(POLL_INTERVAL_S)
                     continue
@@ -577,6 +586,7 @@ async def run_series(client: _SimpleClient, series: str):
                     if _check_correlation(series, "YES"):
                         state.position_side = "YES"
                         state.entry_price = yes_bid
+                        state.peak_price = yes_bid
                         state.entry_time = datetime.now(timezone.utc).isoformat()
                         state.entry_secs_left = secs_left if secs_left is not None else 0.0
                         state.session_trades_entered += 1
@@ -601,6 +611,7 @@ async def run_series(client: _SimpleClient, series: str):
                     if _check_correlation(series, "NO"):
                         state.position_side = "NO"
                         state.entry_price = no_bid
+                        state.peak_price = no_bid
                         state.entry_time = datetime.now(timezone.utc).isoformat()
                         state.entry_secs_left = secs_left if secs_left is not None else 0.0
                         state.session_trades_entered += 1
