@@ -98,6 +98,10 @@ BLOCKED_UTC_HOURS      = {12, 13, 20, 21, 22, 23}
 # Directional filter: look back this many seconds on BTC/USD to confirm direction
 DIRECTION_WINDOW_SECS  = 60.0   # BTC must have moved UP (for YES) or DOWN (for NO) in last 60s
 
+# Risk controls — no external data needed
+DAILY_LOSS_LIMIT_USD   = 1.50   # halt ALL new entries if today's realized P&L drops below -$1.50
+SESSION_HALT_MIN_LOSS  = 0.05   # any single loss ≥ 5¢ sets session_halted on that series
+
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
 #   Entry 85¢, no stop          → win rate 90.8%, Sharpe -1.92, total P&L -$1.39
@@ -382,6 +386,8 @@ class SessionState:
     # Trailing stop: highest price seen since entry; stop fires if price drops >TRAILING_STOP_CENTS below this
     peak_price: float = 0.0
     last_held_price: float = 0.0
+    # Session halt: set True after a losing trade so we don't compound losses in the same window
+    session_halted: bool = False
 
 
 def _close_position(
@@ -427,6 +433,18 @@ def _close_position(
     state.entry_secs_left = 0.0
     state.peak_price = 0.0
     state.last_held_price = 0.0
+
+    # Halt re-entry in this session after any non-trivial loss
+    if pnl < -SESSION_HALT_MIN_LOSS:
+        state.session_halted = True
+
+    # Release global position lock for this series
+    _open_positions.discard(state.series)
+
+    # Track daily realized P&L for circuit breaker
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _daily_pnl[today] = _daily_pnl.get(today, 0.0) + pnl
+
     return pnl
 
 
@@ -444,7 +462,9 @@ def _reset_session_state(state: SessionState) -> None:
     state.corr_waiting = False
     state.peak_price = 0.0
     state.last_held_price = 0.0
+    state.session_halted = False
     _pending_signals.pop(state.series, None)
+    _open_positions.discard(state.series)
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +489,18 @@ def _has_crossed_up(history: deque, threshold: float) -> bool:
 
 # series -> (side: "YES"|"NO", unix_ts: float)
 _pending_signals: dict[str, tuple[str, float]] = {}
+
+# Global position lock: tracks which series currently hold an open position.
+# asyncio is single-threaded, so this set requires no locks.
+_open_positions: set[str] = set()
+
+# Daily realized P&L tracker for circuit breaker (date_str -> cumulative dollars)
+_daily_pnl: dict[str, float] = {}
+
+
+def _get_today_pnl() -> float:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _daily_pnl.get(today, 0.0)
 
 
 def _register_signal(series: str, side: str) -> None:
@@ -634,6 +666,21 @@ async def run_series(client: _SimpleClient, series: str):
                         f"[{ts}] [{series}] ENTRY BLOCKED — outside safe trading window "
                         f"(UTC {datetime.now(timezone.utc).hour:02d}:xx)"
                     )
+                elif state.session_halted:
+                    log.info(
+                        f"[{ts}] [{series}] ENTRY BLOCKED — session halted after loss "
+                        f"(resets next 15-min window) | {mins_left:.1f} min left"
+                    )
+                elif _get_today_pnl() <= -DAILY_LOSS_LIMIT_USD:
+                    log.warning(
+                        f"[{ts}] [{series}] ENTRY BLOCKED — daily loss limit "
+                        f"(today P&L ${_get_today_pnl():+.2f} ≤ −${DAILY_LOSS_LIMIT_USD:.2f})"
+                    )
+                elif _open_positions:
+                    log.info(
+                        f"[{ts}] [{series}] ENTRY BLOCKED — global position lock "
+                        f"(already in: {sorted(_open_positions)}) | {mins_left:.1f} min left"
+                    )
                 elif yes_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.yes_bid_history, ENTRY_THRESHOLD):
                     # Directional filter: BTC must be rising to justify a YES entry
                     _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
@@ -655,6 +702,7 @@ async def run_series(client: _SimpleClient, series: str):
                             state.session_trades_entered += 1
                             state.corr_waiting = False
                             _pending_signals.pop(series, None)
+                            _open_positions.add(series)
                             log.info(
                                 f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
                                 f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR+DIR] | "
@@ -689,6 +737,7 @@ async def run_series(client: _SimpleClient, series: str):
                             state.session_trades_entered += 1
                             state.corr_waiting = False
                             _pending_signals.pop(series, None)
+                            _open_positions.add(series)
                             log.info(
                                 f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
                                 f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR+DIR] | "
@@ -751,6 +800,9 @@ async def main():
     log.info(f"Time-of-day filter: BLOCKED UTC hours = {sorted(BLOCKED_UTC_HOURS)}")
     log.info(f"Directional filter: BTC must confirm direction over last {DIRECTION_WINDOW_SECS:.0f}s "
              f"| feed available: {_BTC_FEED_AVAILABLE}")
+    log.info(f"Risk controls: global position lock (max 1 open) | "
+             f"session halt after >{SESSION_HALT_MIN_LOSS*100:.0f}c loss | "
+             f"daily circuit breaker at −${DAILY_LOSS_LIMIT_USD:.2f}")
     log.info(f"Trade log: {_TRADE_LOG_PATH}")
     log.info("=" * 60)
 
