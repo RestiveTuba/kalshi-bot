@@ -92,6 +92,12 @@ MOMENTUM_HISTORY_LEN   = 90     # deque entries; 90 × 700ms ≈ 63s of price hi
 CORR_WINDOW_SECS       = 90.0   # two series must both signal within this window to confirm (live data: signals stagger ~125s)
 TRAILING_STOP_CENTS    = 5.0    # exit if price drops >5¢ below the highest price seen since entry
 
+# Time-of-day filter (live data: 12–14 UTC and 20–23 UTC are loss-dominated)
+BLOCKED_UTC_HOURS      = {12, 13, 20, 21, 22, 23}
+
+# Directional filter: look back this many seconds on BTC/USD to confirm direction
+DIRECTION_WINDOW_SECS  = 60.0   # BTC must have moved UP (for YES) or DOWN (for NO) in last 60s
+
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
 #   Entry 85¢, no stop          → win rate 90.8%, Sharpe -1.92, total P&L -$1.39
@@ -112,6 +118,17 @@ from urllib.parse import urlencode
 import ssl
 import aiohttp
 import certifi
+
+# Optional BTC directional feed — used for entry direction filter
+try:
+    from latency.binance_feed import get_direction as _get_btc_direction
+    from latency.binance_feed import start as _start_btc_feed, stop as _stop_btc_feed
+    _BTC_FEED_AVAILABLE = True
+except ImportError:
+    _BTC_FEED_AVAILABLE = False
+    def _get_btc_direction(window_secs: float = 60.0) -> str: return "NEUTRAL"  # type: ignore[misc]
+    async def _start_btc_feed() -> None: pass  # type: ignore[misc]
+    async def _stop_btc_feed() -> None: pass  # type: ignore[misc]
 
 _MAX_RETRIES = 3
 _BASE_BACKOFF = 0.5
@@ -612,58 +629,79 @@ async def run_series(client: _SimpleClient, series: str):
                         f"[{ts}] [{series}] NO ENTRY — below min secs floor "
                         f"({secs_left:.0f}s < {MIN_SECS_FOR_ENTRY}s)"
                     )
+                elif datetime.now(timezone.utc).hour in BLOCKED_UTC_HOURS:
+                    log.info(
+                        f"[{ts}] [{series}] ENTRY BLOCKED — outside safe trading window "
+                        f"(UTC {datetime.now(timezone.utc).hour:02d}:xx)"
+                    )
                 elif yes_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.yes_bid_history, ENTRY_THRESHOLD):
-                    # Momentum confirmed (price crossed up recently) — check correlation
-                    _register_signal(series, "YES")
-                    if _check_correlation(series, "YES"):
-                        state.position_side = "YES"
-                        state.entry_price = yes_bid
-                        state.peak_price = yes_bid
-                        state.last_held_price = yes_bid
-                        state.entry_time = datetime.now(timezone.utc).isoformat()
-                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                        state.session_trades_entered += 1
-                        state.corr_waiting = False
-                        _pending_signals.pop(series, None)
+                    # Directional filter: BTC must be rising to justify a YES entry
+                    _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
+                    if _btc_dir != "UP":
                         log.info(
-                            f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
-                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR] | "
-                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                            f"{mins_left:.1f} min left"
+                            f"[{ts}] [{series}] ENTRY BLOCKED — directional filter "
+                            f"(YES needs BTC UP, got {_btc_dir})"
                         )
                     else:
-                        if not state.corr_waiting:
+                        # Momentum confirmed (price crossed up recently) — check correlation
+                        _register_signal(series, "YES")
+                        if _check_correlation(series, "YES"):
+                            state.position_side = "YES"
+                            state.entry_price = yes_bid
+                            state.peak_price = yes_bid
+                            state.last_held_price = yes_bid
+                            state.entry_time = datetime.now(timezone.utc).isoformat()
+                            state.entry_secs_left = secs_left if secs_left is not None else 0.0
+                            state.session_trades_entered += 1
+                            state.corr_waiting = False
+                            _pending_signals.pop(series, None)
                             log.info(
-                                f"[{ts}] [{series}] YES {yes_bid:.0f}c "
-                                f"[MOM ✓ | awaiting correlation] | {mins_left:.1f} min left"
+                                f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
+                                f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR+DIR] | "
+                                f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
+                                f"{mins_left:.1f} min left"
                             )
-                            state.corr_waiting = True
+                        else:
+                            if not state.corr_waiting:
+                                log.info(
+                                    f"[{ts}] [{series}] YES {yes_bid:.0f}c "
+                                    f"[MOM ✓ DIR ✓ | awaiting correlation] | {mins_left:.1f} min left"
+                                )
+                                state.corr_waiting = True
                 elif no_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.no_bid_history, ENTRY_THRESHOLD):
-                    # Momentum confirmed for NO side
-                    _register_signal(series, "NO")
-                    if _check_correlation(series, "NO"):
-                        state.position_side = "NO"
-                        state.entry_price = no_bid
-                        state.peak_price = no_bid
-                        state.last_held_price = no_bid
-                        state.entry_time = datetime.now(timezone.utc).isoformat()
-                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                        state.session_trades_entered += 1
-                        state.corr_waiting = False
-                        _pending_signals.pop(series, None)
+                    # Directional filter: BTC must be falling to justify a NO entry
+                    _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
+                    if _btc_dir != "DOWN":
                         log.info(
-                            f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
-                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR] | "
-                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                            f"{mins_left:.1f} min left"
+                            f"[{ts}] [{series}] ENTRY BLOCKED — directional filter "
+                            f"(NO needs BTC DOWN, got {_btc_dir})"
                         )
                     else:
-                        if not state.corr_waiting:
+                        # Momentum confirmed for NO side
+                        _register_signal(series, "NO")
+                        if _check_correlation(series, "NO"):
+                            state.position_side = "NO"
+                            state.entry_price = no_bid
+                            state.peak_price = no_bid
+                            state.last_held_price = no_bid
+                            state.entry_time = datetime.now(timezone.utc).isoformat()
+                            state.entry_secs_left = secs_left if secs_left is not None else 0.0
+                            state.session_trades_entered += 1
+                            state.corr_waiting = False
+                            _pending_signals.pop(series, None)
                             log.info(
-                                f"[{ts}] [{series}] NO {no_bid:.0f}c "
-                                f"[MOM ✓ | awaiting correlation] | {mins_left:.1f} min left"
+                                f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
+                                f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR+DIR] | "
+                                f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
+                                f"{mins_left:.1f} min left"
                             )
-                            state.corr_waiting = True
+                        else:
+                            if not state.corr_waiting:
+                                log.info(
+                                    f"[{ts}] [{series}] NO {no_bid:.0f}c "
+                                    f"[MOM ✓ DIR ✓ | awaiting correlation] | {mins_left:.1f} min left"
+                                )
+                                state.corr_waiting = True
                 else:
                     # No signal or price not a fresh cross — clear pending state
                     _pending_signals.pop(series, None)
@@ -710,12 +748,18 @@ async def main():
     log.info(f"Momentum filter: crossing detection over {MOMENTUM_HISTORY_LEN} polls (~{MOMENTUM_HISTORY_LEN*POLL_INTERVAL_S:.0f}s window)")
     log.info(f"Correlation filter: requires 2-of-3 series same direction within {CORR_WINDOW_SECS}s")
     log.info(f"Activation window: last {ACTIVATE_MINS_BEFORE_CLOSE} min of each 15-min contract")
+    log.info(f"Time-of-day filter: BLOCKED UTC hours = {sorted(BLOCKED_UTC_HOURS)}")
+    log.info(f"Directional filter: BTC must confirm direction over last {DIRECTION_WINDOW_SECS:.0f}s "
+             f"| feed available: {_BTC_FEED_AVAILABLE}")
     log.info(f"Trade log: {_TRADE_LOG_PATH}")
     log.info("=" * 60)
 
     client = _SimpleClient()
     tasks = []
     try:
+        if _BTC_FEED_AVAILABLE:
+            await _start_btc_feed()
+            log.info("BTC directional feed started (Coinbase WebSocket)")
         tasks = [asyncio.create_task(run_series(client, s)) for s in SERIES]
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -723,6 +767,8 @@ async def main():
     finally:
         for t in tasks:
             t.cancel()
+        if _BTC_FEED_AVAILABLE:
+            await _stop_btc_feed()
         await client.close()
         log.info("Bot stopped.")
 

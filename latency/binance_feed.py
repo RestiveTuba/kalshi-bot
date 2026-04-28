@@ -197,3 +197,38 @@ def get_price() -> Optional[float]:
 
 def is_connected() -> bool:
     return _feed.connected
+
+
+def get_direction(window_secs: float = 60.0) -> str:
+    """
+    Return "UP", "DOWN", or "NEUTRAL" based on BTC/USD price change over the
+    last *window_secs* seconds.
+
+    "UP"      — price rose more than MIN_MOMENTUM_PCT over the window
+    "DOWN"    — price fell more than MIN_MOMENTUM_PCT over the window
+    "NEUTRAL" — move too small, or not enough data yet
+
+    Used by momentum_bot.py to confirm trade direction before entry.
+    """
+    history = _feed._history
+    current = _feed._price
+    if not history or current is None:
+        return "NEUTRAL"
+
+    cutoff = time.time() - window_secs
+    baseline: Optional[float] = None
+    for ts, price in history:
+        if ts >= cutoff:
+            baseline = price
+            break
+
+    if baseline is None or baseline == 0:
+        return "NEUTRAL"
+
+    pct_change = (current - baseline) / baseline
+    threshold  = MIN_MOMENTUM_PCT / 100.0
+    if pct_change > threshold:
+        return "UP"
+    if pct_change < -threshold:
+        return "DOWN"
+    return "NEUTRAL"
