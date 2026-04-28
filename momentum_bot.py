@@ -64,8 +64,13 @@ _TRADE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mome
 def _write_trade_record(record: dict) -> None:
     """Append one trade record as a JSON line to momentum_trades.jsonl."""
     try:
-        with open(_TRADE_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        line = (json.dumps(record) + "\n").encode("utf-8")
+        fd = os.open(_TRADE_LOG_PATH, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     except Exception as exc:
         log.error(f"Failed to write trade record: {exc}")
 
@@ -359,6 +364,7 @@ class SessionState:
     corr_waiting: bool = False
     # Trailing stop: highest price seen since entry; stop fires if price drops >TRAILING_STOP_CENTS below this
     peak_price: float = 0.0
+    last_held_price: float = 0.0
 
 
 def _close_position(
@@ -403,7 +409,25 @@ def _close_position(
     state.entry_time = ""
     state.entry_secs_left = 0.0
     state.peak_price = 0.0
+    state.last_held_price = 0.0
     return pnl
+
+
+def _reset_session_state(state: SessionState) -> None:
+    state.ticker = ""
+    state.position_side = None
+    state.entry_price = 0.0
+    state.entry_time = ""
+    state.entry_secs_left = 0.0
+    state.session_pnl = 0.0
+    state.active = False
+    state.session_trades_entered = 0
+    state.yes_bid_history.clear()
+    state.no_bid_history.clear()
+    state.corr_waiting = False
+    state.peak_price = 0.0
+    state.last_held_price = 0.0
+    _pending_signals.pop(state.series, None)
 
 
 # ---------------------------------------------------------------------------
@@ -437,8 +461,10 @@ def _register_signal(series: str, side: str) -> None:
 def _check_correlation(series: str, side: str) -> bool:
     """Return True if ≥1 OTHER series has the same side signal within CORR_WINDOW_SECS."""
     now = time.time()
-    for s, (sig_side, sig_ts) in _pending_signals.items():
+    for s, (sig_side, sig_ts) in list(_pending_signals.items()):
         if s != series and sig_side == side and (now - sig_ts) <= CORR_WINDOW_SECS:
+            _pending_signals.pop(series, None)
+            _pending_signals.pop(s, None)
             return True
     return False
 
@@ -455,6 +481,21 @@ async def run_series(client: _SimpleClient, series: str):
         try:
             raw = await fetch_active_market(client, series)
             if raw is None:
+                if state.position_side is not None:
+                    closed_side = state.position_side
+                    exit_price = state.last_held_price if state.last_held_price > 0 else state.entry_price
+                    pnl = _close_position(state, exit_price, "SESSION_RESET", secs_left=None)
+                    log.warning(
+                        f"[{series}] SESSION_RESET forced close after expiry on {closed_side} "
+                        f"exit={exit_price:.0f}c P&L=${pnl:+.2f}"
+                    )
+                    if state.ticker:
+                        log.info(
+                            f"[{series}] Session ended: {state.ticker} | "
+                            f"session P&L: ${state.session_pnl:+.2f} | "
+                            f"trades completed: {state.trade_count}"
+                        )
+                    _reset_session_state(state)
                 log.info(f"[{series}] No active market found — sleeping 30s")
                 await asyncio.sleep(30)
                 continue
@@ -477,18 +518,8 @@ async def run_series(client: _SimpleClient, series: str):
                         f"session P&L: ${state.session_pnl:+.2f} | "
                         f"trades completed: {state.trade_count}"
                     )
+                _reset_session_state(state)
                 state.ticker = ticker
-                state.position_side = None
-                state.entry_price = 0.0
-                state.entry_time = ""
-                state.entry_secs_left = 0.0
-                state.session_pnl = 0.0
-                state.active = False
-                state.session_trades_entered = 0
-                state.yes_bid_history.clear()
-                state.no_bid_history.clear()
-                state.corr_waiting = False
-                _pending_signals.pop(series, None)
                 log.info(f"[{series}] New session: {ticker}")
 
             secs_left = seconds_until_close(raw)
@@ -541,6 +572,7 @@ async def run_series(client: _SimpleClient, series: str):
             # ── Trailing stop (5¢ from peak price since entry) ────────────────
             if state.position_side is not None:
                 held_price = yes_bid if state.position_side == "YES" else no_bid
+                state.last_held_price = held_price
                 # Ratchet peak up whenever price improves
                 if held_price > state.peak_price:
                     state.peak_price = held_price
@@ -587,6 +619,7 @@ async def run_series(client: _SimpleClient, series: str):
                         state.position_side = "YES"
                         state.entry_price = yes_bid
                         state.peak_price = yes_bid
+                        state.last_held_price = yes_bid
                         state.entry_time = datetime.now(timezone.utc).isoformat()
                         state.entry_secs_left = secs_left if secs_left is not None else 0.0
                         state.session_trades_entered += 1
@@ -612,6 +645,7 @@ async def run_series(client: _SimpleClient, series: str):
                         state.position_side = "NO"
                         state.entry_price = no_bid
                         state.peak_price = no_bid
+                        state.last_held_price = no_bid
                         state.entry_time = datetime.now(timezone.utc).isoformat()
                         state.entry_secs_left = secs_left if secs_left is not None else 0.0
                         state.session_trades_entered += 1
