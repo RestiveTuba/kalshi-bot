@@ -642,20 +642,24 @@ async def main(
     series: str,
     n_markets: int,
     entry_threshold: float,
+    conviction_threshold: float,
     stop_loss: Optional[float],
     min_secs_for_entry: float,
+    corr_window_secs: float,
+    blocked_utc_hours: frozenset,
     label: str,
 ) -> None:
     stop_desc = f"{stop_loss:.0f}¢" if stop_loss is not None else "none"
-    min_desc  = f"{min_secs_for_entry:.0f}s" if min_secs_for_entry > 0 else "none"
     print(
-        f"[{label}] entry={entry_threshold:.0f}¢  stop={stop_desc}  "
-        f"min_secs={min_desc}  markets={n_markets}",
+        f"Running {series} — entry={entry_threshold:.0f}¢  conv={conviction_threshold:.0f}¢  "
+        f"stop={stop_desc}  min_secs={min_secs_for_entry:.0f}s  "
+        f"corr={corr_window_secs:.0f}s  markets={n_markets}",
         flush=True,
     )
     client = KalshiClient()
     try:
         markets = await fetch_finalized_markets(client, series, n_markets)
+        print(f"Fetched {len(markets)} markets, simulating...", flush=True)
 
         all_trades:   list[TradeResult] = []
         session_pnls: list[float]       = []
@@ -671,7 +675,7 @@ async def main(
             try:
                 candles = await fetch_candlesticks(client, series, ticker, window_start, window_end)
             except Exception as exc:
-                print(f"[{label}] {ticker}: fetch failed ({exc})", flush=True)
+                print(f"  {ticker}: fetch failed ({exc})", flush=True)
                 continue
             if not candles:
                 await asyncio.sleep(REQ_DELAY)
@@ -680,21 +684,29 @@ async def main(
             trades = simulate_session(
                 ticker, close_ts, candles,
                 entry_threshold=entry_threshold,
+                conviction_threshold=conviction_threshold,
                 stop_loss=stop_loss,
                 min_secs_for_entry=min_secs_for_entry,
+                corr_window_secs=corr_window_secs,
+                blocked_utc_hours=blocked_utc_hours,
             )
             all_trades.extend(trades)
             session_pnl = sum(t.pnl for t in trades)
             if trades:
                 session_pnls.append(session_pnl)
+
+            if i % 500 == 0:
+                print(f"  {i}/{len(markets)} markets processed...", flush=True)
             await asyncio.sleep(REQ_DELAY)
 
         if not all_trades:
-            print(f"[{label}] No trades generated.")
+            print(f"No trades generated — threshold may be too high for this series.")
             return
 
         stats = compute_stats(all_trades, session_pnls)
-        print("RESULT:" + json.dumps({"label": label, "stats": stats}), flush=True)
+        print_results(stats, series, n_markets, len(markets))
+        # Also emit JSON envelope for programmatic use
+        print("RESULT:" + json.dumps({"label": label or series, "stats": stats}), flush=True)
 
     finally:
         await client.close()
@@ -706,13 +718,23 @@ async def main(
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Momentum strategy backtester")
-    parser.add_argument("--series",      default="KXBTC15M")
-    parser.add_argument("--markets",     type=int,   default=100)
-    parser.add_argument("--entry",       type=float, default=85,  help="Entry threshold cents")
-    parser.add_argument("--stop",        type=float, default=0,   help="Stop-loss cents (0=disabled)")
-    parser.add_argument("--min-secs",    type=float, default=0,   help="Min seconds remaining before entry")
-    parser.add_argument("--label",       default="",              help="Label for single-run output")
-    parser.add_argument("--grid-search", action="store_true",
+    parser.add_argument("--series",        default="KXBTC15M")
+    parser.add_argument("--markets",       type=int,   default=100)
+    parser.add_argument("--entry",         type=float, default=90,
+                        help="Entry threshold cents (default: 90 — grid-search optimal)")
+    parser.add_argument("--conviction",    type=float, default=93,
+                        help="Conviction-override threshold cents (default: 93)")
+    parser.add_argument("--stop",          type=float, default=0,
+                        help="Stop-loss cents (0=disabled)")
+    parser.add_argument("--min-secs",      type=float, default=60,
+                        help="Min seconds remaining before entry (default: 60 — grid-search optimal)")
+    parser.add_argument("--corr-window",   type=float, default=45,
+                        help="Signal-persistence proxy seconds (default: 45 — grid-search optimal)")
+    parser.add_argument("--blocked-hours", default="12,13,20,21,22,23",
+                        help="Comma-separated UTC hours to block entries (default: 12,13,20,21,22,23)")
+    parser.add_argument("--label",         default="",
+                        help="Label for single-run output")
+    parser.add_argument("--grid-search",   action="store_true",
                         help="Run 324-combination grid search; outputs top-10 Sharpe table")
     return parser.parse_args()
 
@@ -727,17 +749,19 @@ if __name__ == "__main__":
             ))
         else:
             stop_loss_val: Optional[float] = args.stop if args.stop > 0 else None
-            label = args.label or (
-                f"entry={args.entry:.0f} "
-                f"stop={'none' if stop_loss_val is None else f'{args.stop:.0f}'} "
-                f"minsecs={args.min_secs:.0f}"
-            )
+            blocked: frozenset = frozenset(
+                int(h.strip()) for h in args.blocked_hours.split(",") if h.strip()
+            ) if args.blocked_hours.strip() else frozenset()
+            label = args.label or args.series
             asyncio.run(main(
                 series=args.series,
                 n_markets=args.markets,
                 entry_threshold=args.entry,
+                conviction_threshold=args.conviction,
                 stop_loss=stop_loss_val,
                 min_secs_for_entry=args.min_secs,
+                corr_window_secs=args.corr_window,
+                blocked_utc_hours=blocked,
                 label=label,
             ))
     except KeyboardInterrupt:
