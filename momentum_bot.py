@@ -21,6 +21,7 @@ import asyncio
 import json
 import sys
 import os
+import uuid as _uuid_mod
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -86,7 +87,8 @@ STOP_LOSS_THRESHOLD    = None   # disabled — no stop-loss (500-session backtes
 HARD_CLOSE_SECS        = 30     # exit any open position with this many seconds left
 MIN_SECS_FOR_ENTRY     = 60     # grid search optimal (60s beats 90s/120s across all combos)
 MAX_TRADES_PER_SESSION = 3      # cap per series per 15-min window
-CONTRACTS              = 1
+CONTRACTS              = 20     # contracts per trade (scaled up from 1; backtest: 96.6% win rate)
+MAX_EXPOSURE_USD       = 200.0  # per-trade safety cap; 20 × $0.98 max = $19.60, well under limit
 PAPER_MODE             = True   # always True until you explicitly flip
 
 MOMENTUM_HISTORY_LEN   = 90     # deque entries; 90 × 700ms ≈ 63s of price history
@@ -99,10 +101,20 @@ BLOCKED_UTC_HOURS      = {12, 13, 20, 21, 22, 23}
 # Directional filter: look back this many seconds on BTC/USD to confirm direction
 DIRECTION_WINDOW_SECS  = 60.0   # BTC must have moved UP (for YES) or DOWN (for NO) in last 60s
 
-# Risk controls — no external data needed
-DAILY_LOSS_LIMIT_USD   = 1.50   # halt ALL new entries if today's realized P&L drops below -$1.50
-SESSION_HALT_MIN_LOSS  = 0.05   # any single loss ≥ 5¢ sets session_halted on that series
+# Risk controls — dollar thresholds scale proportionally with CONTRACTS
+# Per-contract baselines: halt after $0.05/contract loss in session, $1.50/contract/day.
+# At CONTRACTS=20 these become $1.00 and $30.00 — same risk-per-contract protection.
+DAILY_LOSS_LIMIT_USD   = round(1.50 * CONTRACTS, 2)   # $30.00 at 20 contracts
+SESSION_HALT_MIN_LOSS  = round(0.05 * CONTRACTS, 2)   # $1.00 at 20 contracts
 MAX_ENTRY_PRICE        = 99.0   # never buy ≥99¢ — only 1¢ margin left, risk/reward is never rational
+
+# Market-making mode — post limit orders instead of hitting the ask
+# When True: instead of buying at the current ask, post a limit order MAKER_OFFSET_CENTS below.
+# The order cancels automatically after MAKER_TIMEOUT_SECS if unfilled and the signal is skipped.
+# Paper mode simulates fills when the market bid drops to/below the posted limit price.
+MAKER_MODE             = False  # flip to True to provide liquidity and collect the spread
+MAKER_OFFSET_CENTS     = 2.0    # post limit N¢ below current bid/ask (e.g. 90¢ bid → 88¢ limit)
+MAKER_TIMEOUT_SECS     = 30     # cancel and skip if unfilled after this many seconds
 
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
@@ -230,6 +242,11 @@ class _SimpleClient:
         sign_path = "/trade-api/v2/" + path
         return await self._request("POST", path, sign_path=sign_path,
                                    body_str=body_str, json_body=body)
+
+    async def delete(self, path: str) -> dict[str, Any]:
+        path = path.lstrip("/")
+        sign_path = "/trade-api/v2/" + path
+        return await self._request("DELETE", path, sign_path=sign_path)
 
     async def _request(self, method: str, path: str, *, sign_path: str,
                        body_str: str = "", json_body: Optional[dict] = None) -> dict[str, Any]:
@@ -365,6 +382,7 @@ class TradeRecord:
     exit_reason: str           # "STOP_LOSS" | "HARD_CLOSE" | "SESSION_RESET"
     pnl_dollars: float
     entry_type: str = ""       # "MOM" (momentum+corr) or "MOM_OVERRIDE" (conviction bypass)
+    fill_type:  str = ""       # "TAKER" (market order) or "MAKER" (limit order filled)
     paper: bool = True
 
 
@@ -391,8 +409,14 @@ class SessionState:
     last_held_price: float = 0.0
     # Session halt: set True after a losing trade so we don't compound losses in the same window
     session_halted: bool = False
-    # Entry type for the current position — written to JSONL on close
+    # Entry signal and fill type — both written to JSONL on close
     entry_type: str = ""       # "MOM" | "MOM_OVERRIDE"
+    fill_type:  str = ""       # "TAKER" | "MAKER"
+    # Pending maker order (MAKER_MODE only)
+    pending_order_id:    str   = ""    # order_id from Kalshi (or "PM_*" in paper mode)
+    pending_order_side:  str   = ""    # "YES" or "NO" side being sought
+    pending_order_price: float = 0.0   # limit price in cents
+    pending_order_ts:    float = 0.0   # time.time() when the order was posted
 
 
 def _close_position(
@@ -426,6 +450,7 @@ def _close_position(
         exit_reason=exit_reason,
         pnl_dollars=round(pnl, 4),
         entry_type=state.entry_type,
+        fill_type=state.fill_type,
         paper=PAPER_MODE,
     )
     _write_trade_record(asdict(record))
@@ -440,6 +465,7 @@ def _close_position(
     state.peak_price = 0.0
     state.last_held_price = 0.0
     state.entry_type = ""
+    state.fill_type  = ""
 
     # Halt re-entry in this session after any non-trivial loss
     if pnl < -SESSION_HALT_MIN_LOSS:
@@ -471,6 +497,11 @@ def _reset_session_state(state: SessionState) -> None:
     state.last_held_price = 0.0
     state.session_halted = False
     state.entry_type = ""
+    state.fill_type  = ""
+    state.pending_order_id    = ""
+    state.pending_order_side  = ""
+    state.pending_order_price = 0.0
+    state.pending_order_ts    = 0.0
     _pending_signals.pop(state.series, None)
     _open_positions.discard(state.series)
 
@@ -524,6 +555,110 @@ def _check_correlation(series: str, side: str) -> bool:
             _pending_signals.pop(s, None)
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Entry execution — shared by all signal paths (MOM, MOM_OVERRIDE)
+# ---------------------------------------------------------------------------
+
+async def _execute_entry(
+    client: _SimpleClient,
+    state: SessionState,
+    series: str,
+    side: str,           # "YES" or "NO"
+    price: float,        # cents: current market bid/ask for the chosen side
+    entry_type: str,     # "MOM" or "MOM_OVERRIDE"
+    secs_left: float,
+    ts: str,
+    mins_left: float,
+) -> None:
+    """
+    Execute a trade entry.
+
+    TAKER mode (MAKER_MODE=False): buy at the current ask immediately.
+    MAKER mode (MAKER_MODE=True):  post a limit order at price - MAKER_OFFSET_CENTS.
+      - Paper: simulated; order 'fills' when the market bid drops to the limit.
+      - Live:  POST /portfolio/orders with type=limit; polled by run_series on
+               subsequent ticks; cancelled after MAKER_TIMEOUT_SECS if unfilled.
+
+    In both modes the global position lock (_open_positions) is claimed here so
+    no other series can enter while the maker order is pending.
+    """
+    # Exposure guard — safety net for any future edge cases
+    exposure = price * CONTRACTS / 100.0
+    if exposure > MAX_EXPOSURE_USD:
+        log.warning(
+            f"[{ts}] [{series}] ENTRY BLOCKED (exposure) — "
+            f"${exposure:.2f} > ${MAX_EXPOSURE_USD:.0f} cap"
+        )
+        return
+
+    # Claim the global position lock now (released on fill or maker timeout)
+    _open_positions.add(series)
+    state.corr_waiting = False
+    _pending_signals.pop(series, None)
+    state.entry_type = entry_type
+
+    if MAKER_MODE:
+        limit_price = price - MAKER_OFFSET_CENTS
+        if limit_price < 50.0:
+            # Price too low to make a sensible maker order — fall through to taker
+            log.info(
+                f"[{ts}] [{series}] MAKER limit {limit_price:.0f}c < 50c floor — "
+                f"using taker instead"
+            )
+        else:
+            order_id = ""
+            if PAPER_MODE:
+                order_id = f"PM_{series}_{int(time.time() * 1000) % 1_000_000}"
+            else:
+                # yes_price on Kalshi: for YES buy = limit_price; for NO buy = 100 - limit_price
+                yes_price_val = int(limit_price) if side == "YES" else (100 - int(limit_price))
+                try:
+                    resp = await client.post("portfolio/orders", {
+                        "ticker":           state.ticker,
+                        "client_order_id":  _uuid_mod.uuid4().hex,
+                        "side":             side.lower(),
+                        "action":           "buy",
+                        "type":             "limit",
+                        "count":            CONTRACTS,
+                        "yes_price":        yes_price_val,
+                    })
+                    order_id = resp.get("order", {}).get("order_id", "")
+                    if not order_id:
+                        log.warning(f"[{ts}] [{series}] Maker order POST returned no order_id: {resp}")
+                except Exception as exc:
+                    log.warning(f"[{ts}] [{series}] Maker order POST failed: {exc} — using taker")
+
+            if order_id:
+                state.pending_order_id    = order_id
+                state.pending_order_side  = side
+                state.pending_order_price = limit_price
+                state.pending_order_ts    = time.time()
+                log.info(
+                    f"[{ts}] [{series}] MAKER ORDER {side} @ {limit_price:.0f}c "
+                    f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [{entry_type}] "
+                    f"| bid={price:.0f}c offset={MAKER_OFFSET_CENTS:.0f}c "
+                    f"| waiting ≤{MAKER_TIMEOUT_SECS}s | {mins_left:.1f} min left"
+                )
+                return  # position will be set when fill is confirmed in run_series
+            # Fall through to taker if order posting failed
+
+    # ── TAKER entry (immediate) ──────────────────────────────────────────────
+    state.position_side      = side
+    state.fill_type          = "TAKER"
+    state.entry_price        = price
+    state.peak_price         = price
+    state.last_held_price    = price
+    state.entry_time         = datetime.now(timezone.utc).isoformat()
+    state.entry_secs_left    = secs_left
+    state.session_trades_entered += 1
+    log.info(
+        f"[{ts}] [{series}] BUY {side} @ {price:.0f}c "
+        f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [{entry_type}] "
+        f"| entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} "
+        f"| {mins_left:.1f} min left"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +746,81 @@ async def run_series(client: _SimpleClient, series: str):
                 )
 
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+            # ── Pending maker order check (MAKER_MODE only) ────────────────
+            # When a maker order was posted in a prior tick, we check for a fill
+            # or cancel on timeout before doing anything else.
+            if MAKER_MODE and state.pending_order_id and state.position_side is None:
+                elapsed = time.time() - state.pending_order_ts
+                watched_bid = yes_bid if state.pending_order_side == "YES" else no_bid
+
+                filled = False
+                if PAPER_MODE:
+                    # Simulate fill when the market bid comes down to our limit price
+                    filled = watched_bid <= state.pending_order_price + 0.5
+                else:
+                    try:
+                        order_resp = await client.get(
+                            f"portfolio/orders/{state.pending_order_id}"
+                        )
+                        filled = order_resp.get("order", {}).get("status", "") == "filled"
+                    except Exception as exc:
+                        log.warning(f"[{ts}] [{series}] Maker order status check failed: {exc}")
+
+                if filled:
+                    fill_price = state.pending_order_price
+                    state.position_side       = state.pending_order_side
+                    state.fill_type           = "MAKER"
+                    state.entry_price         = fill_price
+                    state.peak_price          = fill_price
+                    state.last_held_price     = fill_price
+                    state.entry_time          = datetime.now(timezone.utc).isoformat()
+                    state.entry_secs_left     = secs_left if secs_left is not None else 0.0
+                    state.session_trades_entered += 1
+                    state.pending_order_id    = ""
+                    state.pending_order_side  = ""
+                    log.info(
+                        f"[{ts}] [{series}] *** MAKER FILL {state.position_side} "
+                        f"@ {fill_price:.0f}c *** "
+                        f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [{state.entry_type}] "
+                        f"| entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} "
+                        f"| {mins_left:.1f} min left"
+                    )
+                    # Don't continue — fall through to the holding logic below
+
+                elif elapsed >= MAKER_TIMEOUT_SECS:
+                    if not PAPER_MODE:
+                        try:
+                            await client.delete(
+                                f"portfolio/orders/{state.pending_order_id}"
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                f"[{ts}] [{series}] Failed to cancel maker order "
+                                f"{state.pending_order_id}: {exc}"
+                            )
+                    log.info(
+                        f"[{ts}] [{series}] MAKER TIMEOUT ({elapsed:.0f}s) — "
+                        f"limit unfilled @ {state.pending_order_price:.0f}c, "
+                        f"signal skipped | {mins_left:.1f} min left"
+                    )
+                    state.pending_order_id    = ""
+                    state.pending_order_side  = ""
+                    state.pending_order_price = 0.0
+                    state.entry_type          = ""
+                    _open_positions.discard(series)  # release lock on timeout
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
+
+                else:
+                    log.info(
+                        f"[{ts}] [{series}] MAKER WAITING {state.pending_order_side} "
+                        f"@ {state.pending_order_price:.0f}c "
+                        f"({elapsed:.0f}s/{MAKER_TIMEOUT_SECS}s) "
+                        f"| cur bid={watched_bid:.0f}c | {mins_left:.1f} min left"
+                    )
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
 
             # ── Hard close: exit any position with <30s remaining ──────────
             if state.position_side is not None and secs_left is not None and secs_left <= HARD_CLOSE_SECS:
@@ -703,6 +913,12 @@ async def run_series(client: _SimpleClient, series: str):
                         f"≥ {MAX_ENTRY_PRICE:.0f}c (never pay ≥99c, risk/reward < 1¢) | "
                         f"{mins_left:.1f} min left"
                     )
+                elif max(yes_bid, no_bid) * CONTRACTS / 100.0 > MAX_EXPOSURE_USD:
+                    exposure = max(yes_bid, no_bid) * CONTRACTS / 100.0
+                    log.warning(
+                        f"[{ts}] [{series}] ENTRY BLOCKED — exposure ${exposure:.2f} "
+                        f"> MAX_EXPOSURE_USD ${MAX_EXPOSURE_USD:.0f} | {mins_left:.1f} min left"
+                    )
                 elif yes_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.yes_bid_history, ENTRY_THRESHOLD):
                     # Directional filter: BTC must be rising to justify a YES entry
                     _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
@@ -715,22 +931,9 @@ async def run_series(client: _SimpleClient, series: str):
                         # Momentum confirmed (price crossed up recently) — check correlation
                         _register_signal(series, "YES")
                         if _check_correlation(series, "YES"):
-                            state.position_side = "YES"
-                            state.entry_type = "MOM"
-                            state.entry_price = yes_bid
-                            state.peak_price = yes_bid
-                            state.last_held_price = yes_bid
-                            state.entry_time = datetime.now(timezone.utc).isoformat()
-                            state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                            state.session_trades_entered += 1
-                            state.corr_waiting = False
-                            _pending_signals.pop(series, None)
-                            _open_positions.add(series)
-                            log.info(
-                                f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
-                                f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR+DIR] | "
-                                f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                                f"{mins_left:.1f} min left"
+                            await _execute_entry(
+                                client, state, series, "YES", yes_bid, "MOM",
+                                secs_left if secs_left is not None else 0.0, ts, mins_left,
                             )
                         else:
                             if not state.corr_waiting:
@@ -751,22 +954,9 @@ async def run_series(client: _SimpleClient, series: str):
                         # Momentum confirmed for NO side
                         _register_signal(series, "NO")
                         if _check_correlation(series, "NO"):
-                            state.position_side = "NO"
-                            state.entry_type = "MOM"
-                            state.entry_price = no_bid
-                            state.peak_price = no_bid
-                            state.last_held_price = no_bid
-                            state.entry_time = datetime.now(timezone.utc).isoformat()
-                            state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                            state.session_trades_entered += 1
-                            state.corr_waiting = False
-                            _pending_signals.pop(series, None)
-                            _open_positions.add(series)
-                            log.info(
-                                f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
-                                f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM+CORR+DIR] | "
-                                f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                                f"{mins_left:.1f} min left"
+                            await _execute_entry(
+                                client, state, series, "NO", no_bid, "MOM",
+                                secs_left if secs_left is not None else 0.0, ts, mins_left,
                             )
                         else:
                             if not state.corr_waiting:
@@ -791,22 +981,9 @@ async def run_series(client: _SimpleClient, series: str):
                             f"(YES {yes_bid:.0f}c ≥ {CONVICTION_THRESHOLD}c needs BTC UP, got {_btc_dir})"
                         )
                     else:
-                        state.position_side = "YES"
-                        state.entry_type = "MOM_OVERRIDE"
-                        state.entry_price = yes_bid
-                        state.peak_price = yes_bid
-                        state.last_held_price = yes_bid
-                        state.entry_time = datetime.now(timezone.utc).isoformat()
-                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                        state.session_trades_entered += 1
-                        state.corr_waiting = False
-                        _pending_signals.pop(series, None)
-                        _open_positions.add(series)
-                        log.info(
-                            f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
-                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM_OVERRIDE] | "
-                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                            f"{mins_left:.1f} min left"
+                        await _execute_entry(
+                            client, state, series, "YES", yes_bid, "MOM_OVERRIDE",
+                            secs_left if secs_left is not None else 0.0, ts, mins_left,
                         )
                 elif no_bid >= CONVICTION_THRESHOLD:
                     _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
@@ -816,22 +993,9 @@ async def run_series(client: _SimpleClient, series: str):
                             f"(NO {no_bid:.0f}c ≥ {CONVICTION_THRESHOLD}c needs BTC DOWN, got {_btc_dir})"
                         )
                     else:
-                        state.position_side = "NO"
-                        state.entry_type = "MOM_OVERRIDE"
-                        state.entry_price = no_bid
-                        state.peak_price = no_bid
-                        state.last_held_price = no_bid
-                        state.entry_time = datetime.now(timezone.utc).isoformat()
-                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
-                        state.session_trades_entered += 1
-                        state.corr_waiting = False
-                        _pending_signals.pop(series, None)
-                        _open_positions.add(series)
-                        log.info(
-                            f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
-                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM_OVERRIDE] | "
-                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
-                            f"{mins_left:.1f} min left"
+                        await _execute_entry(
+                            client, state, series, "NO", no_bid, "MOM_OVERRIDE",
+                            secs_left if secs_left is not None else 0.0, ts, mins_left,
                         )
                 else:
                     # No signal — price below threshold or no fresh cross below conviction level
@@ -875,7 +1039,7 @@ async def main():
     log.info(f"Tracking: {', '.join(SERIES)}")
     stop_desc = f"{STOP_LOSS_THRESHOLD}c" if STOP_LOSS_THRESHOLD is not None else "disabled"
     log.info(f"Poll: {POLL_INTERVAL_S*1000:.0f}ms | Entry: {ENTRY_THRESHOLD}c | Stop: {stop_desc} | Min secs: {MIN_SECS_FOR_ENTRY}s")
-    log.info(f"Hard close: {HARD_CLOSE_SECS}s before expiry | Session cap: {MAX_TRADES_PER_SESSION} entries/series")
+    log.info(f"Position size: {CONTRACTS} contracts | Max exposure: ${MAX_EXPOSURE_USD:.0f} | Hard close: {HARD_CLOSE_SECS}s before expiry | Cap: {MAX_TRADES_PER_SESSION}/series")
     log.info(f"Momentum filter: crossing detection over {MOMENTUM_HISTORY_LEN} polls (~{MOMENTUM_HISTORY_LEN*POLL_INTERVAL_S:.0f}s window) | conviction override ≥{CONVICTION_THRESHOLD}c bypasses cross+corr")
     log.info(f"Correlation filter: requires 2-of-3 series same direction within {CORR_WINDOW_SECS}s")
     log.info(f"Activation window: last {ACTIVATE_MINS_BEFORE_CLOSE} min of each 15-min contract")
@@ -883,9 +1047,12 @@ async def main():
     log.info(f"Directional filter: BTC must confirm direction over last {DIRECTION_WINDOW_SECS:.0f}s "
              f"| feed available: {_BTC_FEED_AVAILABLE}")
     log.info(f"Risk controls: global position lock (max 1 open) | "
-             f"session halt after >{SESSION_HALT_MIN_LOSS*100:.0f}c loss | "
+             f"session halt after >${SESSION_HALT_MIN_LOSS:.2f} loss | "
              f"daily circuit breaker at −${DAILY_LOSS_LIMIT_USD:.2f} | "
-             f"max entry price {MAX_ENTRY_PRICE:.0f}c (never pay ≥99c)")
+             f"max entry {MAX_ENTRY_PRICE:.0f}c | exposure cap ${MAX_EXPOSURE_USD:.0f}")
+    maker_desc = (f"ENABLED — limit offset={MAKER_OFFSET_CENTS:.0f}c "
+                  f"timeout={MAKER_TIMEOUT_SECS}s") if MAKER_MODE else "disabled (TAKER mode)"
+    log.info(f"Market-making mode: {maker_desc}")
     log.info(f"Trade log: {_TRADE_LOG_PATH}")
     log.info("=" * 60)
 

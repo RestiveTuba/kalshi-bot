@@ -127,18 +127,25 @@ PAPER_MODE = True  # flip to False only after funding and verifying credentials
 
 # Signal parameters — dynamic thresholds by time-to-close
 # Contracts with <1h left reprice more aggressively on BTC moves
-BTC_WINDOW_SECS        = 30.0  # rolling window for BTC move measurement
+#
+# NOTE: BTC_WINDOW_SECS and STALE_WINDOW_SECS are intentionally DIFFERENT:
+#   BTC_WINDOW_SECS   — how far back we measure BTC's price move (10 s = fast signal)
+#   STALE_WINDOW_SECS — how far back we check whether Polymarket has already repriced (30 s)
+# The 2.7-second measured lag means a 10-second BTC signal still gives us a head start,
+# but staleness must be confirmed over a longer 30-second window to avoid false positives.
+BTC_WINDOW_SECS        = 10.0  # 10-second BTC move detection (0x8dxd strategy window)
+STALE_WINDOW_SECS      = 30.0  # Polymarket price staleness check window (separate)
 LAG_GAP_CENTS          = 4.0   # cents: minimum implied-edge gap to signal
 
 # Near-term (<1h to close): tighter move threshold, lower stale bar
-BTC_MOVE_PCT_NEAR      = 0.003  # 0.3% BTC move required
-STALE_THRESHOLD_NEAR   = 0.04   # Polymarket must NOT have moved ≥4¢ in window
+BTC_MOVE_PCT_NEAR      = 0.003  # 0.3% BTC move in 10 s required
+STALE_THRESHOLD_NEAR   = 0.04   # Polymarket must NOT have moved ≥4¢ in 30-s window
 
 # Far-term (1-4h to close): need bigger move, higher stale bar (daily contracts lag more)
-BTC_MOVE_PCT_FAR       = 0.008  # 0.8% BTC move required
-STALE_THRESHOLD_FAR    = 0.06   # Polymarket must NOT have moved ≥6¢ in window
+BTC_MOVE_PCT_FAR       = 0.008  # 0.8% BTC move in 10 s required
+STALE_THRESHOLD_FAR    = 0.06   # Polymarket must NOT have moved ≥6¢ in 30-s window
 
-STALENESS_CONFIRM_SECS = 60.0   # also check that price has been flat for 60s (not just 30s)
+STALENESS_CONFIRM_SECS = 60.0   # also check price has been flat for 60 s (not just 30 s)
 
 # Sensitivity: ¢ of probability shift implied per 1% BTC move
 # Near-term contracts (high delta) move more; far-term contracts (lower delta) move less
@@ -179,8 +186,8 @@ ASSET_KEYWORDS = {
     "ETH": ["eth", "ethereum", "ether"],
 }
 
-# Order sizing (live mode only)
-ORDER_SIZE_USDC = 10.0   # $10 USDC per trade
+# Order sizing
+ORDER_SIZE_USDC = 50.0   # $50 USDC per trade — enough to move the needle at 10-20 trades/day
 SIG_TYPE        = 0      # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
 
 # ---------------------------------------------------------------------------
@@ -601,14 +608,14 @@ def detect_lag_signal(
         Sensitivity:       6 ¢ per 1 % BTC move
 
     Fires only when ALL of:
-      1. BTC moved ≥ threshold over BTC_WINDOW_SECS (30 s).
-      2. Polymarket YES price has NOT moved ≥ stale_threshold in the 30-s window
-         → price is lagging the underlying move.
+      1. BTC moved ≥ threshold over BTC_WINDOW_SECS (10 s) — fast detection.
+      2. Polymarket YES price has NOT moved ≥ stale_threshold in the last
+         STALE_WINDOW_SECS (30 s) → price is lagging the underlying move.
       3. Polymarket YES price has also NOT moved ≥ stale_threshold in the last
-         STALENESS_CONFIRM_SECS (60 s) → confirm it's genuinely stale, not
-         just mid-reprice. This is the key guard against entering after the
-         contract has already started catching up.
-      4. Implied edge (¢ from BTC move) ≥ LAG_GAP_CENTS (4 ¢).
+         STALENESS_CONFIRM_SECS (60 s) → confirm genuine staleness, not
+         just mid-reprice. Guards against entering after the contract has
+         already started catching up.
+      4. Implied edge (¢ from BTC move magnitude) ≥ LAG_GAP_CENTS (4 ¢).
     """
     hours_left = market.hours_to_close
 
@@ -628,22 +635,23 @@ def detect_lag_signal(
     if abs(btc_move) < move_threshold:
         return None
 
-    # 2. Staleness check over the BTC measurement window (30 s)
-    yes_30s_ago = _price_at(market.yes_history, BTC_WINDOW_SECS)
-    if yes_30s_ago is None:
-        return None
+    # 2. Staleness check over STALE_WINDOW_SECS (30 s) — separate from the 10-s BTC signal.
+    #    If the contract has already repriced in the last 30 s, the edge is gone.
+    yes_stale_ago = _price_at(market.yes_history, STALE_WINDOW_SECS)
+    if yes_stale_ago is None:
+        return None  # not enough price history yet
 
-    if abs(market.yes_ask - yes_30s_ago) >= stale_threshold:
-        return None  # contract already repriced within the BTC window
+    if abs(market.yes_ask - yes_stale_ago) >= stale_threshold:
+        return None  # contract already repriced in the 30-s window
 
-    # 3. Staleness confirmation over the longer 60-s window — ensure the
-    #    contract has genuinely been flat, not just mid-reprice on entry
-    yes_60s_ago = _price_at(market.yes_history, STALENESS_CONFIRM_SECS)
-    if yes_60s_ago is None:
-        return None  # not enough history yet
+    # 3. Staleness confirmation over 60 s — ensure the contract has genuinely
+    #    been flat, not just caught mid-reprice on the 30-s check.
+    yes_confirm_ago = _price_at(market.yes_history, STALENESS_CONFIRM_SECS)
+    if yes_confirm_ago is None:
+        return None  # need full 60-s history before trading
 
-    if abs(market.yes_ask - yes_60s_ago) >= stale_threshold:
-        return None  # contract repriced in the last 60 s — edge already gone
+    if abs(market.yes_ask - yes_confirm_ago) >= stale_threshold:
+        return None  # repriced in the last 60 s — lag window already closed
 
     # 4. Implied edge from BTC move magnitude
     implied_cents = abs(btc_move) * 100 * sensitivity
@@ -744,12 +752,14 @@ def log_entry(market: MarketWatch, side: str, price: float,
         "question":           market.question,
         "side":               side,
         "entry_price_cents":  round(price * 100, 2),
+        "order_size_usdc":    ORDER_SIZE_USDC,
         "entry_time":         datetime.now(timezone.utc).isoformat(),
         "close_time":         market.close_time.isoformat(),
         "hours_to_close":     round(hours_left, 3),
         "regime":             regime,
         "btc_price_at_entry": round(btc_price, 2),
         "btc_move_pct":       round(btc_move_pct * 100, 4),
+        "btc_window_secs":    BTC_WINDOW_SECS,
         "volume_usdc":        round(market.volume_usdc, 0),
         "paper":              PAPER_MODE,
     })
@@ -914,12 +924,13 @@ async def main() -> None:
     log.info("=" * 65)
     log.info("Kalshi Bot — Path D: Polymarket Latency Arb")
     log.info(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
-    log.info(f"BTC window:         {BTC_WINDOW_SECS:.0f}s | staleness confirm: {STALENESS_CONFIRM_SECS:.0f}s")
-    log.info(f"NEAR regime (<1h):  BTC move ≥{BTC_MOVE_PCT_NEAR*100:.1f}% | stale <{STALE_THRESHOLD_NEAR*100:.0f}¢")
-    log.info(f"FAR  regime (1-4h): BTC move ≥{BTC_MOVE_PCT_FAR*100:.1f}% | stale <{STALE_THRESHOLD_FAR*100:.0f}¢")
+    log.info(f"BTC signal window:  {BTC_WINDOW_SECS:.0f}s (fast 10-s arb window)")
+    log.info(f"Stale check window: {STALE_WINDOW_SECS:.0f}s (contract must be flat) | confirm: {STALENESS_CONFIRM_SECS:.0f}s")
+    log.info(f"NEAR regime (<1h):  BTC move ≥{BTC_MOVE_PCT_NEAR*100:.1f}% in {BTC_WINDOW_SECS:.0f}s | stale <{STALE_THRESHOLD_NEAR*100:.0f}¢")
+    log.info(f"FAR  regime (1-4h): BTC move ≥{BTC_MOVE_PCT_FAR*100:.1f}% in {BTC_WINDOW_SECS:.0f}s | stale <{STALE_THRESHOLD_FAR*100:.0f}¢")
     log.info(f"Lag gap (min edge): {LAG_GAP_CENTS:.0f}¢ | volume filter: ≥${MIN_VOLUME_USDC:,}")
     log.info(f"Market window:      {MIN_SECS_TO_CLOSE}s–{MAX_HOURS_TO_CLOSE:.0f}h before close")
-    log.info(f"Order size (live):  ${ORDER_SIZE_USDC:.0f} USDC")
+    log.info(f"Order size:         ${ORDER_SIZE_USDC:.0f} USDC per trade")
     log.info(f"Trade log:          {_TRADE_LOG_PATH}")
     log.info("=" * 65)
 
