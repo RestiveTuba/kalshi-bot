@@ -80,17 +80,17 @@ def _write_trade_record(record: dict) -> None:
 SERIES = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 POLL_INTERVAL_S        = 0.70   # 700 ms
 ACTIVATE_MINS_BEFORE_CLOSE = 8
-ENTRY_THRESHOLD        = 87     # cents — lowered from 92; live data shows best trades entered at 86-89¢
+ENTRY_THRESHOLD        = 90     # cents — grid search optimal (500 markets: Sharpe 8.93 vs 6.x at 87c)
 CONVICTION_THRESHOLD   = 93     # cents — bypass momentum cross + correlation at this price; outcome near-certain
 STOP_LOSS_THRESHOLD    = None   # disabled — no stop-loss (500-session backtest)
 HARD_CLOSE_SECS        = 30     # exit any open position with this many seconds left
-MIN_SECS_FOR_ENTRY     = 90     # only enter if >= 90s remain (avoids gap-risk near expiry)
+MIN_SECS_FOR_ENTRY     = 60     # grid search optimal (60s beats 90s/120s across all combos)
 MAX_TRADES_PER_SESSION = 3      # cap per series per 15-min window
 CONTRACTS              = 1
 PAPER_MODE             = True   # always True until you explicitly flip
 
 MOMENTUM_HISTORY_LEN   = 90     # deque entries; 90 × 700ms ≈ 63s of price history
-CORR_WINDOW_SECS       = 90.0   # two series must both signal within this window to confirm (live data: signals stagger ~125s)
+CORR_WINDOW_SECS       = 45.0   # grid search optimal (45s corr window, Sharpe 8.93 vs 8.43 at 90s)
 TRAILING_STOP_CENTS    = 5.0    # exit if price drops >5¢ below the highest price seen since entry
 
 # Time-of-day filter (live data: 12–14 UTC and 20–23 UTC are loss-dominated)
