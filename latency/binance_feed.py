@@ -199,6 +199,24 @@ def is_connected() -> bool:
     return _feed.connected
 
 
+def get_price_ago(window_secs: float = 30.0) -> Optional[float]:
+    """
+    Return the oldest BTC/USD price observed within the last *window_secs* seconds,
+    i.e. approximately the price from *window_secs* ago.
+
+    Returns None if not enough history has accumulated.
+    Used by polymarket_bot.py to measure BTC price change over a rolling window.
+    """
+    history = _feed._history
+    if not history:
+        return None
+    cutoff = time.time() - window_secs
+    for ts, price in history:
+        if ts >= cutoff:
+            return price
+    return None
+
+
 def get_direction(window_secs: float = 60.0) -> str:
     """
     Return "UP", "DOWN", or "NEUTRAL" based on BTC/USD price change over the

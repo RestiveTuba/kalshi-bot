@@ -1,0 +1,827 @@
+"""
+polymarket_bot.py — Path D: Polymarket latency arb against Coinbase BTC/USD feed.
+
+Strategy
+--------
+Polymarket does not have standardised 5-minute / 15-minute crypto series (unlike
+Kalshi's KXBTC15M). Instead it has daily/weekly "Will BTC be above $X by date?"
+markets. This bot:
+
+  1. Discovers active BTC and ETH price-direction markets via the Gamma API
+     that close within MAX_HOURS_TO_CLOSE (default: 6 h).
+  2. Reuses the existing Coinbase WebSocket feed (latency/binance_feed.py) for
+     real-time BTC/USD price.
+  3. When BTC moves ≥ BTC_MOVE_PCT (0.3 %) over BTC_WINDOW_SECS (30 s) AND
+     the target Polymarket contract price has NOT moved ≥ STALE_THRESHOLD (1 ¢)
+     in the same window, we consider the contract price stale (lagging).
+  4. If the lag-adjusted expected price differs from the current ask by ≥
+     LAG_GAP_CENTS (4 ¢), we buy the correct side.
+  5. Paper mode: trade is logged to polymarket_trades.jsonl only.
+  6. Live mode: order is placed via the CLOB REST API with L2 HMAC signing.
+
+Authentication (L1 + L2)
+------------------------
+L1: EIP-712 wallet signature used once at startup to derive L2 API credentials.
+    Requires POLYMARKET_PRIVATE_KEY in .env.
+
+L2: HMAC-SHA256 request signing on every trading call.
+    Headers: POLY_ADDRESS, POLY_SIGNATURE, POLY_TIMESTAMP, POLY_API_KEY,
+             POLY_PASSPHRASE.
+    If L2 credentials are already in .env (POLYMARKET_API_KEY, POLYMARKET_SECRET,
+    POLYMARKET_PASSPHRASE), L1 derivation is skipped.
+
+Required .env keys:
+    POLYMARKET_PRIVATE_KEY       — 0x-prefixed EOA private key
+    POLYMARKET_FUNDER_ADDRESS    — proxy wallet address from polymarket.com/settings
+    POLYMARKET_API_KEY           — (optional) pre-derived L2 key
+    POLYMARKET_SECRET            — (optional) pre-derived L2 secret
+    POLYMARKET_PASSPHRASE        — (optional) pre-derived L2 passphrase
+
+Signature type defaults to EOA (0). Change SIG_TYPE to 1 (POLY_PROXY) or
+2 (GNOSIS_SAFE) if your wallet is a proxy or Gnosis Safe.
+
+Usage:
+    python3 polymarket_bot.py
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac as _hmac
+import json
+import logging
+import logging.handlers
+import os
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import aiohttp
+import certifi
+import ssl
+
+# ---------------------------------------------------------------------------
+# Logging — stdout + rotating file, same style as momentum_bot.py
+# ---------------------------------------------------------------------------
+
+def _setup_logging() -> logging.Logger:
+    fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    logger = logging.getLogger("polymarket_bot")
+    logger.setLevel(logging.INFO)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "polymarket.log")
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.info("Logging to " + log_path)
+    return logger
+
+
+log = _setup_logging()
+
+# ---------------------------------------------------------------------------
+# Trade log (JSONL) — same append pattern as momentum_trades.jsonl
+# ---------------------------------------------------------------------------
+
+_TRADE_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "polymarket_trades.jsonl"
+)
+
+
+def _write_trade_record(record: dict) -> None:
+    try:
+        line = (json.dumps(record) + "\n").encode("utf-8")
+        fd = os.open(_TRADE_LOG_PATH, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception as exc:
+        log.error(f"Failed to write trade record: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CLOB_HOST  = "https://clob.polymarket.com"
+GAMMA_API  = "https://gamma-api.polymarket.com"
+CHAIN_ID   = 137   # Polygon mainnet
+
+PAPER_MODE = True  # flip to False only after funding and verifying credentials
+
+# Signal parameters
+BTC_MOVE_PCT      = 0.003   # 0.3 % move in BTC_WINDOW_SECS triggers lag check
+BTC_WINDOW_SECS   = 30.0    # rolling window for BTC move measurement
+LAG_GAP_CENTS     = 4.0     # cents (0.04 in [0,1]): min expected-vs-actual gap to signal
+STALE_THRESHOLD   = 0.01    # if Polymarket moved < 1 ¢ while BTC moved ≥ 0.3 %, price is stale
+
+# Market discovery
+MAX_HOURS_TO_CLOSE  = 6.0   # watch markets closing within this many hours
+MIN_SECS_TO_CLOSE   = 120   # don't enter within 2 min of market close
+REFRESH_SECS        = 120.0 # re-scan Gamma for new markets every 2 min
+POLL_INTERVAL_S     = 0.5   # 500 ms per market poll cycle
+PRICE_HISTORY_LEN   = 120   # 120 × 0.5 s = 60 s of price history per token
+
+# Markets of interest — Gamma API text-search terms
+SEARCH_TERMS = ["BTC above", "BTC below", "bitcoin above", "bitcoin below",
+                "ETH above",  "ETH below",  "ether above",  "ether below",
+                "BTC price",  "ETH price",  "bitcoin price", "ethereum price"]
+TRACKED_ASSETS = {"BTC": ["BTC", "bitcoin", "Bitcoin"],
+                  "ETH": ["ETH", "ether", "Ethereum", "ethereum"]}
+
+# Order sizing (live mode only)
+ORDER_SIZE_USDC = 10.0   # $10 USDC per trade
+SIG_TYPE        = 0      # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
+
+# ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
+
+def _load_env() -> dict:
+    env: dict[str, str] = {}
+    env_path = Path(os.path.dirname(os.path.abspath(__file__))) / ".env"
+    if env_path.exists():
+        for raw in env_path.read_text().splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    for k in (
+        "POLYMARKET_PRIVATE_KEY", "POLYMARKET_FUNDER_ADDRESS",
+        "POLYMARKET_API_KEY", "POLYMARKET_SECRET", "POLYMARKET_PASSPHRASE",
+    ):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env
+
+
+_env = _load_env()
+
+# ---------------------------------------------------------------------------
+# L2 HMAC-SHA256 request signing
+# Spec: https://docs.polymarket.com/developers/CLOB/authentication
+# Reference Python impl: https://github.com/Polymarket/py-clob-client-v2/
+#                        blob/main/py_clob_client_v2/signing/hmac.py
+# ---------------------------------------------------------------------------
+
+def _l2_sign(secret_b64: str, timestamp: str, method: str,
+             path: str, body: str = "") -> str:
+    """HMAC-SHA256 over (timestamp + METHOD + path + body), key = base64-decoded secret."""
+    message = timestamp + method.upper() + path + body
+    raw_key = base64.b64decode(secret_b64)
+    digest = _hmac.new(raw_key, message.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode()
+
+
+def _l2_headers(method: str, path: str, body: str = "") -> dict:
+    """Build the five POLY_* headers required for all trading endpoints."""
+    api_key    = _env.get("POLYMARKET_API_KEY", "")
+    secret     = _env.get("POLYMARKET_SECRET", "")
+    passphrase = _env.get("POLYMARKET_PASSPHRASE", "")
+    address    = _env.get("POLYMARKET_FUNDER_ADDRESS", "")
+    ts = str(int(time.time()))
+    sig = _l2_sign(secret, ts, method, path, body) if secret else ""
+    return {
+        "POLY_ADDRESS":    address,
+        "POLY_SIGNATURE":  sig,
+        "POLY_TIMESTAMP":  ts,
+        "POLY_API_KEY":    api_key,
+        "POLY_PASSPHRASE": passphrase,
+    }
+
+
+# ---------------------------------------------------------------------------
+# L1 EIP-712 credential derivation (once at startup, via py_clob_client_v2)
+# ---------------------------------------------------------------------------
+
+async def _ensure_api_credentials() -> bool:
+    """
+    Derive L2 API credentials from the wallet private key (L1 EIP-712 auth).
+    Writes the derived values back into _env so _l2_headers() picks them up.
+
+    Returns True if credentials are available (pre-set or freshly derived).
+    Skipped silently in paper mode if POLYMARKET_PRIVATE_KEY is absent.
+    """
+    if _env.get("POLYMARKET_API_KEY") and _env.get("POLYMARKET_SECRET"):
+        log.info("Polymarket L2 credentials loaded from env")
+        return True
+
+    pk = _env.get("POLYMARKET_PRIVATE_KEY")
+    if not pk:
+        if PAPER_MODE:
+            log.info("PAPER mode — Polymarket private key not required for read-only operation")
+            return True
+        log.warning("POLYMARKET_PRIVATE_KEY missing — live trading unavailable")
+        return False
+
+    def _sync_derive():
+        try:
+            from py_clob_client_v2 import ClobClient  # pip install py_clob_client_v2
+            client = ClobClient(host=CLOB_HOST, chain_id=CHAIN_ID, key=pk)
+            creds = client.create_or_derive_api_key()
+            return creds.get("apiKey"), creds.get("secret"), creds.get("passphrase")
+        except ImportError:
+            log.warning(
+                "py_clob_client_v2 not installed — install with: pip install py_clob_client_v2\n"
+                "Live trading unavailable until installed."
+            )
+            return None
+        except Exception as exc:
+            log.error(f"L1 credential derivation failed: {exc}")
+            return None
+
+    log.info("Deriving Polymarket L2 credentials via L1 EIP-712 signing...")
+    result = await asyncio.get_event_loop().run_in_executor(None, _sync_derive)
+    if result and all(result):
+        api_key, secret, passphrase = result
+        _env["POLYMARKET_API_KEY"]    = api_key
+        _env["POLYMARKET_SECRET"]     = secret
+        _env["POLYMARKET_PASSPHRASE"] = passphrase
+        log.info(f"Derived L2 credentials — api_key={api_key[:8]}...")
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# State: per-market tracking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MarketWatch:
+    """One Polymarket market being monitored for lag signals."""
+    condition_id:  str
+    question:      str
+    asset:         str        # "BTC" or "ETH"
+    yes_token_id:  str        # big-integer string from clobTokenIds[0]
+    no_token_id:   str        # big-integer string from clobTokenIds[1]
+    close_time:    datetime
+
+    # Polled prices (updated every POLL_INTERVAL_S)
+    yes_ask: float = 0.0      # best ask for YES outcome (what you pay to buy)
+    no_ask:  float = 0.0      # best ask for NO outcome
+
+    # Price history deques: (unix_ts, price) tuples
+    yes_history: deque = field(default_factory=lambda: deque(maxlen=PRICE_HISTORY_LEN))
+    no_history:  deque = field(default_factory=lambda: deque(maxlen=PRICE_HISTORY_LEN))
+
+    # Position tracking
+    in_position:   bool  = False
+    position_side: Optional[str]  = None   # "YES" or "NO"
+    entry_price:   float = 0.0
+    entry_time:    str   = ""
+    entry_btc:     float = 0.0             # BTC price at entry
+
+
+# Global position lock — same pattern as momentum_bot.py
+_open_positions: set[str] = set()  # condition_ids currently holding a position
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+
+
+async def _get_json(session: aiohttp.ClientSession, url: str,
+                    params: Optional[dict] = None) -> Optional[dict | list]:
+    try:
+        async with session.get(url, params=params, ssl=_ssl_ctx, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            r.raise_for_status()
+            return await r.json(content_type=None)
+    except Exception as exc:
+        log.debug(f"GET {url}: {exc}")
+        return None
+
+
+async def _post_json(session: aiohttp.ClientSession, url: str,
+                     payload, headers: Optional[dict] = None) -> Optional[dict]:
+    try:
+        async with session.post(
+            url, json=payload,
+            headers=headers or {},
+            ssl=_ssl_ctx,
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            r.raise_for_status()
+            return await r.json(content_type=None)
+    except Exception as exc:
+        log.debug(f"POST {url}: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Market discovery (Gamma API)
+# ---------------------------------------------------------------------------
+
+def _asset_of(question: str) -> Optional[str]:
+    """Return 'BTC' or 'ETH' if the question is a crypto price-direction market."""
+    q = question.lower()
+    for asset, keywords in TRACKED_ASSETS.items():
+        if any(kw.lower() in q for kw in keywords):
+            # Must also contain a price-direction keyword
+            if any(w in q for w in ("above", "below", "higher", "lower", "over", "price", "up", "down")):
+                return asset
+    return None
+
+
+async def discover_markets(session: aiohttp.ClientSession) -> list[MarketWatch]:
+    """
+    Query the Gamma API for active BTC/ETH price-direction markets closing within
+    MAX_HOURS_TO_CLOSE hours.
+
+    Polymarket does NOT have standardised 5/15-minute crypto series. Markets here
+    are daily or weekly "Will BTC be above $X?" style contracts. The lag-arb logic
+    works regardless of duration — when BTC moves, any price-direction contract
+    should reprice promptly.
+    """
+    now = datetime.now(timezone.utc)
+    max_secs = MAX_HOURS_TO_CLOSE * 3600
+    seen: set[str] = set()
+    results: list[MarketWatch] = []
+
+    # Query each search term; Gamma API does fuzzy text matching on questions
+    for term in SEARCH_TERMS:
+        data = await _get_json(session, f"{GAMMA_API}/markets", params={
+            "q": term, "active": "true", "closed": "false", "limit": 50,
+        })
+        if not data:
+            continue
+        markets_raw = data if isinstance(data, list) else data.get("data", [])
+
+        for m in markets_raw:
+            cid = m.get("conditionId", "")
+            if not cid or cid in seen:
+                continue
+
+            question = m.get("question", "")
+            asset = _asset_of(question)
+            if asset is None:
+                continue
+
+            # Only markets with CLOB order books enabled
+            if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
+                continue
+
+            # Parse close time
+            ct_str = m.get("endDate") or m.get("end_date_iso")
+            if not ct_str:
+                continue
+            try:
+                ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                if ct.tzinfo is None:
+                    ct = ct.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            secs_left = (ct - now).total_seconds()
+            if not (MIN_SECS_TO_CLOSE < secs_left <= max_secs):
+                continue
+
+            # Parse clobTokenIds — Gamma API returns this as a JSON-encoded string
+            raw_ids = m.get("clobTokenIds", "[]")
+            try:
+                token_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if len(token_ids) < 2:
+                continue
+
+            seen.add(cid)
+            results.append(MarketWatch(
+                condition_id=cid,
+                question=question,
+                asset=asset,
+                yes_token_id=str(token_ids[0]),
+                no_token_id=str(token_ids[1]),
+                close_time=ct,
+            ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Price polling (CLOB REST — no auth required for reads)
+# ---------------------------------------------------------------------------
+
+async def fetch_prices(
+    session: aiohttp.ClientSession,
+    market: MarketWatch,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Fetch best-ask prices for YES and NO tokens via POST /prices.
+    Returns (yes_ask, no_ask) in decimal [0, 1] (e.g. 0.65 = 65 ¢).
+    """
+    payload = [
+        {"token_id": market.yes_token_id, "side": "BUY"},
+        {"token_id": market.no_token_id,  "side": "BUY"},
+    ]
+    data = await _post_json(session, f"{CLOB_HOST}/prices", payload)
+    if not data:
+        return None, None
+    try:
+        yes_ask = float(data[market.yes_token_id]["BUY"])
+        no_ask  = float(data[market.no_token_id]["BUY"])
+        return yes_ask, no_ask
+    except (KeyError, TypeError, ValueError):
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Lag signal detection
+# ---------------------------------------------------------------------------
+
+def _price_at(history: deque, window_secs: float) -> Optional[float]:
+    """Oldest price within the last window_secs seconds (≈ price window_secs ago)."""
+    cutoff = time.time() - window_secs
+    for ts, price in history:
+        if ts >= cutoff:
+            return price
+    return None
+
+
+def detect_lag_signal(
+    market: MarketWatch,
+    btc_now: float,
+    btc_before: float,
+) -> Optional[str]:
+    """
+    Returns "YES", "NO", or None.
+
+    Fires when:
+      1. BTC moved ≥ BTC_MOVE_PCT (0.3 %) over BTC_WINDOW_SECS (30 s).
+      2. Polymarket YES price has NOT moved ≥ STALE_THRESHOLD (1 ¢) in the
+         same window — contract price is lagging the underlying move.
+      3. Implied fair price (estimated from BTC move magnitude) differs from
+         current ask by ≥ LAG_GAP_CENTS (4 ¢) — worthwhile edge to take.
+
+    Sensitivity heuristic: a 1 % BTC move is assumed to imply ≈ 10 ¢ shift
+    in near-term price-direction contract probability. Adjust SENSITIVITY to
+    tune signal aggressiveness.
+    """
+    SENSITIVITY = 10.0  # ¢ of probability shift per 1 % BTC move
+
+    btc_move = (btc_now - btc_before) / btc_before
+    if abs(btc_move) < BTC_MOVE_PCT:
+        return None
+
+    # Check for stale Polymarket price
+    yes_before = _price_at(market.yes_history, BTC_WINDOW_SECS)
+    if yes_before is None:
+        return None  # insufficient price history yet
+
+    poly_move = abs(market.yes_ask - yes_before)
+    if poly_move >= STALE_THRESHOLD:
+        return None  # Polymarket already repriced — no lag
+
+    # Estimate implied probability shift (in cents)
+    implied_cents = abs(btc_move) * 100 * SENSITIVITY  # e.g. 0.3 % × 10 = 3 ¢
+    if implied_cents < LAG_GAP_CENTS:
+        return None  # expected edge below threshold
+
+    # BTC UP → YES should be more expensive → buy YES if ask is still cheap
+    if btc_move > 0 and market.yes_ask < 0.95:
+        return "YES"
+
+    # BTC DOWN → NO should be more expensive → buy NO if ask is still cheap
+    if btc_move < 0 and market.no_ask < 0.95:
+        return "NO"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Order placement
+# ---------------------------------------------------------------------------
+
+async def place_order(
+    session: aiohttp.ClientSession,
+    market: MarketWatch,
+    side: str,
+    price: float,
+) -> bool:
+    """
+    Paper mode: log the intended order, return True.
+    Live mode:  EIP-712 sign the order via py_clob_client_v2 (run in executor
+                to avoid blocking the event loop), then POST to CLOB.
+    """
+    if PAPER_MODE:
+        log.info(
+            f"[PAPER] BUY {side} '{market.question[:60]}' "
+            f"@ {price:.3f} ({price*100:.1f}¢) | asset={market.asset}"
+        )
+        return True
+
+    pk      = _env.get("POLYMARKET_PRIVATE_KEY", "")
+    funder  = _env.get("POLYMARKET_FUNDER_ADDRESS", "")
+    api_key = _env.get("POLYMARKET_API_KEY", "")
+    secret  = _env.get("POLYMARKET_SECRET", "")
+    passphrase = _env.get("POLYMARKET_PASSPHRASE", "")
+
+    if not all([pk, funder, api_key, secret, passphrase]):
+        log.warning("Live order skipped — credentials incomplete")
+        return False
+
+    token_id = market.yes_token_id if side == "YES" else market.no_token_id
+    size = round(ORDER_SIZE_USDC / price, 2)  # shares = USDC / price
+
+    def _sync_order():
+        try:
+            from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs
+            from py_clob_client_v2.order_builder.constants import BUY
+
+            creds = ApiCreds(
+                api_key=api_key,
+                api_secret=secret,
+                api_passphrase=passphrase,
+            )
+            client = ClobClient(
+                host=CLOB_HOST,
+                chain_id=CHAIN_ID,
+                key=pk,
+                creds=creds,
+                signature_type=SIG_TYPE,
+                funder=funder,
+            )
+            return client.create_and_post_order(OrderArgs(
+                token_id=token_id,
+                price=round(price, 2),
+                size=size,
+                side=BUY,
+            ))
+        except Exception as exc:
+            log.error(f"Order placement failed: {exc}")
+            return None
+
+    result = await asyncio.get_event_loop().run_in_executor(None, _sync_order)
+    if result:
+        log.info(f"[LIVE] Order placed: {result}")
+    return result is not None
+
+
+# ---------------------------------------------------------------------------
+# Trade JSONL logging (same field style as momentum_trades.jsonl)
+# ---------------------------------------------------------------------------
+
+def log_entry(market: MarketWatch, side: str, price: float,
+              btc_price: float, btc_move_pct: float) -> None:
+    _write_trade_record({
+        "platform":           "polymarket",
+        "asset":              market.asset,
+        "condition_id":       market.condition_id,
+        "question":           market.question,
+        "side":               side,
+        "entry_price_cents":  round(price * 100, 2),
+        "entry_time":         datetime.now(timezone.utc).isoformat(),
+        "close_time":         market.close_time.isoformat(),
+        "secs_to_close":      round((market.close_time - datetime.now(timezone.utc)).total_seconds(), 1),
+        "btc_price_at_entry": round(btc_price, 2),
+        "btc_move_pct":       round(btc_move_pct * 100, 4),
+        "paper":              PAPER_MODE,
+    })
+
+
+def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
+    raw_pnl = exit_price - market.entry_price if market.position_side == "YES" \
+              else market.entry_price - exit_price
+    dollar_pnl = round(raw_pnl * (ORDER_SIZE_USDC / market.entry_price), 4)
+    _write_trade_record({
+        "platform":           "polymarket",
+        "asset":              market.asset,
+        "condition_id":       market.condition_id,
+        "question":           market.question,
+        "side":               market.position_side,
+        "entry_price_cents":  round(market.entry_price * 100, 2),
+        "exit_price_cents":   round(exit_price * 100, 2),
+        "entry_time":         market.entry_time,
+        "exit_time":          datetime.now(timezone.utc).isoformat(),
+        "exit_reason":        reason,
+        "pnl_dollars":        dollar_pnl,
+        "paper":              PAPER_MODE,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Per-market monitoring loop
+# ---------------------------------------------------------------------------
+
+async def run_market(
+    session: aiohttp.ClientSession,
+    market: MarketWatch,
+    btc_feed,           # the latency.binance_feed module
+) -> None:
+    secs_left = (market.close_time - datetime.now(timezone.utc)).total_seconds()
+    log.info(
+        f"[POLY] Watching: '{market.question[:70]}' "
+        f"| {market.asset} | closes in {secs_left/60:.1f} min"
+    )
+
+    while True:
+        try:
+            now_utc   = datetime.now(timezone.utc)
+            secs_left = (market.close_time - now_utc).total_seconds()
+            ts        = now_utc.strftime("%H:%M:%S.%f")[:-3]
+
+            # Market has closed — force-close any open position and stop
+            if secs_left <= 0:
+                if market.in_position:
+                    exit_price = market.yes_ask if market.position_side == "YES" else market.no_ask
+                    log_exit(market, exit_price, "MARKET_CLOSED")
+                    _open_positions.discard(market.condition_id)
+                log.info(f"[{ts}] [POLY] Market closed: {market.condition_id[:16]}...")
+                return
+
+            # Hard-close within MIN_SECS_TO_CLOSE
+            if market.in_position and secs_left < MIN_SECS_TO_CLOSE:
+                exit_price = market.yes_ask if market.position_side == "YES" else market.no_ask
+                log_exit(market, exit_price, "HARD_CLOSE")
+                _open_positions.discard(market.condition_id)
+                market.in_position   = False
+                market.position_side = None
+                log.info(
+                    f"[{ts}] [POLY] HARD_CLOSE {market.position_side} "
+                    f"@ {exit_price:.3f} | {secs_left:.0f}s left"
+                )
+
+            # Fetch current YES/NO ask prices from CLOB
+            yes_ask, no_ask = await fetch_prices(session, market)
+            if yes_ask is None:
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            market.yes_ask = yes_ask
+            market.no_ask  = no_ask
+            now_ts = time.time()
+            market.yes_history.append((now_ts, yes_ask))
+            market.no_history.append((now_ts, no_ask))
+
+            # If already in position, log unrealized P&L and wait for exit
+            if market.in_position:
+                held  = market.yes_ask if market.position_side == "YES" else market.no_ask
+                unrl  = (held - market.entry_price) * (ORDER_SIZE_USDC / market.entry_price)
+                log.info(
+                    f"[{ts}] [POLY] HOLDING {market.position_side} "
+                    f"| cur={held:.3f} entry={market.entry_price:.3f} "
+                    f"| unrealized=${unrl:+.2f} | {secs_left:.0f}s left"
+                )
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            # === Entry logic ===
+
+            # Global position lock — only 1 position at a time across all markets
+            if _open_positions:
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            if secs_left < MIN_SECS_TO_CLOSE:
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            # Get BTC price and 30-second-ago price from shared feed
+            btc_now    = btc_feed.get_price()
+            btc_before = btc_feed.get_price_ago(BTC_WINDOW_SECS)
+
+            if btc_now is None or btc_before is None:
+                log.info(f"[{ts}] [POLY] BTC feed warming up — waiting...")
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            signal = detect_lag_signal(market, btc_now, btc_before)
+            btc_move = (btc_now - btc_before) / btc_before
+
+            if signal is None:
+                log.info(
+                    f"[{ts}] [POLY] '{market.question[:45]}' "
+                    f"| YES={yes_ask:.3f} NO={no_ask:.3f} "
+                    f"| BTC Δ{btc_move*100:+.3f}% | {secs_left/60:.1f} min left"
+                )
+            else:
+                entry_price = market.yes_ask if signal == "YES" else market.no_ask
+                ok = await place_order(session, market, signal, entry_price)
+                if ok:
+                    market.in_position   = True
+                    market.position_side = signal
+                    market.entry_price   = entry_price
+                    market.entry_time    = now_utc.isoformat()
+                    market.entry_btc     = btc_now
+                    _open_positions.add(market.condition_id)
+                    log_entry(market, signal, entry_price, btc_now, btc_move)
+                    log.info(
+                        f"[{ts}] [POLY] *** BUY {signal} *** "
+                        f"'{market.question[:50]}' "
+                        f"@ {entry_price:.3f} ({entry_price*100:.1f}¢) "
+                        f"| BTC Δ{btc_move*100:+.3f}% (lag detected) "
+                        f"| {'PAPER' if PAPER_MODE else 'LIVE'} | {secs_left/60:.1f} min left"
+                    )
+
+        except asyncio.CancelledError:
+            log.info(f"[POLY] Task cancelled for {market.condition_id[:16]}...")
+            return
+        except Exception as exc:
+            log.error(f"[POLY] run_market error: {exc}")
+
+        await asyncio.sleep(POLL_INTERVAL_S)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
+    log.info("=" * 60)
+    log.info("Kalshi Bot — Path D: Polymarket Latency Arb")
+    log.info(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
+    log.info(f"BTC move threshold: {BTC_MOVE_PCT*100:.1f}% over {BTC_WINDOW_SECS:.0f}s")
+    log.info(f"Lag gap threshold:  {LAG_GAP_CENTS:.0f}¢ | stale threshold: {STALE_THRESHOLD*100:.0f}¢")
+    log.info(f"Market window:      {MIN_SECS_TO_CLOSE}s–{MAX_HOURS_TO_CLOSE:.1f}h before close")
+    log.info(f"Order size (live):  ${ORDER_SIZE_USDC:.0f} USDC")
+    log.info(f"Trade log:          {_TRADE_LOG_PATH}")
+    log.info("=" * 60)
+
+    # Start shared Coinbase BTC feed (same module used by momentum_bot.py)
+    try:
+        import latency.binance_feed as btc_feed
+        # Attach get_price_ago to the module namespace if not already present
+        if not hasattr(btc_feed, "get_price_ago"):
+            log.error("latency/binance_feed.py missing get_price_ago() — update the file")
+            return
+        await btc_feed.start()
+        log.info("Coinbase BTC/USD feed started (shared with Path C)")
+    except ImportError:
+        log.error("latency/binance_feed not found — cannot run without BTC price feed")
+        return
+
+    # Derive / load L2 credentials
+    creds_ok = await _ensure_api_credentials()
+    if not PAPER_MODE and not creds_ok:
+        log.error("Live mode requires valid Polymarket credentials — aborting")
+        await btc_feed.stop()
+        return
+
+    connector = aiohttp.TCPConnector(ssl=_ssl_ctx, limit=50)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        active_tasks: dict[str, asyncio.Task] = {}
+
+        try:
+            while True:
+                log.info(f"[POLY] Scanning Gamma API for BTC/ETH price markets...")
+                markets = await discover_markets(session)
+
+                if markets:
+                    log.info(f"[POLY] Found {len(markets)} eligible market(s):")
+                    for m in markets:
+                        secs = (m.close_time - datetime.now(timezone.utc)).total_seconds()
+                        log.info(f"  [{m.asset}] '{m.question[:65]}' — closes in {secs/60:.1f} min")
+                else:
+                    log.info(
+                        "[POLY] No BTC/ETH price-direction markets closing within "
+                        f"{MAX_HOURS_TO_CLOSE:.0f}h found — will rescan in {REFRESH_SECS:.0f}s.\n"
+                        "       Note: Polymarket has no standardised 5/15-min crypto series.\n"
+                        "       Daily/weekly 'BTC above $X' markets are the target product."
+                    )
+
+                # Launch new tasks; skip already-monitored markets
+                for market in markets:
+                    cid = market.condition_id
+                    if cid in active_tasks and not active_tasks[cid].done():
+                        continue
+                    task = asyncio.create_task(run_market(session, market, btc_feed))
+                    active_tasks[cid] = task
+
+                # Prune finished tasks
+                for cid in [c for c, t in active_tasks.items() if t.done()]:
+                    del active_tasks[cid]
+
+                await asyncio.sleep(REFRESH_SECS)
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            log.info("Shutting down...")
+        finally:
+            for t in active_tasks.values():
+                t.cancel()
+            await asyncio.gather(*active_tasks.values(), return_exceptions=True)
+            await btc_feed.stop()
+            log.info("Polymarket bot stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
