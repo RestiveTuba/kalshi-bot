@@ -8,18 +8,22 @@ candlestick data through the momentum_bot.py strategy, and reports:
   - Per-exit-reason breakdown
   - Worst / best session
 
-Strategy mirrors momentum_bot.py exactly:
-  - Activation window : last ACTIVATE_MINS minutes of each 15-min contract
-  - Entry             : YES bid >= 85¢  OR  NO bid >= 85¢  (first signal wins)
-  - Stop-loss         : exit if held price drops below 70¢
-  - Hard close        : exit if <= 30 s remain in contract
-  - Session trade cap : max 3 entries per 15-min window
-  - No entry allowed once inside the hard-close zone
+Single-run mode (default):
+    python3 backtest.py                  # last 100 finalized markets
+    python3 backtest.py --markets 500
 
-Usage:
-    python3 backtest.py                  # last 100 finalized markets (~25 h)
-    python3 backtest.py --markets 500    # ~5 days
-    python3 backtest.py --series KXETH15M --markets 200
+Grid-search mode (324 parameter combinations, data fetched once):
+    python3 backtest.py --grid-search --markets 500
+
+Grid sweeps:
+  ENTRY_THRESHOLD     : 83, 85, 87, 90
+  CONVICTION_THRESHOLD: 91, 93, 95
+  MIN_SECS_FOR_ENTRY  : 60, 90, 120
+  BLOCKED_UTC_HOURS   : {12,13,20-23} | {20-23} | none
+  CORR_WINDOW_SECS    : 45, 90, 120   (proxy: signal must persist N secs before entry)
+
+The data fetch takes ~1-2 min for 500 markets; the 324 simulations run in <1 s.
+Full results are saved to grid_results.json; top 10 are printed to stdout.
 """
 from __future__ import annotations
 
@@ -35,6 +39,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import product as itertools_product
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -42,16 +47,30 @@ from urllib.parse import urlencode
 import aiohttp
 import certifi
 
-# ── Strategy constants (defaults; overridden by CLI flags) ──────────────────
-ENTRY_THRESHOLD    : int   = 85      # cents
-STOP_LOSS          : int   = 70      # cents  (None = disabled)
-HARD_CLOSE_SECS    : int   = 30      # seconds before expiry
-ACTIVATE_MINS      : int   = 8       # only look at last N minutes
-MAX_TRADES_PER_SESSION: int = 3
-CONTRACTS          : int   = 1       # 1 contract per trade
-MIN_SECS_FOR_ENTRY : int   = 0       # 0 = no minimum (set >0 to filter late entries)
+# ── Strategy constants (defaults; overridden by CLI flags or grid params) ──
+ENTRY_THRESHOLD      : float = 85.0   # cents
+STOP_LOSS            : Optional[float] = None  # cents  (None = disabled)
+HARD_CLOSE_SECS      : int   = 30      # seconds before expiry
+ACTIVATE_MINS        : int   = 8       # only look at last N minutes
+MAX_TRADES_PER_SESSION: int  = 3
+CONTRACTS            : int   = 1
+MIN_SECS_FOR_ENTRY   : float = 0.0    # 0 = no minimum
+MAX_ENTRY_PRICE      : float = 98.9   # never buy ≥99¢ — only 1¢ margin left
 
-# ── API / fetch settings ─────────────────────────────────────────────────────
+# ── Grid search parameter space ───────────────────────────────────────────
+GRID = {
+    "entry_threshold":      [83.0, 85.0, 87.0, 90.0],
+    "conviction_threshold": [91.0, 93.0, 95.0],
+    "min_secs_for_entry":   [60.0, 90.0, 120.0],
+    "blocked_utc_hours": [
+        frozenset({12, 13, 20, 21, 22, 23}),   # current filter
+        frozenset({20, 21, 22, 23}),             # evenings only
+        frozenset(),                             # no time filter
+    ],
+    "corr_window_secs": [45.0, 90.0, 120.0],
+}
+
+# ── API / fetch settings ─────────────────────────────────────────────────
 BASE_URL  = "https://api.elections.kalshi.com/trade-api/v2/"
 REQ_DELAY = 0.12   # seconds between requests to avoid rate-limiting
 
@@ -138,7 +157,7 @@ async def fetch_finalized_markets(
     """Return up to `limit` finalized markets, newest-first."""
     markets: list[dict] = []
     cursor: Optional[str] = None
-    page = 100  # max per page
+    page = 100
 
     while len(markets) < limit:
         params: dict = {"series_ticker": series, "status": "settled", "limit": page}
@@ -182,7 +201,6 @@ def _parse_open_ts(m: dict) -> Optional[int]:
 async def fetch_candlesticks(
     client: KalshiClient, series: str, ticker: str, start_ts: int, end_ts: int
 ) -> list[dict]:
-    """Return 1-minute candlesticks for a single market in the given window."""
     ep = f"series/{series}/markets/{ticker}/candlesticks"
     data = await client.get(ep, {"start_ts": start_ts, "end_ts": end_ts, "period_interval": 1})
     return data.get("candlesticks", [])
@@ -216,17 +234,28 @@ def simulate_session(
     close_ts: int,
     candles: list[dict],
     entry_threshold: float = ENTRY_THRESHOLD,
-    stop_loss: Optional[float] = STOP_LOSS,   # None = no stop-loss
+    conviction_threshold: float = 93.0,
+    stop_loss: Optional[float] = STOP_LOSS,
     min_secs_for_entry: float = MIN_SECS_FOR_ENTRY,
+    blocked_utc_hours: frozenset = frozenset(),
+    corr_window_secs: float = 90.0,
+    max_entry_price: float = MAX_ENTRY_PRICE,
 ) -> list[TradeResult]:
     """
-    Replay candles through the momentum strategy.
-    Each candle represents one minute; we use end-of-minute prices.
+    Replay 1-minute candles through the momentum strategy.
 
-    Args:
-        entry_threshold:   cents required to trigger a BUY signal
-        stop_loss:         cents below which we exit; None to disable
-        min_secs_for_entry: only enter if this many seconds remain (0 = no floor)
+    Parameters
+    ----------
+    entry_threshold      : cents required to trigger a regular BUY signal
+    conviction_threshold : cents at/above which we skip the corr_window wait
+                           (models the momentum_bot.py conviction override)
+    stop_loss            : cents below which we exit; None = disabled
+    min_secs_for_entry   : only enter if this many seconds remain (0 = no floor)
+    blocked_utc_hours    : frozenset of UTC hours where entries are suppressed
+    corr_window_secs     : proxy for momentum+correlation filter — a regular
+                           (non-conviction) signal must persist this many seconds
+                           before triggering entry (candle-resolution approximation)
+    max_entry_price      : never enter at or above this price (≥99¢ has <1¢ margin)
     """
     results: list[TradeResult] = []
     position_side: Optional[str] = None
@@ -234,18 +263,23 @@ def simulate_session(
     entry_ts: int = 0
     trades_entered: int = 0
 
+    # Signal persistence tracking (proxy for momentum cross + correlation filter)
+    yes_signal_since: Optional[int] = None  # unix ts when YES first exceeded threshold
+    no_signal_since:  Optional[int] = None
+
     for c in candles:
         candle_ts: int = int(c["end_period_ts"])
         secs_left: float = close_ts - candle_ts
 
-        # Skip candles outside activation window
         if secs_left <= 0 or secs_left > ACTIVATE_MINS * 60:
+            yes_signal_since = None
+            no_signal_since  = None
             continue
 
         yes_bid, yes_ask = _candle_to_prices(c)
-        no_bid  = 100.0 - yes_ask
+        no_bid = 100.0 - yes_ask
 
-        # ── Hard close ──────────────────────────────────────────────────────
+        # ── Hard close ────────────────────────────────────────────────────
         if position_side is not None and secs_left <= HARD_CLOSE_SECS:
             exit_price = yes_bid if position_side == "YES" else no_bid
             pnl = (exit_price - entry_price) * CONTRACTS / 100.0
@@ -256,9 +290,11 @@ def simulate_session(
                 exit_reason="HARD_CLOSE", pnl=round(pnl, 4),
             ))
             position_side = None
+            yes_signal_since = None
+            no_signal_since  = None
             continue
 
-        # ── Stop-loss (skipped if disabled) ─────────────────────────────────
+        # ── Stop-loss (skipped if disabled) ──────────────────────────────
         if stop_loss is not None and position_side is not None:
             held = yes_bid if position_side == "YES" else no_bid
             if held < stop_loss:
@@ -270,28 +306,62 @@ def simulate_session(
                     exit_reason="STOP_LOSS", pnl=round(pnl, 4),
                 ))
                 position_side = None
+                yes_signal_since = None
+                no_signal_since  = None
                 continue
 
-        # ── Entry: flat, cap not reached, outside hard-close zone, min secs ok ─
-        entry_secs_ok = (min_secs_for_entry == 0) or (secs_left >= min_secs_for_entry)
+        # ── Entry ─────────────────────────────────────────────────────────
         if (
             position_side is None
             and trades_entered < MAX_TRADES_PER_SESSION
             and secs_left > HARD_CLOSE_SECS
-            and entry_secs_ok
+            and ((min_secs_for_entry == 0) or (secs_left >= min_secs_for_entry))
         ):
-            if yes_bid >= entry_threshold:
-                position_side = "YES"
-                entry_price = yes_bid
-                entry_ts = candle_ts
-                trades_entered += 1
-            elif no_bid >= entry_threshold:
-                position_side = "NO"
-                entry_price = no_bid
-                entry_ts = candle_ts
-                trades_entered += 1
+            # Time-of-day filter
+            candle_hour = datetime.utcfromtimestamp(candle_ts).hour
+            if candle_hour in blocked_utc_hours:
+                yes_signal_since = None
+                no_signal_since  = None
 
-    # ── Force-close any position still open at last candle ──────────────────
+            elif yes_bid >= entry_threshold and yes_bid < max_entry_price:
+                # Track how long YES has been at/above threshold
+                if yes_signal_since is None:
+                    yes_signal_since = candle_ts
+                no_signal_since = None  # reset opposite
+
+                signal_age = candle_ts - yes_signal_since
+                is_conviction = yes_bid >= conviction_threshold
+
+                # Conviction bypass (≥conviction_threshold): enter immediately
+                # Normal entry: wait for corr_window_secs of persistent signal
+                if is_conviction or signal_age >= corr_window_secs:
+                    position_side = "YES"
+                    entry_price   = yes_bid
+                    entry_ts      = candle_ts
+                    trades_entered += 1
+                    yes_signal_since = None
+
+            elif no_bid >= entry_threshold and no_bid < max_entry_price:
+                if no_signal_since is None:
+                    no_signal_since = candle_ts
+                yes_signal_since = None
+
+                signal_age = candle_ts - no_signal_since
+                is_conviction = no_bid >= conviction_threshold
+
+                if is_conviction or signal_age >= corr_window_secs:
+                    position_side = "NO"
+                    entry_price   = no_bid
+                    entry_ts      = candle_ts
+                    trades_entered += 1
+                    no_signal_since = None
+
+            else:
+                # Price below threshold — reset signal tracking
+                yes_signal_since = None
+                no_signal_since  = None
+
+    # ── Force-close any remaining open position ───────────────────────────
     if position_side is not None and candles:
         last_c = candles[-1]
         last_ts = int(last_c["end_period_ts"])
@@ -318,8 +388,8 @@ def compute_stats(
     session_pnls: list[float],
 ) -> dict:
     """
-    Returns a dict of metrics.
     Sharpe is computed on per-session P&L, annualised assuming 96 sessions/day.
+    Returns {} if no trades.
     """
     if not all_trades:
         return {}
@@ -332,14 +402,12 @@ def compute_stats(
     avg_pnl  = statistics.mean(pnls)
     total    = sum(pnls)
 
-    # Sharpe on per-session P&L (96 sessions/day × 365 days ≈ 35040/year)
     sharpe = 0.0
     if len(session_pnls) > 1:
         mu  = statistics.mean(session_pnls)
         std = statistics.stdev(session_pnls)
         if std > 0:
-            # annualise: sqrt(sessions per year)
-            sharpe = (mu / std) * math.sqrt(35040)
+            sharpe = (mu / std) * math.sqrt(35040)  # 96 sessions/day × 365
 
     by_reason: dict[str, dict] = {}
     for t in all_trades:
@@ -390,8 +458,184 @@ def print_results(stats: dict, series: str, n_markets: int, n_fetched: int) -> N
     print(f"{'═' * 56}\n")
 
 
+def _hours_label(hours: frozenset) -> str:
+    if not hours:
+        return "none     "
+    if 12 in hours:
+        return "{12,13,20-23}"
+    return "{20-23}  "
+
+
+def print_grid_results(
+    results: list[dict],
+    n_requested: int,
+    n_fetched: int,
+    series: str = "KXBTC15M",
+) -> None:
+    W = 110
+    print(f"\n{'═' * W}")
+    print(f"  KXBTC15M Grid Search — {n_fetched} markets (of {n_requested} requested), 324 parameter combinations")
+    print(f"  NOTE: corr_window is a signal-persistence proxy (live uses cross-series correlation)")
+    print(f"{'═' * W}")
+
+    hdr = (
+        f"  {'#':>2}  {'entry':>5}  {'conv':>4}  {'min_s':>5}  "
+        f"{'utc_block':>12}  {'corr_w':>6}  "
+        f"{'trades':>6}  {'win%':>6}  "
+        f"{'avg_pnl':>8}  {'total_pnl':>10}  {'sharpe':>7}"
+    )
+    print(hdr)
+    print(f"  {'─' * (W - 4)}")
+
+    for rank, r in enumerate(results, 1):
+        p = r["params"]
+        s = r["stats"]
+        if not s:
+            continue
+        print(
+            f"  {rank:>2}  "
+            f"{p.entry_threshold:>4.0f}¢  "
+            f"{p.conviction_threshold:>3.0f}¢  "
+            f"{p.min_secs_for_entry:>4.0f}s  "
+            f"{_hours_label(p.blocked_utc_hours):>12}  "
+            f"{p.corr_window_secs:>5.0f}s  "
+            f"{s['total_trades']:>6}  "
+            f"{s['win_rate']:>5.1%}  "
+            f"${s['avg_pnl_per_trade']:>+7.4f}  "
+            f"${s['total_pnl']:>+9.4f}  "
+            f"{s['sharpe_annualised']:>7.3f}"
+        )
+
+    print(f"{'═' * W}\n")
+
+
 # ---------------------------------------------------------------------------
-# Main
+# Grid search
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GridParams:
+    entry_threshold:      float
+    conviction_threshold: float
+    min_secs_for_entry:   float
+    blocked_utc_hours:    frozenset
+    corr_window_secs:     float
+
+
+async def run_grid_search(series: str, n_markets: int) -> None:
+    """
+    Phase 1: Fetch all candlestick data (once, ~1-2 min for 500 markets).
+    Phase 2: Simulate all 324 parameter combinations in-memory (<1 s).
+    Phase 3: Print top 10 by Sharpe; save full results to grid_results.json.
+    """
+    client = KalshiClient()
+    try:
+        # ── Phase 1: fetch ───────────────────────────────────────────────
+        print(f"[grid] Fetching {n_markets} settled {series} markets...", flush=True)
+        raw_markets = await fetch_finalized_markets(client, series, n_markets)
+        print(f"[grid] Got {len(raw_markets)} markets, fetching candlesticks...", flush=True)
+
+        market_data: list[dict] = []
+        for i, m in enumerate(raw_markets, 1):
+            ticker   = m.get("ticker", "")
+            close_ts = _parse_close_ts(m)
+            open_ts  = _parse_open_ts(m)
+            if not ticker or not close_ts or not open_ts:
+                continue
+            window_start = close_ts - ACTIVATE_MINS * 60 - 60
+            window_end   = close_ts
+            try:
+                candles = await fetch_candlesticks(
+                    client, series, ticker, window_start, window_end
+                )
+            except Exception as exc:
+                print(f"[grid] {ticker}: fetch failed ({exc})", flush=True)
+                candles = []
+            if candles:
+                market_data.append({
+                    "ticker":   ticker,
+                    "close_ts": close_ts,
+                    "candles":  candles,
+                })
+            if i % 100 == 0 or i == len(raw_markets):
+                print(f"[grid]   {i}/{len(raw_markets)} markets fetched, {len(market_data)} with candles", flush=True)
+            await asyncio.sleep(REQ_DELAY)
+
+        print(f"[grid] Cached {len(market_data)} markets. Running 324 simulations...", flush=True)
+
+        # ── Phase 2: grid simulations ────────────────────────────────────
+        keys   = list(GRID.keys())
+        combos = list(itertools_product(*GRID.values()))
+
+        all_results: list[dict] = []
+        t0 = time.time()
+
+        for combo in combos:
+            params = dict(zip(keys, combo))
+            gp = GridParams(**params)
+
+            all_trades:   list[TradeResult] = []
+            session_pnls: list[float]       = []
+
+            for md in market_data:
+                trades = simulate_session(
+                    md["ticker"],
+                    md["close_ts"],
+                    md["candles"],
+                    entry_threshold      = gp.entry_threshold,
+                    conviction_threshold = gp.conviction_threshold,
+                    stop_loss            = None,
+                    min_secs_for_entry   = gp.min_secs_for_entry,
+                    blocked_utc_hours    = gp.blocked_utc_hours,
+                    corr_window_secs     = gp.corr_window_secs,
+                )
+                all_trades.extend(trades)
+                if trades:
+                    session_pnls.append(sum(t.pnl for t in trades))
+
+            stats = compute_stats(all_trades, session_pnls)
+            all_results.append({"params": gp, "stats": stats})
+
+        elapsed = time.time() - t0
+        print(f"[grid] All {len(combos)} simulations done in {elapsed:.2f}s.", flush=True)
+
+        # ── Phase 3: rank and output ────────────────────────────────────
+        all_results.sort(
+            key=lambda r: r["stats"].get("sharpe_annualised", -float("inf")),
+            reverse=True,
+        )
+
+        print_grid_results(all_results[:10], n_markets, len(market_data), series)
+
+        # Save full results
+        out_path = Path(__file__).parent / "grid_results.json"
+        serializable = []
+        for r in all_results:
+            p = r["params"]
+            s = r["stats"]
+            if not s:
+                continue
+            serializable.append({
+                "params": {
+                    "entry_threshold":      p.entry_threshold,
+                    "conviction_threshold": p.conviction_threshold,
+                    "min_secs_for_entry":   p.min_secs_for_entry,
+                    "blocked_utc_hours":    sorted(p.blocked_utc_hours),
+                    "corr_window_secs":     p.corr_window_secs,
+                },
+                "stats": {
+                    k: v for k, v in s.items() if k != "by_exit_reason"
+                },
+            })
+        out_path.write_text(json.dumps(serializable, indent=2))
+        print(f"[grid] Full results ({len(serializable)} rows) saved to {out_path}\n", flush=True)
+
+    finally:
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Single-run main (unchanged interface)
 # ---------------------------------------------------------------------------
 
 async def main(
@@ -413,25 +657,22 @@ async def main(
     try:
         markets = await fetch_finalized_markets(client, series, n_markets)
 
-        all_trades: list[TradeResult] = []
-        session_pnls: list[float] = []
+        all_trades:   list[TradeResult] = []
+        session_pnls: list[float]       = []
 
         for i, m in enumerate(markets, 1):
-            ticker    = m.get("ticker", "")
-            close_ts  = _parse_close_ts(m)
-            open_ts   = _parse_open_ts(m)
+            ticker   = m.get("ticker", "")
+            close_ts = _parse_close_ts(m)
+            open_ts  = _parse_open_ts(m)
             if not ticker or not close_ts or not open_ts:
                 continue
-
             window_start = close_ts - ACTIVATE_MINS * 60 - 60
             window_end   = close_ts
-
             try:
                 candles = await fetch_candlesticks(client, series, ticker, window_start, window_end)
             except Exception as exc:
                 print(f"[{label}] {ticker}: fetch failed ({exc})", flush=True)
                 continue
-
             if not candles:
                 await asyncio.sleep(REQ_DELAY)
                 continue
@@ -446,7 +687,6 @@ async def main(
             session_pnl = sum(t.pnl for t in trades)
             if trades:
                 session_pnls.append(session_pnl)
-
             await asyncio.sleep(REQ_DELAY)
 
         if not all_trades:
@@ -454,36 +694,51 @@ async def main(
             return
 
         stats = compute_stats(all_trades, session_pnls)
-        # Emit a single parseable result line (JSON envelope)
         print("RESULT:" + json.dumps({"label": label, "stats": stats}), flush=True)
 
     finally:
         await client.close()
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="Momentum strategy backtester")
-    parser.add_argument("--series",    default="KXBTC15M")
-    parser.add_argument("--markets",   type=int,   default=100)
-    parser.add_argument("--entry",     type=float, default=85,  help="Entry threshold in cents (default 85)")
-    parser.add_argument("--stop",      type=float, default=70,  help="Stop-loss in cents (default 70); use 0 to disable")
-    parser.add_argument("--min-secs",  type=float, default=0,   help="Min seconds remaining before entry (default 0 = none)")
-    parser.add_argument("--label",     default="",              help="Label for this run (used in output)")
+    parser.add_argument("--series",      default="KXBTC15M")
+    parser.add_argument("--markets",     type=int,   default=100)
+    parser.add_argument("--entry",       type=float, default=85,  help="Entry threshold cents")
+    parser.add_argument("--stop",        type=float, default=0,   help="Stop-loss cents (0=disabled)")
+    parser.add_argument("--min-secs",    type=float, default=0,   help="Min seconds remaining before entry")
+    parser.add_argument("--label",       default="",              help="Label for single-run output")
+    parser.add_argument("--grid-search", action="store_true",
+                        help="Run 324-combination grid search; outputs top-10 Sharpe table")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    stop_loss_val: Optional[float] = args.stop if args.stop > 0 else None
-    label = args.label or f"entry={args.entry:.0f} stop={'none' if stop_loss_val is None else args.stop:.0f} minsecs={args.min_secs:.0f}"
     try:
-        asyncio.run(main(
-            series=args.series,
-            n_markets=args.markets,
-            entry_threshold=args.entry,
-            stop_loss=stop_loss_val,
-            min_secs_for_entry=args.min_secs,
-            label=label,
-        ))
+        if args.grid_search:
+            asyncio.run(run_grid_search(
+                series=args.series,
+                n_markets=args.markets,
+            ))
+        else:
+            stop_loss_val: Optional[float] = args.stop if args.stop > 0 else None
+            label = args.label or (
+                f"entry={args.entry:.0f} "
+                f"stop={'none' if stop_loss_val is None else f'{args.stop:.0f}'} "
+                f"minsecs={args.min_secs:.0f}"
+            )
+            asyncio.run(main(
+                series=args.series,
+                n_markets=args.markets,
+                entry_threshold=args.entry,
+                stop_loss=stop_loss_val,
+                min_secs_for_entry=args.min_secs,
+                label=label,
+            ))
     except KeyboardInterrupt:
         print("\nInterrupted.")

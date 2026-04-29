@@ -102,6 +102,7 @@ DIRECTION_WINDOW_SECS  = 60.0   # BTC must have moved UP (for YES) or DOWN (for 
 # Risk controls — no external data needed
 DAILY_LOSS_LIMIT_USD   = 1.50   # halt ALL new entries if today's realized P&L drops below -$1.50
 SESSION_HALT_MIN_LOSS  = 0.05   # any single loss ≥ 5¢ sets session_halted on that series
+MAX_ENTRY_PRICE        = 99.0   # never buy ≥99¢ — only 1¢ margin left, risk/reward is never rational
 
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
@@ -363,6 +364,7 @@ class TradeRecord:
     signal_to_close_secs: float  # seconds from entry signal to market close
     exit_reason: str           # "STOP_LOSS" | "HARD_CLOSE" | "SESSION_RESET"
     pnl_dollars: float
+    entry_type: str = ""       # "MOM" (momentum+corr) or "MOM_OVERRIDE" (conviction bypass)
     paper: bool = True
 
 
@@ -389,6 +391,8 @@ class SessionState:
     last_held_price: float = 0.0
     # Session halt: set True after a losing trade so we don't compound losses in the same window
     session_halted: bool = False
+    # Entry type for the current position — written to JSONL on close
+    entry_type: str = ""       # "MOM" | "MOM_OVERRIDE"
 
 
 def _close_position(
@@ -421,6 +425,7 @@ def _close_position(
         signal_to_close_secs=elapsed,
         exit_reason=exit_reason,
         pnl_dollars=round(pnl, 4),
+        entry_type=state.entry_type,
         paper=PAPER_MODE,
     )
     _write_trade_record(asdict(record))
@@ -434,6 +439,7 @@ def _close_position(
     state.entry_secs_left = 0.0
     state.peak_price = 0.0
     state.last_held_price = 0.0
+    state.entry_type = ""
 
     # Halt re-entry in this session after any non-trivial loss
     if pnl < -SESSION_HALT_MIN_LOSS:
@@ -464,6 +470,7 @@ def _reset_session_state(state: SessionState) -> None:
     state.peak_price = 0.0
     state.last_held_price = 0.0
     state.session_halted = False
+    state.entry_type = ""
     _pending_signals.pop(state.series, None)
     _open_positions.discard(state.series)
 
@@ -688,6 +695,14 @@ async def run_series(client: _SimpleClient, series: str):
                         f"[{ts}] [{series}] ENTRY BLOCKED — global position lock "
                         f"(already in: {sorted(_open_positions)}) | {mins_left:.1f} min left"
                     )
+                elif yes_bid >= MAX_ENTRY_PRICE or no_bid >= MAX_ENTRY_PRICE:
+                    over_side  = "YES" if yes_bid >= MAX_ENTRY_PRICE else "NO"
+                    over_price = yes_bid if yes_bid >= MAX_ENTRY_PRICE else no_bid
+                    log.info(
+                        f"[{ts}] [{series}] ENTRY BLOCKED — {over_side} {over_price:.1f}c "
+                        f"≥ {MAX_ENTRY_PRICE:.0f}c (never pay ≥99c, risk/reward < 1¢) | "
+                        f"{mins_left:.1f} min left"
+                    )
                 elif yes_bid >= ENTRY_THRESHOLD and _has_crossed_up(state.yes_bid_history, ENTRY_THRESHOLD):
                     # Directional filter: BTC must be rising to justify a YES entry
                     _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
@@ -701,6 +716,7 @@ async def run_series(client: _SimpleClient, series: str):
                         _register_signal(series, "YES")
                         if _check_correlation(series, "YES"):
                             state.position_side = "YES"
+                            state.entry_type = "MOM"
                             state.entry_price = yes_bid
                             state.peak_price = yes_bid
                             state.last_held_price = yes_bid
@@ -736,6 +752,7 @@ async def run_series(client: _SimpleClient, series: str):
                         _register_signal(series, "NO")
                         if _check_correlation(series, "NO"):
                             state.position_side = "NO"
+                            state.entry_type = "MOM"
                             state.entry_price = no_bid
                             state.peak_price = no_bid
                             state.last_held_price = no_bid
@@ -775,6 +792,7 @@ async def run_series(client: _SimpleClient, series: str):
                         )
                     else:
                         state.position_side = "YES"
+                        state.entry_type = "MOM_OVERRIDE"
                         state.entry_price = yes_bid
                         state.peak_price = yes_bid
                         state.last_held_price = yes_bid
@@ -799,6 +817,7 @@ async def run_series(client: _SimpleClient, series: str):
                         )
                     else:
                         state.position_side = "NO"
+                        state.entry_type = "MOM_OVERRIDE"
                         state.entry_price = no_bid
                         state.peak_price = no_bid
                         state.last_held_price = no_bid
@@ -865,7 +884,8 @@ async def main():
              f"| feed available: {_BTC_FEED_AVAILABLE}")
     log.info(f"Risk controls: global position lock (max 1 open) | "
              f"session halt after >{SESSION_HALT_MIN_LOSS*100:.0f}c loss | "
-             f"daily circuit breaker at −${DAILY_LOSS_LIMIT_USD:.2f}")
+             f"daily circuit breaker at −${DAILY_LOSS_LIMIT_USD:.2f} | "
+             f"max entry price {MAX_ENTRY_PRICE:.0f}c (never pay ≥99c)")
     log.info(f"Trade log: {_TRADE_LOG_PATH}")
     log.info("=" * 60)
 
