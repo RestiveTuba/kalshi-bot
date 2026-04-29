@@ -677,6 +677,12 @@ async def run_series(client: _SimpleClient, series: str):
                         f"(today P&L ${_get_today_pnl():+.2f} ≤ −${DAILY_LOSS_LIMIT_USD:.2f})"
                     )
                 elif _open_positions:
+                    # Clear stale correlation state so the series requires a FRESH
+                    # price cross and NEW cross-series confirmation after the lock releases.
+                    # Without this, a 90-second-old pending signal could confirm an entry
+                    # immediately after the previous position exits — into the same adverse move.
+                    state.corr_waiting = False
+                    _pending_signals.pop(series, None)
                     log.info(
                         f"[{ts}] [{series}] ENTRY BLOCKED — global position lock "
                         f"(already in: {sorted(_open_positions)}) | {mins_left:.1f} min left"
