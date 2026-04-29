@@ -282,6 +282,72 @@ class _SimpleClient:
 
 
 # ---------------------------------------------------------------------------
+# Telegram alerts
+# ---------------------------------------------------------------------------
+
+def _load_tg_creds() -> tuple[str, str]:
+    """Read TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from .env or environment."""
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    cid = os.environ.get("TELEGRAM_CHAT_ID", "")
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                v = v.strip().strip('"').strip("'")
+                if k.strip() == "TELEGRAM_BOT_TOKEN":
+                    tok = v
+                elif k.strip() == "TELEGRAM_CHAT_ID":
+                    cid = v
+    return tok, cid
+
+
+_TG_TOKEN, _TG_CHAT_ID = _load_tg_creds()
+_TG_API = f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage" if _TG_TOKEN else ""
+
+# Per-series alert cooldowns — prevents flooding on repeated events
+_tg_err_ts: dict[str, float] = {}       # error alerts
+_tg_cb_fired: bool = False              # circuit breaker alert (once per day)
+
+
+async def _telegram_send(text: str) -> None:
+    """POST one message to Telegram. Silently swallows all errors."""
+    if not _TG_API or not _TG_CHAT_ID:
+        return
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(
+                _TG_API,
+                json={"chat_id": _TG_CHAT_ID, "text": text},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+    except Exception:
+        pass
+
+
+def _tg_alert(text: str) -> None:
+    """Fire-and-forget Telegram alert. Zero latency; safe from sync or async code."""
+    if not _TG_API or not _TG_CHAT_ID:
+        return
+    try:
+        asyncio.ensure_future(_telegram_send(text))
+    except RuntimeError:
+        pass  # no running loop (only possible at module import time — never in practice)
+
+
+def _tg_error(series: str, exc: Exception) -> None:
+    """Rate-limited error alert — at most once per 5 minutes per series."""
+    now = time.time()
+    if now - _tg_err_ts.get(series, 0) < 300:
+        return
+    _tg_err_ts[series] = now
+    _tg_alert(f"❌ Error [{series}]: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Market data helpers
 # ---------------------------------------------------------------------------
 
@@ -478,6 +544,13 @@ def _close_position(
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _daily_pnl[today] = _daily_pnl.get(today, 0.0) + pnl
 
+    mode = "paper" if PAPER_MODE else "live"
+    _tg_alert(
+        f"{'💰' if pnl >= 0 else '🔴'} CLOSE {record.side} {record.series} "
+        f"{record.entry_price_cents:.0f}¢→{record.exit_price_cents:.0f}¢ | "
+        f"P&L: ${pnl:+.2f} | {exit_reason} | "
+        f"day: ${_daily_pnl[today]:+.2f} | {mode}"
+    )
     return pnl
 
 
@@ -641,6 +714,11 @@ async def _execute_entry(
                     f"| bid={price:.0f}c offset={MAKER_OFFSET_CENTS:.0f}c "
                     f"| waiting ≤{MAKER_TIMEOUT_SECS}s | {mins_left:.1f} min left"
                 )
+                _tg_alert(
+                    f"🎯 MAKER ORDER {side} {series} @ {limit_price:.0f}¢ ×{CONTRACTS} "
+                    f"[{entry_type}] | waiting {MAKER_TIMEOUT_SECS}s | "
+                    f"{'paper' if PAPER_MODE else 'live'}"
+                )
                 return  # position will be set when fill is confirmed in run_series
             # Fall through to taker if order posting failed
 
@@ -658,6 +736,10 @@ async def _execute_entry(
         f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [{entry_type}] "
         f"| entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} "
         f"| {mins_left:.1f} min left"
+    )
+    _tg_alert(
+        f"📈 BUY {side} {series} @ {price:.0f}¢ ×{CONTRACTS} [{entry_type}] | "
+        f"{mins_left:.1f} min left | {'paper' if PAPER_MODE else 'live'}"
     )
 
 
@@ -786,6 +868,11 @@ async def run_series(client: _SimpleClient, series: str):
                         f"| entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} "
                         f"| {mins_left:.1f} min left"
                     )
+                    _tg_alert(
+                        f"📈 MAKER FILL {state.position_side} {series} @ {fill_price:.0f}¢ ×{CONTRACTS} "
+                        f"[{state.entry_type}] | {mins_left:.1f} min left | "
+                        f"{'paper' if PAPER_MODE else 'live'}"
+                    )
                     # Don't continue — fall through to the holding logic below
 
                 elif elapsed >= MAKER_TIMEOUT_SECS:
@@ -894,6 +981,13 @@ async def run_series(client: _SimpleClient, series: str):
                         f"[{ts}] [{series}] ENTRY BLOCKED — daily loss limit "
                         f"(today P&L ${_get_today_pnl():+.2f} ≤ −${DAILY_LOSS_LIMIT_USD:.2f})"
                     )
+                    global _tg_cb_fired
+                    if not _tg_cb_fired:
+                        _tg_cb_fired = True
+                        _tg_alert(
+                            f"🛑 CIRCUIT BREAKER — day P&L: ${_get_today_pnl():+.2f} "
+                            f"≤ −${DAILY_LOSS_LIMIT_USD:.2f} | all entries halted"
+                        )
                 elif _open_positions:
                     # Clear stale correlation state so the series requires a FRESH
                     # price cross and NEW cross-series confirmation after the lock releases.
@@ -1025,6 +1119,7 @@ async def run_series(client: _SimpleClient, series: str):
             return
         except Exception as exc:
             log.error(f"[{series}] Unexpected error: {exc}")
+            _tg_error(series, exc)
 
         await asyncio.sleep(POLL_INTERVAL_S)
 
@@ -1054,6 +1149,8 @@ async def main():
                   f"timeout={MAKER_TIMEOUT_SECS}s") if MAKER_MODE else "disabled (TAKER mode)"
     log.info(f"Market-making mode: {maker_desc}")
     log.info(f"Trade log: {_TRADE_LOG_PATH}")
+    tg_status = f"chat_id={_TG_CHAT_ID}" if _TG_TOKEN else "disabled"
+    log.info(f"Telegram alerts: {tg_status}")
     log.info("=" * 60)
 
     client = _SimpleClient()
@@ -1062,6 +1159,11 @@ async def main():
         if _BTC_FEED_AVAILABLE:
             await _start_btc_feed()
             log.info("BTC directional feed started (Coinbase WebSocket)")
+        _tg_alert(
+            f"✅ Momentum bot started — {'PAPER' if PAPER_MODE else 'LIVE'} | "
+            f"entry≥{ENTRY_THRESHOLD}¢ | ×{CONTRACTS} | "
+            f"BTC feed: {_BTC_FEED_AVAILABLE}"
+        )
         tasks = [asyncio.create_task(run_series(client, s)) for s in SERIES]
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1072,6 +1174,9 @@ async def main():
         if _BTC_FEED_AVAILABLE:
             await _stop_btc_feed()
         await client.close()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day_pnl = _daily_pnl.get(today, 0.0)
+        _tg_alert(f"⏹ Bot stopped — day P&L: ${day_pnl:+.2f}")
         log.info("Bot stopped.")
 
 
