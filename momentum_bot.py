@@ -102,10 +102,6 @@ DIRECTION_WINDOW_SECS  = 60.0   # BTC must have moved UP (for YES) or DOWN (for 
 DAILY_LOSS_LIMIT_USD   = 1.50   # halt ALL new entries if today's realized P&L drops below -$1.50
 SESSION_HALT_MIN_LOSS  = 0.05   # any single loss ≥ 5¢ sets session_halted on that series
 
-# Simulation multiplier — paper mode only. Does NOT change actual order sizing (always 1 contract).
-# Scales pnl_dollars in the JSONL log so the dashboard reflects what N contracts would earn.
-SIMULATION_MULTIPLIER  = 10
-
 # Tuning rationale (500-session KXBTC15M backtest, Apr 2026):
 #   Entry 92¢, no stop, 90s min → win rate 95.4%, Sharpe +3.68, total P&L +$1.60
 #   Entry 85¢, no stop          → win rate 90.8%, Sharpe -1.92, total P&L -$1.39
@@ -426,13 +422,7 @@ def _close_position(
         pnl_dollars=round(pnl, 4),
         paper=PAPER_MODE,
     )
-    # Scale logged P&L by the simulation multiplier so the JSONL reflects
-    # what SIMULATION_MULTIPLIER contracts would earn. Internal session
-    # tracking (state.session_pnl, state.total_pnl) stays at 1-contract values.
-    record_dict = asdict(record)
-    record_dict["pnl_dollars"] = round(pnl * SIMULATION_MULTIPLIER, 4)
-    record_dict["simulated_contracts"] = SIMULATION_MULTIPLIER
-    _write_trade_record(record_dict)
+    _write_trade_record(asdict(record))
 
     state.session_pnl += pnl
     state.total_pnl += pnl
