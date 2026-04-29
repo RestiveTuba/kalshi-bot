@@ -125,25 +125,59 @@ CHAIN_ID   = 137   # Polygon mainnet
 
 PAPER_MODE = True  # flip to False only after funding and verifying credentials
 
-# Signal parameters
-BTC_MOVE_PCT      = 0.003   # 0.3 % move in BTC_WINDOW_SECS triggers lag check
-BTC_WINDOW_SECS   = 30.0    # rolling window for BTC move measurement
-LAG_GAP_CENTS     = 4.0     # cents (0.04 in [0,1]): min expected-vs-actual gap to signal
-STALE_THRESHOLD   = 0.01    # if Polymarket moved < 1 ¢ while BTC moved ≥ 0.3 %, price is stale
+# Signal parameters — dynamic thresholds by time-to-close
+# Contracts with <1h left reprice more aggressively on BTC moves
+BTC_WINDOW_SECS        = 30.0  # rolling window for BTC move measurement
+LAG_GAP_CENTS          = 4.0   # cents: minimum implied-edge gap to signal
 
-# Market discovery
-MAX_HOURS_TO_CLOSE  = 6.0   # watch markets closing within this many hours
-MIN_SECS_TO_CLOSE   = 120   # don't enter within 2 min of market close
-REFRESH_SECS        = 120.0 # re-scan Gamma for new markets every 2 min
-POLL_INTERVAL_S     = 0.5   # 500 ms per market poll cycle
-PRICE_HISTORY_LEN   = 120   # 120 × 0.5 s = 60 s of price history per token
+# Near-term (<1h to close): tighter move threshold, lower stale bar
+BTC_MOVE_PCT_NEAR      = 0.003  # 0.3% BTC move required
+STALE_THRESHOLD_NEAR   = 0.04   # Polymarket must NOT have moved ≥4¢ in window
 
-# Markets of interest — Gamma API text-search terms
-SEARCH_TERMS = ["BTC above", "BTC below", "bitcoin above", "bitcoin below",
-                "ETH above",  "ETH below",  "ether above",  "ether below",
-                "BTC price",  "ETH price",  "bitcoin price", "ethereum price"]
-TRACKED_ASSETS = {"BTC": ["BTC", "bitcoin", "Bitcoin"],
-                  "ETH": ["ETH", "ether", "Ethereum", "ethereum"]}
+# Far-term (1-4h to close): need bigger move, higher stale bar (daily contracts lag more)
+BTC_MOVE_PCT_FAR       = 0.008  # 0.8% BTC move required
+STALE_THRESHOLD_FAR    = 0.06   # Polymarket must NOT have moved ≥6¢ in window
+
+STALENESS_CONFIRM_SECS = 60.0   # also check that price has been flat for 60s (not just 30s)
+
+# Sensitivity: ¢ of probability shift implied per 1% BTC move
+# Near-term contracts (high delta) move more; far-term contracts (lower delta) move less
+SENSITIVITY_NEAR = 12.0
+SENSITIVITY_FAR  = 6.0
+
+# Market discovery — two-tier window
+#
+# SCAN_HOURS:  how far out to look for upcoming markets (24h lookahead).
+#              Markets in this window are tracked in the pipeline but not traded.
+#
+# MAX_HOURS_TO_CLOSE: only TRADE markets closing within this many hours.
+#              Below 4h, daily BTC contracts are in their final stretch and
+#              reprice more aggressively on BTC moves (higher delta).
+#
+# Note: Polymarket has no standardised 5/15-min crypto series. Their BTC/ETH
+# markets are daily ("Will BTC close above $X today?") settling at midnight UTC.
+# Between daily close and new contract creation (~00:00-01:00 UTC) there will
+# be no markets in the TRADE window — the bot rescan log will say so clearly.
+SCAN_HOURS          = 24.0   # lookahead: discover markets closing within 24h
+MAX_HOURS_TO_CLOSE  = 4.0    # trade window: only enter on markets <4h to close
+MIN_SECS_TO_CLOSE   = 120    # hard floor: don't enter within 2 min of close
+MIN_VOLUME_USDC     = 10_000  # skip thin markets — wide spreads eat arb profit
+REFRESH_SECS        = 120.0  # re-scan Gamma API every 2 min
+POLL_INTERVAL_S     = 0.5    # 500 ms per market poll cycle
+PRICE_HISTORY_LEN   = 180    # 180 × 0.5 s = 90 s of price history per token
+
+# Gamma API search — use event/tag search for crypto rather than full-text
+# Full-text q= searches entire description and returns off-topic markets (eg. GTA VI bets)
+# Instead: query by tag "crypto" and filter client-side by question keywords
+GAMMA_TAGS      = ["crypto", "bitcoin", "ethereum"]
+QUESTION_INCLUDE = ["above", "below", "higher", "lower", "over", "price up", "price down",
+                    "reach", "hit", "exceed", "close above", "close below", "end above",
+                    "end below", "finish above", "finish below"]
+
+ASSET_KEYWORDS = {
+    "BTC": ["btc", "bitcoin", " btc "],
+    "ETH": ["eth", "ethereum", "ether"],
+}
 
 # Order sizing (live mode only)
 ORDER_SIZE_USDC = 10.0   # $10 USDC per trade
@@ -271,6 +305,8 @@ class MarketWatch:
     yes_token_id:  str        # big-integer string from clobTokenIds[0]
     no_token_id:   str        # big-integer string from clobTokenIds[1]
     close_time:    datetime
+    volume_usdc:   float = 0.0  # total market volume (for logging)
+    volume_24h:    float = 0.0  # 24-hour volume (more indicative of current liquidity)
 
     # Polled prices (updated every POLL_INTERVAL_S)
     yes_ask: float = 0.0      # best ask for YES outcome (what you pay to buy)
@@ -286,6 +322,10 @@ class MarketWatch:
     entry_price:   float = 0.0
     entry_time:    str   = ""
     entry_btc:     float = 0.0             # BTC price at entry
+
+    @property
+    def hours_to_close(self) -> float:
+        return (self.close_time - datetime.now(timezone.utc)).total_seconds() / 3600
 
 
 # Global position lock — same pattern as momentum_bot.py
@@ -329,90 +369,175 @@ async def _post_json(session: aiohttp.ClientSession, url: str,
 # Market discovery (Gamma API)
 # ---------------------------------------------------------------------------
 
-def _asset_of(question: str) -> Optional[str]:
-    """Return 'BTC' or 'ETH' if the question is a crypto price-direction market."""
+def _classify_market(question: str) -> Optional[str]:
+    """
+    Return 'BTC' or 'ETH' if the question is a BTC/ETH price-direction market,
+    None otherwise.
+
+    Checks:
+    1. Question contains an asset keyword (btc/bitcoin, eth/ethereum)
+    2. Question contains a directional-price keyword (above, below, reach, etc.)
+
+    Uses case-insensitive matching on the question only — NOT the full description,
+    which avoids false-positives from event descriptions mentioning crypto tangentially.
+    """
     q = question.lower()
-    for asset, keywords in TRACKED_ASSETS.items():
-        if any(kw.lower() in q for kw in keywords):
-            # Must also contain a price-direction keyword
-            if any(w in q for w in ("above", "below", "higher", "lower", "over", "price", "up", "down")):
+    for asset, keywords in ASSET_KEYWORDS.items():
+        if any(kw in q for kw in keywords):
+            if any(kw in q for kw in QUESTION_INCLUDE):
                 return asset
     return None
 
 
-async def discover_markets(session: aiohttp.ClientSession) -> list[MarketWatch]:
+def _parse_close_time(m: dict) -> Optional[datetime]:
     """
-    Query the Gamma API for active BTC/ETH price-direction markets closing within
-    MAX_HOURS_TO_CLOSE hours.
+    Extract and parse a market's close time from Gamma API response fields.
 
-    Polymarket does NOT have standardised 5/15-minute crypto series. Markets here
-    are daily or weekly "Will BTC be above $X?" style contracts. The lag-arb logic
-    works regardless of duration — when BTC moves, any price-direction contract
-    should reprice promptly.
+    Field priority: endDate (full ISO) > endDateIso (date-only) > closeTime
+    The Gamma API returns endDateIso as "YYYY-MM-DD" — we treat that as
+    23:59:59 UTC on that day (not midnight, to avoid fencepost issues where
+    a same-day market appears to have already closed at 00:00 UTC).
+    """
+    # Full ISO timestamp first (most precise)
+    for field_name in ("endDate", "closeTime"):
+        ct_str = m.get(field_name)
+        if not ct_str or len(ct_str) < 16:
+            continue
+        try:
+            ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+            return ct if ct.tzinfo else ct.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    # Date-only fallback — treat as end of that UTC day
+    ct_str = m.get("endDateIso") or m.get("end_date_iso")
+    if ct_str and len(ct_str) == 10:
+        try:
+            ct = datetime.fromisoformat(ct_str + "T23:59:59+00:00")
+            return ct
+        except Exception:
+            pass
+
+    return None
+
+
+async def _fetch_gamma_page(
+    session: aiohttp.ClientSession,
+    params: dict,
+) -> list[dict]:
+    """Fetch one page from the Gamma /markets endpoint, return raw list."""
+    data = await _get_json(session, f"{GAMMA_API}/markets", params=params)
+    if not data:
+        return []
+    return data if isinstance(data, list) else data.get("data", data.get("markets", []))
+
+
+async def discover_markets(
+    session: aiohttp.ClientSession,
+) -> tuple[list[MarketWatch], list[MarketWatch]]:
+    """
+    Discover BTC/ETH price-direction markets on Polymarket.
+
+    Returns (tradeable, pipeline) where:
+      tradeable — markets closing within MAX_HOURS_TO_CLOSE (4h), ready to monitor
+      pipeline  — markets closing within SCAN_HOURS (24h), displayed as upcoming
+
+    Search strategy:
+      Pass 1: tag_slug=bitcoin / ethereum — Polymarket's own tagging
+      Pass 2: text search for specific BTC/ETH price-direction phrases
+      (The Gamma API q= parameter searches full text incl. descriptions, so we
+       apply strict client-side filtering on the question field only.)
+
+    Filters applied to all candidates:
+      - Question contains asset keyword + directional keyword
+      - CLOB order book active (enableOrderBook + acceptingOrders)
+      - Total volume ≥ MIN_VOLUME_USDC ($10k) — thin books have wide spreads
+      - Close time: MIN_SECS_TO_CLOSE (2 min) < t ≤ SCAN_HOURS (24h)
+
+    Note: Polymarket does not have standardised 5/15-min crypto contracts.
+    Their BTC/ETH markets are typically daily ("Will BTC close above $X today?")
+    settling at midnight UTC. Between ~00:00-01:00 UTC after daily settlement,
+    the tradeable list will be empty — this is expected.
     """
     now = datetime.now(timezone.utc)
-    max_secs = MAX_HOURS_TO_CLOSE * 3600
+    scan_secs  = SCAN_HOURS * 3600
+    trade_secs = MAX_HOURS_TO_CLOSE * 3600
     seen: set[str] = set()
-    results: list[MarketWatch] = []
+    raw_candidates: list[dict] = []
 
-    # Query each search term; Gamma API does fuzzy text matching on questions
-    for term in SEARCH_TERMS:
-        data = await _get_json(session, f"{GAMMA_API}/markets", params={
-            "q": term, "active": "true", "closed": "false", "limit": 50,
+    # Pass 1: Polymarket's own crypto/bitcoin/ethereum tags
+    for tag in ("bitcoin", "ethereum", "crypto"):
+        page = await _fetch_gamma_page(session, {
+            "tag_slug": tag, "active": "true", "closed": "false", "limit": 100,
         })
-        if not data:
+        raw_candidates.extend(page)
+
+    # Pass 2: question-text search — catches markets not tagged but named clearly
+    for phrase in ("BTC above", "BTC below", "bitcoin above", "bitcoin below",
+                   "ETH above", "ETH below", "ethereum above", "ethereum below",
+                   "bitcoin end", "bitcoin close", "ETH end", "ETH close"):
+        page = await _fetch_gamma_page(session, {
+            "q": phrase, "active": "true", "closed": "false", "limit": 30,
+        })
+        raw_candidates.extend(page)
+
+    tradeable: list[MarketWatch] = []
+    pipeline:  list[MarketWatch] = []
+
+    for m in raw_candidates:
+        cid = m.get("conditionId", "")
+        if not cid or cid in seen:
             continue
-        markets_raw = data if isinstance(data, list) else data.get("data", [])
 
-        for m in markets_raw:
-            cid = m.get("conditionId", "")
-            if not cid or cid in seen:
-                continue
+        question = m.get("question", "")
+        asset = _classify_market(question)
+        if asset is None:
+            continue
 
-            question = m.get("question", "")
-            asset = _asset_of(question)
-            if asset is None:
-                continue
+        if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
+            continue
 
-            # Only markets with CLOB order books enabled
-            if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
-                continue
+        # Volume filter — total and/or 24h
+        volume_total = float(m.get("volumeNum", 0) or 0)
+        volume_24h   = float(m.get("volume24hr",  0) or 0)
+        if volume_total < MIN_VOLUME_USDC:
+            continue
 
-            # Parse close time
-            ct_str = m.get("endDate") or m.get("end_date_iso")
-            if not ct_str:
-                continue
-            try:
-                ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
-                if ct.tzinfo is None:
-                    ct = ct.replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
+        ct = _parse_close_time(m)
+        if ct is None:
+            continue
+        secs_left = (ct - now).total_seconds()
+        if secs_left <= MIN_SECS_TO_CLOSE:
+            continue
+        if secs_left > scan_secs:
+            continue
 
-            secs_left = (ct - now).total_seconds()
-            if not (MIN_SECS_TO_CLOSE < secs_left <= max_secs):
-                continue
+        raw_ids = m.get("clobTokenIds", "[]")
+        try:
+            token_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if len(token_ids) < 2:
+            continue
 
-            # Parse clobTokenIds — Gamma API returns this as a JSON-encoded string
-            raw_ids = m.get("clobTokenIds", "[]")
-            try:
-                token_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if len(token_ids) < 2:
-                continue
+        seen.add(cid)
+        market = MarketWatch(
+            condition_id=cid,
+            question=question,
+            asset=asset,
+            yes_token_id=str(token_ids[0]),
+            no_token_id=str(token_ids[1]),
+            close_time=ct,
+            volume_usdc=volume_total,
+            volume_24h=volume_24h,
+        )
 
-            seen.add(cid)
-            results.append(MarketWatch(
-                condition_id=cid,
-                question=question,
-                asset=asset,
-                yes_token_id=str(token_ids[0]),
-                no_token_id=str(token_ids[1]),
-                close_time=ct,
-            ))
+        if secs_left <= trade_secs:
+            tradeable.append(market)
+        else:
+            pipeline.append(market)
 
-    return results
+    return tradeable, pipeline
 
 
 # ---------------------------------------------------------------------------
@@ -463,42 +588,71 @@ def detect_lag_signal(
     """
     Returns "YES", "NO", or None.
 
-    Fires when:
-      1. BTC moved ≥ BTC_MOVE_PCT (0.3 %) over BTC_WINDOW_SECS (30 s).
-      2. Polymarket YES price has NOT moved ≥ STALE_THRESHOLD (1 ¢) in the
-         same window — contract price is lagging the underlying move.
-      3. Implied fair price (estimated from BTC move magnitude) differs from
-         current ask by ≥ LAG_GAP_CENTS (4 ¢) — worthwhile edge to take.
+    Uses dynamic thresholds based on time to close:
 
-    Sensitivity heuristic: a 1 % BTC move is assumed to imply ≈ 10 ¢ shift
-    in near-term price-direction contract probability. Adjust SENSITIVITY to
-    tune signal aggressiveness.
+      < 1h to close — NEAR regime:
+        BTC move required: ≥ 0.3 % (tight; contract delta is high)
+        Stale threshold:   < 4 ¢ movement (tight; contract should reprice fast)
+        Sensitivity:       12 ¢ per 1 % BTC move
+
+      1-4h to close — FAR regime:
+        BTC move required: ≥ 0.8 % (need a bigger signal for a daily contract)
+        Stale threshold:   < 6 ¢ movement (wider; daily contracts update slowly)
+        Sensitivity:       6 ¢ per 1 % BTC move
+
+    Fires only when ALL of:
+      1. BTC moved ≥ threshold over BTC_WINDOW_SECS (30 s).
+      2. Polymarket YES price has NOT moved ≥ stale_threshold in the 30-s window
+         → price is lagging the underlying move.
+      3. Polymarket YES price has also NOT moved ≥ stale_threshold in the last
+         STALENESS_CONFIRM_SECS (60 s) → confirm it's genuinely stale, not
+         just mid-reprice. This is the key guard against entering after the
+         contract has already started catching up.
+      4. Implied edge (¢ from BTC move) ≥ LAG_GAP_CENTS (4 ¢).
     """
-    SENSITIVITY = 10.0  # ¢ of probability shift per 1 % BTC move
+    hours_left = market.hours_to_close
+
+    # Select regime
+    if hours_left < 1.0:
+        move_threshold   = BTC_MOVE_PCT_NEAR
+        stale_threshold  = STALE_THRESHOLD_NEAR
+        sensitivity      = SENSITIVITY_NEAR
+    else:
+        move_threshold   = BTC_MOVE_PCT_FAR
+        stale_threshold  = STALE_THRESHOLD_FAR
+        sensitivity      = SENSITIVITY_FAR
 
     btc_move = (btc_now - btc_before) / btc_before
-    if abs(btc_move) < BTC_MOVE_PCT:
+
+    # 1. BTC move threshold
+    if abs(btc_move) < move_threshold:
         return None
 
-    # Check for stale Polymarket price
-    yes_before = _price_at(market.yes_history, BTC_WINDOW_SECS)
-    if yes_before is None:
-        return None  # insufficient price history yet
+    # 2. Staleness check over the BTC measurement window (30 s)
+    yes_30s_ago = _price_at(market.yes_history, BTC_WINDOW_SECS)
+    if yes_30s_ago is None:
+        return None
 
-    poly_move = abs(market.yes_ask - yes_before)
-    if poly_move >= STALE_THRESHOLD:
-        return None  # Polymarket already repriced — no lag
+    if abs(market.yes_ask - yes_30s_ago) >= stale_threshold:
+        return None  # contract already repriced within the BTC window
 
-    # Estimate implied probability shift (in cents)
-    implied_cents = abs(btc_move) * 100 * SENSITIVITY  # e.g. 0.3 % × 10 = 3 ¢
+    # 3. Staleness confirmation over the longer 60-s window — ensure the
+    #    contract has genuinely been flat, not just mid-reprice on entry
+    yes_60s_ago = _price_at(market.yes_history, STALENESS_CONFIRM_SECS)
+    if yes_60s_ago is None:
+        return None  # not enough history yet
+
+    if abs(market.yes_ask - yes_60s_ago) >= stale_threshold:
+        return None  # contract repriced in the last 60 s — edge already gone
+
+    # 4. Implied edge from BTC move magnitude
+    implied_cents = abs(btc_move) * 100 * sensitivity
     if implied_cents < LAG_GAP_CENTS:
-        return None  # expected edge below threshold
+        return None
 
-    # BTC UP → YES should be more expensive → buy YES if ask is still cheap
+    # Direction
     if btc_move > 0 and market.yes_ask < 0.95:
         return "YES"
-
-    # BTC DOWN → NO should be more expensive → buy NO if ask is still cheap
     if btc_move < 0 and market.no_ask < 0.95:
         return "NO"
 
@@ -580,6 +734,9 @@ async def place_order(
 
 def log_entry(market: MarketWatch, side: str, price: float,
               btc_price: float, btc_move_pct: float) -> None:
+    """Log a trade entry. btc_move_pct is a fraction (e.g. 0.008 = 0.8%)."""
+    hours_left = market.hours_to_close
+    regime = "NEAR" if hours_left < 1.0 else "FAR"
     _write_trade_record({
         "platform":           "polymarket",
         "asset":              market.asset,
@@ -589,9 +746,11 @@ def log_entry(market: MarketWatch, side: str, price: float,
         "entry_price_cents":  round(price * 100, 2),
         "entry_time":         datetime.now(timezone.utc).isoformat(),
         "close_time":         market.close_time.isoformat(),
-        "secs_to_close":      round((market.close_time - datetime.now(timezone.utc)).total_seconds(), 1),
+        "hours_to_close":     round(hours_left, 3),
+        "regime":             regime,
         "btc_price_at_entry": round(btc_price, 2),
         "btc_move_pct":       round(btc_move_pct * 100, 4),
+        "volume_usdc":        round(market.volume_usdc, 0),
         "paper":              PAPER_MODE,
     })
 
@@ -600,6 +759,7 @@ def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
     raw_pnl = exit_price - market.entry_price if market.position_side == "YES" \
               else market.entry_price - exit_price
     dollar_pnl = round(raw_pnl * (ORDER_SIZE_USDC / market.entry_price), 4)
+    hours_left = market.hours_to_close
     _write_trade_record({
         "platform":           "polymarket",
         "asset":              market.asset,
@@ -610,8 +770,10 @@ def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
         "exit_price_cents":   round(exit_price * 100, 2),
         "entry_time":         market.entry_time,
         "exit_time":          datetime.now(timezone.utc).isoformat(),
+        "hours_to_close":     round(hours_left, 3),
         "exit_reason":        reason,
         "pnl_dollars":        dollar_pnl,
+        "volume_usdc":        round(market.volume_usdc, 0),
         "paper":              PAPER_MODE,
     })
 
@@ -625,10 +787,13 @@ async def run_market(
     market: MarketWatch,
     btc_feed,           # the latency.binance_feed module
 ) -> None:
-    secs_left = (market.close_time - datetime.now(timezone.utc)).total_seconds()
+    hours_left = market.hours_to_close
+    regime = "NEAR (<1h)" if hours_left < 1.0 else f"FAR ({hours_left:.1f}h)"
+    threshold = BTC_MOVE_PCT_NEAR if hours_left < 1.0 else BTC_MOVE_PCT_FAR
     log.info(
-        f"[POLY] Watching: '{market.question[:70]}' "
-        f"| {market.asset} | closes in {secs_left/60:.1f} min"
+        f"[POLY] Watching [{regime}]: '{market.question[:65]}' "
+        f"| {market.asset} | vol=${market.volume_usdc:,.0f} "
+        f"| move_threshold={threshold*100:.1f}%"
     )
 
     while True:
@@ -705,11 +870,13 @@ async def run_market(
             signal = detect_lag_signal(market, btc_now, btc_before)
             btc_move = (btc_now - btc_before) / btc_before
 
+            hours_left = secs_left / 3600
+            regime = "NEAR" if hours_left < 1.0 else "FAR"
             if signal is None:
                 log.info(
-                    f"[{ts}] [POLY] '{market.question[:45]}' "
+                    f"[{ts}] [POLY] [{regime}] '{market.question[:40]}' "
                     f"| YES={yes_ask:.3f} NO={no_ask:.3f} "
-                    f"| BTC Δ{btc_move*100:+.3f}% | {secs_left/60:.1f} min left"
+                    f"| BTC Δ{btc_move*100:+.3f}% | {hours_left:.2f}h left"
                 )
             else:
                 entry_price = market.yes_ask if signal == "YES" else market.no_ask
@@ -744,15 +911,17 @@ async def run_market(
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    log.info("=" * 60)
+    log.info("=" * 65)
     log.info("Kalshi Bot — Path D: Polymarket Latency Arb")
     log.info(f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}")
-    log.info(f"BTC move threshold: {BTC_MOVE_PCT*100:.1f}% over {BTC_WINDOW_SECS:.0f}s")
-    log.info(f"Lag gap threshold:  {LAG_GAP_CENTS:.0f}¢ | stale threshold: {STALE_THRESHOLD*100:.0f}¢")
-    log.info(f"Market window:      {MIN_SECS_TO_CLOSE}s–{MAX_HOURS_TO_CLOSE:.1f}h before close")
+    log.info(f"BTC window:         {BTC_WINDOW_SECS:.0f}s | staleness confirm: {STALENESS_CONFIRM_SECS:.0f}s")
+    log.info(f"NEAR regime (<1h):  BTC move ≥{BTC_MOVE_PCT_NEAR*100:.1f}% | stale <{STALE_THRESHOLD_NEAR*100:.0f}¢")
+    log.info(f"FAR  regime (1-4h): BTC move ≥{BTC_MOVE_PCT_FAR*100:.1f}% | stale <{STALE_THRESHOLD_FAR*100:.0f}¢")
+    log.info(f"Lag gap (min edge): {LAG_GAP_CENTS:.0f}¢ | volume filter: ≥${MIN_VOLUME_USDC:,}")
+    log.info(f"Market window:      {MIN_SECS_TO_CLOSE}s–{MAX_HOURS_TO_CLOSE:.0f}h before close")
     log.info(f"Order size (live):  ${ORDER_SIZE_USDC:.0f} USDC")
     log.info(f"Trade log:          {_TRADE_LOG_PATH}")
-    log.info("=" * 60)
+    log.info("=" * 65)
 
     # Start shared Coinbase BTC feed (same module used by momentum_bot.py)
     try:
@@ -780,24 +949,46 @@ async def main() -> None:
 
         try:
             while True:
-                log.info(f"[POLY] Scanning Gamma API for BTC/ETH price markets...")
-                markets = await discover_markets(session)
+                log.info("[POLY] Scanning Gamma API for BTC/ETH price-direction markets...")
+                tradeable, pipeline = await discover_markets(session)
 
-                if markets:
-                    log.info(f"[POLY] Found {len(markets)} eligible market(s):")
-                    for m in markets:
-                        secs = (m.close_time - datetime.now(timezone.utc)).total_seconds()
-                        log.info(f"  [{m.asset}] '{m.question[:65]}' — closes in {secs/60:.1f} min")
+                # Report pipeline (markets coming within 24h but not yet tradeable)
+                if pipeline:
+                    log.info(f"[POLY] Pipeline ({len(pipeline)} market(s) in {MAX_HOURS_TO_CLOSE:.0f}h–{SCAN_HOURS:.0f}h window):")
+                    for m in sorted(pipeline, key=lambda x: x.close_time):
+                        h = m.hours_to_close
+                        log.info(
+                            f"  [{m.asset}] '{m.question[:60]}' "
+                            f"— {h:.1f}h left | vol=${m.volume_usdc:,.0f} (24h=${m.volume_24h:,.0f})"
+                        )
+
+                if tradeable:
+                    log.info(f"[POLY] TRADEABLE ({len(tradeable)} market(s) within {MAX_HOURS_TO_CLOSE:.0f}h):")
+                    for m in tradeable:
+                        h = m.hours_to_close
+                        regime = "NEAR" if h < 1.0 else "FAR"
+                        log.info(
+                            f"  [{m.asset}|{regime}] '{m.question[:58]}' "
+                            f"— {h:.2f}h left | vol=${m.volume_usdc:,.0f}"
+                        )
                 else:
-                    log.info(
-                        "[POLY] No BTC/ETH price-direction markets closing within "
-                        f"{MAX_HOURS_TO_CLOSE:.0f}h found — will rescan in {REFRESH_SECS:.0f}s.\n"
-                        "       Note: Polymarket has no standardised 5/15-min crypto series.\n"
-                        "       Daily/weekly 'BTC above $X' markets are the target product."
-                    )
+                    if pipeline:
+                        earliest_h = min(m.hours_to_close for m in pipeline)
+                        log.info(
+                            f"[POLY] No markets in trade window (<{MAX_HOURS_TO_CLOSE:.0f}h). "
+                            f"Next eligible market enters window in ~{earliest_h - MAX_HOURS_TO_CLOSE:.1f}h. "
+                            f"Rescan in {REFRESH_SECS:.0f}s."
+                        )
+                    else:
+                        log.info(
+                            f"[POLY] No BTC/ETH price-direction markets found within {SCAN_HOURS:.0f}h "
+                            f"(vol≥${MIN_VOLUME_USDC:,}). Rescan in {REFRESH_SECS:.0f}s. "
+                            "This is normal near daily UTC midnight when Polymarket's "
+                            "daily contracts have just settled and new ones are being created."
+                        )
 
-                # Launch new tasks; skip already-monitored markets
-                for market in markets:
+                # Launch monitor tasks for tradeable markets only
+                for market in tradeable:
                     cid = market.condition_id
                     if cid in active_tasks and not active_tasks[cid].done():
                         continue
