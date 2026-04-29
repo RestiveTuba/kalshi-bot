@@ -81,6 +81,7 @@ SERIES = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 POLL_INTERVAL_S        = 0.70   # 700 ms
 ACTIVATE_MINS_BEFORE_CLOSE = 8
 ENTRY_THRESHOLD        = 87     # cents — lowered from 92; live data shows best trades entered at 86-89¢
+CONVICTION_THRESHOLD   = 93     # cents — bypass momentum cross + correlation at this price; outcome near-certain
 STOP_LOSS_THRESHOLD    = None   # disabled — no stop-loss (500-session backtest)
 HARD_CLOSE_SECS        = 30     # exit any open position with this many seconds left
 MIN_SECS_FOR_ENTRY     = 90     # only enter if >= 90s remain (avoids gap-risk near expiry)
@@ -757,8 +758,64 @@ async def run_series(client: _SimpleClient, series: str):
                                     f"[MOM ✓ DIR ✓ | awaiting correlation] | {mins_left:.1f} min left"
                                 )
                                 state.corr_waiting = True
+
+                # ── Conviction override ───────────────────────────────────────
+                # Price ≥ CONVICTION_THRESHOLD (93¢) with no fresh cross.
+                # At this level the outcome is near-certain; bypass the momentum
+                # cross requirement and the correlation filter entirely.
+                # Still requires: directional filter, position lock, session
+                # halt, daily circuit-breaker, trade cap, time-of-day filter —
+                # all of which are already checked above in the elif chain.
+                elif yes_bid >= CONVICTION_THRESHOLD:
+                    _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
+                    if _btc_dir != "UP":
+                        log.info(
+                            f"[{ts}] [{series}] ENTRY BLOCKED — conviction override directional filter "
+                            f"(YES {yes_bid:.0f}c ≥ {CONVICTION_THRESHOLD}c needs BTC UP, got {_btc_dir})"
+                        )
+                    else:
+                        state.position_side = "YES"
+                        state.entry_price = yes_bid
+                        state.peak_price = yes_bid
+                        state.last_held_price = yes_bid
+                        state.entry_time = datetime.now(timezone.utc).isoformat()
+                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
+                        state.session_trades_entered += 1
+                        state.corr_waiting = False
+                        _pending_signals.pop(series, None)
+                        _open_positions.add(series)
+                        log.info(
+                            f"[{ts}] [{series}] BUY YES @ {yes_bid:.0f}c "
+                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM_OVERRIDE] | "
+                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
+                            f"{mins_left:.1f} min left"
+                        )
+                elif no_bid >= CONVICTION_THRESHOLD:
+                    _btc_dir = _get_btc_direction(DIRECTION_WINDOW_SECS)
+                    if _btc_dir != "DOWN":
+                        log.info(
+                            f"[{ts}] [{series}] ENTRY BLOCKED — conviction override directional filter "
+                            f"(NO {no_bid:.0f}c ≥ {CONVICTION_THRESHOLD}c needs BTC DOWN, got {_btc_dir})"
+                        )
+                    else:
+                        state.position_side = "NO"
+                        state.entry_price = no_bid
+                        state.peak_price = no_bid
+                        state.last_held_price = no_bid
+                        state.entry_time = datetime.now(timezone.utc).isoformat()
+                        state.entry_secs_left = secs_left if secs_left is not None else 0.0
+                        state.session_trades_entered += 1
+                        state.corr_waiting = False
+                        _pending_signals.pop(series, None)
+                        _open_positions.add(series)
+                        log.info(
+                            f"[{ts}] [{series}] BUY NO @ {no_bid:.0f}c "
+                            f"[{'PAPER' if PAPER_MODE else 'LIVE'}] [MOM_OVERRIDE] | "
+                            f"entry #{state.session_trades_entered}/{MAX_TRADES_PER_SESSION} | "
+                            f"{mins_left:.1f} min left"
+                        )
                 else:
-                    # No signal or price not a fresh cross — clear pending state
+                    # No signal — price below threshold or no fresh cross below conviction level
                     _pending_signals.pop(series, None)
                     state.corr_waiting = False
                     no_cross_note = (
@@ -800,7 +857,7 @@ async def main():
     stop_desc = f"{STOP_LOSS_THRESHOLD}c" if STOP_LOSS_THRESHOLD is not None else "disabled"
     log.info(f"Poll: {POLL_INTERVAL_S*1000:.0f}ms | Entry: {ENTRY_THRESHOLD}c | Stop: {stop_desc} | Min secs: {MIN_SECS_FOR_ENTRY}s")
     log.info(f"Hard close: {HARD_CLOSE_SECS}s before expiry | Session cap: {MAX_TRADES_PER_SESSION} entries/series")
-    log.info(f"Momentum filter: crossing detection over {MOMENTUM_HISTORY_LEN} polls (~{MOMENTUM_HISTORY_LEN*POLL_INTERVAL_S:.0f}s window)")
+    log.info(f"Momentum filter: crossing detection over {MOMENTUM_HISTORY_LEN} polls (~{MOMENTUM_HISTORY_LEN*POLL_INTERVAL_S:.0f}s window) | conviction override ≥{CONVICTION_THRESHOLD}c bypasses cross+corr")
     log.info(f"Correlation filter: requires 2-of-3 series same direction within {CORR_WINDOW_SECS}s")
     log.info(f"Activation window: last {ACTIVATE_MINS_BEFORE_CLOSE} min of each 15-min contract")
     log.info(f"Time-of-day filter: BLOCKED UTC hours = {sorted(BLOCKED_UTC_HOURS)}")
