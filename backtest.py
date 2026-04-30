@@ -48,13 +48,15 @@ import aiohttp
 import certifi
 
 # ── Strategy constants (defaults; overridden by CLI flags or grid params) ──
-ENTRY_THRESHOLD      : float = 85.0   # cents
+# Values match live momentum_bot.py so `python3 backtest.py` without flags
+# runs the same parameters as the running bot.
+ENTRY_THRESHOLD      : float = 90.0   # cents — grid-search optimal
 STOP_LOSS            : Optional[float] = None  # cents  (None = disabled)
 HARD_CLOSE_SECS      : int   = 30      # seconds before expiry
 ACTIVATE_MINS        : int   = 8       # only look at last N minutes
 MAX_TRADES_PER_SESSION: int  = 3
-CONTRACTS            : int   = 1
-MIN_SECS_FOR_ENTRY   : float = 0.0    # 0 = no minimum
+CONTRACTS            : int   = 20      # matches live bot; P&L is per-20-contract position
+MIN_SECS_FOR_ENTRY   : float = 60.0   # grid-search optimal
 MAX_ENTRY_PRICE      : float = 98.9   # never buy ≥99¢ — only 1¢ margin left
 
 # ── Grid search parameter space ───────────────────────────────────────────

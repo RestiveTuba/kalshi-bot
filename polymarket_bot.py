@@ -143,6 +143,11 @@ PRICE_HISTORY_LEN = 60         # 60 × 2 s = 120 s of best_ask history per token
 ORDER_SIZE_USDC = 50.0   # $50 USDC per trade — enough to move the needle at 10-20 trades/day
 SIG_TYPE        = 0      # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
 
+# Risk controls
+DAILY_LOSS_LIMIT_USD = 10.0  # halt all entries if daily realized P&L drops below -$10
+                              # ($50/trade × 2 losses = $100 max drawdown is too loose;
+                              #  halt at -$10 while strategy is unvalidated)
+
 # ---------------------------------------------------------------------------
 # .env loader
 # ---------------------------------------------------------------------------
@@ -166,6 +171,75 @@ def _load_env() -> dict:
 
 
 _env = _load_env()
+
+# ---------------------------------------------------------------------------
+# Telegram alerts — same pattern as momentum_bot.py
+# ---------------------------------------------------------------------------
+
+def _load_tg_creds() -> tuple[str, str]:
+    """Read TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from _env (already loaded)."""
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", _env.get("TELEGRAM_BOT_TOKEN", ""))
+    cid = os.environ.get("TELEGRAM_CHAT_ID",   _env.get("TELEGRAM_CHAT_ID",   ""))
+    return tok, cid
+
+
+_TG_TOKEN, _TG_CHAT_ID = _load_tg_creds()
+_TG_API = f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage" if _TG_TOKEN else ""
+
+_tg_err_ts:       dict[str, float] = {}  # rate-limit error alerts per context key
+_tg_cb_fired_date: str             = ""  # UTC date string on which circuit breaker last fired
+
+
+async def _telegram_send(text: str) -> None:
+    """POST one message to Telegram. Silently swallows all errors."""
+    if not _TG_API or not _TG_CHAT_ID:
+        return
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(
+                _TG_API,
+                json={"chat_id": _TG_CHAT_ID, "text": text},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+    except Exception:
+        pass
+
+
+def _tg_alert(text: str) -> None:
+    """Fire-and-forget Telegram alert. Zero latency; safe from sync or async code."""
+    if not _TG_API or not _TG_CHAT_ID:
+        return
+    try:
+        asyncio.ensure_future(_telegram_send(text))
+    except RuntimeError:
+        pass  # no running loop — only possible at module import time
+
+
+def _tg_error(context: str, exc: Exception) -> None:
+    """Rate-limited error alert — at most once per 5 minutes per context key."""
+    now = time.time()
+    if now - _tg_err_ts.get(context, 0) < 300:
+        return
+    _tg_err_ts[context] = now
+    _tg_alert(f"❌ Error [POLY/{context}]: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Daily P&L tracking (for circuit breaker)
+# ---------------------------------------------------------------------------
+
+_daily_pnl: dict[str, float] = {}
+
+
+def _get_today_pnl() -> float:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _daily_pnl.get(today, 0.0)
+
+
+def _record_pnl(pnl: float) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _daily_pnl[today] = _daily_pnl.get(today, 0.0) + pnl
+
 
 # ---------------------------------------------------------------------------
 # L2 HMAC-SHA256 request signing
@@ -362,6 +436,9 @@ async def get_current_market(
     m = raw[0]
     if not m.get("enableOrderBook"):
         log.warning(f"[POLY] {slug}: order book not enabled")
+        return None
+    if not m.get("acceptingOrders", True):
+        log.warning(f"[POLY] {slug}: market not accepting orders")
         return None
 
     # Parse clobTokenIds — index 0 = UP, index 1 = DOWN
@@ -593,7 +670,8 @@ def log_entry(market: MarketWatch, side: str, price: float,
     })
 
 
-def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
+def log_exit(market: MarketWatch, exit_price: float, reason: str) -> float:
+    """Log trade exit to JSONL and return realized P&L in dollars."""
     raw_pnl = (exit_price - market.entry_price) if market.position_side == "UP" \
               else (market.entry_price - exit_price)
     dollar_pnl = round(raw_pnl * (ORDER_SIZE_USDC / market.entry_price), 4)
@@ -613,6 +691,7 @@ def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
         "volume_usdc":        round(market.volume_usdc, 2),
         "paper":              PAPER_MODE,
     })
+    return dollar_pnl
 
 
 # ---------------------------------------------------------------------------
@@ -646,9 +725,15 @@ async def run_market(
             if secs_left <= 0:
                 if market.in_position:
                     exit_price = market.up_ask if market.position_side == "UP" else market.dn_ask
-                    log_exit(market, exit_price, "MARKET_CLOSED")
+                    pnl = log_exit(market, exit_price, "MARKET_CLOSED")
+                    _record_pnl(pnl)
                     _in_position = False
-                    log.info(f"[{ts}] [POLY] Window closed — position settled at {exit_price:.3f}")
+                    log.info(f"[{ts}] [POLY] Window closed — position settled at {exit_price:.3f} | P&L ${pnl:+.2f}")
+                    _tg_alert(
+                        f"{'💰' if pnl >= 0 else '🔴'} POLY CLOSE {market.position_side} "
+                        f"@ {exit_price*100:.1f}¢ | P&L ${pnl:+.2f} | MARKET_CLOSED | "
+                        f"day: ${_get_today_pnl():+.2f} | {'paper' if PAPER_MODE else 'live'}"
+                    )
                 else:
                     log.info(f"[{ts}] [POLY] Window closed — no position held")
                 return
@@ -657,14 +742,21 @@ async def run_market(
             if market.in_position and secs_left < MIN_SECS_TO_CLOSE:
                 exit_price = market.up_ask if market.position_side == "UP" else market.dn_ask
                 side = market.position_side
-                log_exit(market, exit_price, "HARD_CLOSE")
+                pnl = log_exit(market, exit_price, "HARD_CLOSE")
+                _record_pnl(pnl)
                 _in_position = False
                 market.in_position   = False
                 market.position_side = None
                 log.info(
                     f"[{ts}] [POLY] HARD_CLOSE {side} @ {exit_price:.3f} "
-                    f"({exit_price*100:.1f}¢) | {secs_left:.0f}s left"
+                    f"({exit_price*100:.1f}¢) | P&L ${pnl:+.2f} | {secs_left:.0f}s left"
                 )
+                _tg_alert(
+                    f"{'💰' if pnl >= 0 else '🔴'} POLY CLOSE {side} "
+                    f"@ {exit_price*100:.1f}¢ | P&L ${pnl:+.2f} | HARD_CLOSE | "
+                    f"day: ${_get_today_pnl():+.2f} | {'paper' if PAPER_MODE else 'live'}"
+                )
+                continue  # don't fall through to WATCHING logs after close
 
             # Fetch UP and DOWN order books via GET /book?token_id=
             up_bid, up_ask, dn_bid, dn_ask = await fetch_market_books(session, market)
@@ -699,6 +791,23 @@ async def run_market(
                     f"| UP bid={up_bid:.3f} ask={up_ask:.3f} "
                     f"| DN bid={dn_bid:.3f} ask={dn_ask:.3f} "
                     f"| {secs_left:.0f}s left"
+                )
+                await asyncio.sleep(POLL_INTERVAL_S)
+                continue
+
+            # Daily circuit breaker — halt all entries if loss limit is reached
+            if _get_today_pnl() <= -DAILY_LOSS_LIMIT_USD:
+                global _tg_cb_fired_date
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if _tg_cb_fired_date != today_str:
+                    _tg_cb_fired_date = today_str
+                    _tg_alert(
+                        f"🛑 POLY CIRCUIT BREAKER — day P&L: ${_get_today_pnl():+.2f} "
+                        f"≤ −${DAILY_LOSS_LIMIT_USD:.2f} | all entries halted"
+                    )
+                log.warning(
+                    f"[{ts}] [POLY] ENTRY BLOCKED — daily loss limit "
+                    f"(today P&L ${_get_today_pnl():+.2f} ≤ −${DAILY_LOSS_LIMIT_USD:.2f})"
                 )
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
@@ -740,12 +849,19 @@ async def run_market(
                         f"{BTC_WINDOW_SECS:.0f}s | UP ask flat {STALE_WINDOW:.0f}s | "
                         f"{'PAPER' if PAPER_MODE else 'LIVE'} | {secs_left:.0f}s left ***"
                     )
+                    _tg_alert(
+                        f"📈 POLY BUY {signal} @ {entry_price*100:.1f}¢ | "
+                        f"BTC Δ{btc_move*100:+.3f}% in {BTC_WINDOW_SECS:.0f}s | "
+                        f"${ORDER_SIZE_USDC:.0f} USDC | {secs_left:.0f}s left | "
+                        f"{'paper' if PAPER_MODE else 'live'}"
+                    )
 
         except asyncio.CancelledError:
             log.info(f"[POLY] run_market cancelled mid-window")
             return
         except Exception as exc:
             log.error(f"[POLY] run_market error: {exc}")
+            _tg_error("run_market", exc)
 
         await asyncio.sleep(POLL_INTERVAL_S)
 
@@ -765,9 +881,9 @@ async def main() -> None:
     log.info(f"Order size:   ${ORDER_SIZE_USDC:.0f} USDC per trade")
     log.info(f"Data:         Gamma API (slug lookup) + CLOB /book (order books) — public, no auth")
     log.info(f"Trade log:    {_TRADE_LOG_PATH}")
+    tg_status = f"chat_id={_TG_CHAT_ID}" if _TG_TOKEN else "disabled"
+    log.info(f"Telegram:     {tg_status}")
     log.info("=" * 65)
-
-    # Start shared Coinbase BTC feed
     try:
         import latency.binance_feed as btc_feed
         if not hasattr(btc_feed, "get_price_ago"):
@@ -785,6 +901,11 @@ async def main() -> None:
         await btc_feed.stop()
         return
 
+    _tg_alert(
+        f"✅ Polymarket bot started — {'PAPER' if PAPER_MODE else 'LIVE'} | "
+        f"BTC ≥{BTC_MOVE_PCT*100:.1f}% in {BTC_WINDOW_SECS:.0f}s | "
+        f"${ORDER_SIZE_USDC:.0f} USDC/trade | cb: −${DAILY_LOSS_LIMIT_USD:.0f}/day"
+    )
     connector = aiohttp.TCPConnector(ssl=_ssl_ctx, limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
         try:
@@ -836,6 +957,8 @@ async def main() -> None:
             log.info("Shutting down...")
         finally:
             await btc_feed.stop()
+            today_pnl = _get_today_pnl()
+            _tg_alert(f"⏹ Polymarket bot stopped — day P&L: ${today_pnl:+.2f}")
             log.info("Polymarket bot stopped.")
 
 

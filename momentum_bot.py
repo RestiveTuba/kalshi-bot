@@ -310,7 +310,7 @@ _TG_API = f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage" if _TG_TOKEN el
 
 # Per-series alert cooldowns — prevents flooding on repeated events
 _tg_err_ts: dict[str, float] = {}       # error alerts
-_tg_cb_fired: bool = False              # circuit breaker alert (once per day)
+_tg_cb_fired_date: str = ""             # UTC date on which circuit breaker last alerted
 
 
 async def _telegram_send(text: str) -> None:
@@ -981,9 +981,10 @@ async def run_series(client: _SimpleClient, series: str):
                         f"[{ts}] [{series}] ENTRY BLOCKED — daily loss limit "
                         f"(today P&L ${_get_today_pnl():+.2f} ≤ −${DAILY_LOSS_LIMIT_USD:.2f})"
                     )
-                    global _tg_cb_fired
-                    if not _tg_cb_fired:
-                        _tg_cb_fired = True
+                    global _tg_cb_fired_date
+                    _today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    if _tg_cb_fired_date != _today_str:
+                        _tg_cb_fired_date = _today_str
                         _tg_alert(
                             f"🛑 CIRCUIT BREAKER — day P&L: ${_get_today_pnl():+.2f} "
                             f"≤ −${DAILY_LOSS_LIMIT_USD:.2f} | all entries halted"
