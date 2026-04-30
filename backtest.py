@@ -238,6 +238,7 @@ def simulate_session(
     entry_threshold: float = ENTRY_THRESHOLD,
     conviction_threshold: float = 93.0,
     stop_loss: Optional[float] = STOP_LOSS,
+    trailing_stop_cents: Optional[float] = None,
     min_secs_for_entry: float = MIN_SECS_FOR_ENTRY,
     blocked_utc_hours: frozenset = frozenset(),
     corr_window_secs: float = 90.0,
@@ -251,7 +252,11 @@ def simulate_session(
     entry_threshold      : cents required to trigger a regular BUY signal
     conviction_threshold : cents at/above which we skip the corr_window wait
                            (models the momentum_bot.py conviction override)
-    stop_loss            : cents below which we exit; None = disabled
+    stop_loss            : fixed cents below entry at which we exit; None = disabled
+    trailing_stop_cents  : exit if price drops > N¢ below the highest price since
+                           entry (ratchets up as price rises); None = disabled.
+                           NOTE: evaluated at 1-minute candle resolution, not 700ms
+                           like the live bot, so trigger counts are a lower bound.
     min_secs_for_entry   : only enter if this many seconds remain (0 = no floor)
     blocked_utc_hours    : frozenset of UTC hours where entries are suppressed
     corr_window_secs     : proxy for momentum+correlation filter — a regular
@@ -263,6 +268,7 @@ def simulate_session(
     position_side: Optional[str] = None
     entry_price: float = 0.0
     entry_ts: int = 0
+    peak_price: float = 0.0   # highest price seen since entry (for trailing stop)
     trades_entered: int = 0
 
     # Signal persistence tracking (proxy for momentum cross + correlation filter)
@@ -292,11 +298,32 @@ def simulate_session(
                 exit_reason="HARD_CLOSE", pnl=round(pnl, 4),
             ))
             position_side = None
+            peak_price = 0.0
             yes_signal_since = None
             no_signal_since  = None
             continue
 
-        # ── Stop-loss (skipped if disabled) ──────────────────────────────
+        # ── Trailing stop (ratchets up with price, checked before fixed stop) ──
+        if trailing_stop_cents is not None and position_side is not None:
+            held = yes_bid if position_side == "YES" else no_bid
+            if held > peak_price:
+                peak_price = held
+            trail_level = peak_price - trailing_stop_cents
+            if held < trail_level:
+                pnl = (held - entry_price) * CONTRACTS / 100.0
+                results.append(TradeResult(
+                    ticker=ticker, side=position_side,
+                    entry_price=entry_price, exit_price=held,
+                    entry_ts=entry_ts, exit_ts=candle_ts,
+                    exit_reason="TRAIL_STOP", pnl=round(pnl, 4),
+                ))
+                position_side = None
+                peak_price = 0.0
+                yes_signal_since = None
+                no_signal_since  = None
+                continue
+
+        # ── Fixed stop-loss (skipped if disabled) ────────────────────────
         if stop_loss is not None and position_side is not None:
             held = yes_bid if position_side == "YES" else no_bid
             if held < stop_loss:
@@ -308,6 +335,7 @@ def simulate_session(
                     exit_reason="STOP_LOSS", pnl=round(pnl, 4),
                 ))
                 position_side = None
+                peak_price = 0.0
                 yes_signal_since = None
                 no_signal_since  = None
                 continue
@@ -339,6 +367,7 @@ def simulate_session(
                 if is_conviction or signal_age >= corr_window_secs:
                     position_side = "YES"
                     entry_price   = yes_bid
+                    peak_price    = yes_bid
                     entry_ts      = candle_ts
                     trades_entered += 1
                     yes_signal_since = None
@@ -354,6 +383,7 @@ def simulate_session(
                 if is_conviction or signal_age >= corr_window_secs:
                     position_side = "NO"
                     entry_price   = no_bid
+                    peak_price    = no_bid
                     entry_ts      = candle_ts
                     trades_entered += 1
                     no_signal_since = None
@@ -646,15 +676,17 @@ async def main(
     entry_threshold: float,
     conviction_threshold: float,
     stop_loss: Optional[float],
+    trailing_stop_cents: Optional[float],
     min_secs_for_entry: float,
     corr_window_secs: float,
     blocked_utc_hours: frozenset,
     label: str,
 ) -> None:
     stop_desc = f"{stop_loss:.0f}¢" if stop_loss is not None else "none"
+    trail_desc = f"{trailing_stop_cents:.0f}¢" if trailing_stop_cents is not None else "none"
     print(
         f"Running {series} — entry={entry_threshold:.0f}¢  conv={conviction_threshold:.0f}¢  "
-        f"stop={stop_desc}  min_secs={min_secs_for_entry:.0f}s  "
+        f"stop={stop_desc}  trail={trail_desc}  min_secs={min_secs_for_entry:.0f}s  "
         f"corr={corr_window_secs:.0f}s  markets={n_markets}",
         flush=True,
     )
@@ -688,6 +720,7 @@ async def main(
                 entry_threshold=entry_threshold,
                 conviction_threshold=conviction_threshold,
                 stop_loss=stop_loss,
+                trailing_stop_cents=trailing_stop_cents,
                 min_secs_for_entry=min_secs_for_entry,
                 corr_window_secs=corr_window_secs,
                 blocked_utc_hours=blocked_utc_hours,
@@ -727,7 +760,9 @@ def _parse_args():
     parser.add_argument("--conviction",    type=float, default=93,
                         help="Conviction-override threshold cents (default: 93)")
     parser.add_argument("--stop",          type=float, default=0,
-                        help="Stop-loss cents (0=disabled)")
+                        help="Fixed stop-loss cents (0=disabled)")
+    parser.add_argument("--trail-stop",    type=float, default=0,
+                        help="Trailing stop cents from peak (0=disabled, e.g. 5 = exit if price drops >5¢ below peak)")
     parser.add_argument("--min-secs",      type=float, default=60,
                         help="Min seconds remaining before entry (default: 60 — grid-search optimal)")
     parser.add_argument("--corr-window",   type=float, default=45,
@@ -751,6 +786,7 @@ if __name__ == "__main__":
             ))
         else:
             stop_loss_val: Optional[float] = args.stop if args.stop > 0 else None
+            trail_stop_val: Optional[float] = args.trail_stop if args.trail_stop > 0 else None
             blocked: frozenset = frozenset(
                 int(h.strip()) for h in args.blocked_hours.split(",") if h.strip()
             ) if args.blocked_hours.strip() else frozenset()
@@ -761,6 +797,7 @@ if __name__ == "__main__":
                 entry_threshold=args.entry,
                 conviction_threshold=args.conviction,
                 stop_loss=stop_loss_val,
+                trailing_stop_cents=trail_stop_val,
                 min_secs_for_entry=args.min_secs,
                 corr_window_secs=args.corr_window,
                 blocked_utc_hours=blocked,
