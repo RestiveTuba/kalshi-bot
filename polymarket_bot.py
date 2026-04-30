@@ -3,21 +3,22 @@ polymarket_bot.py — Path D: Polymarket latency arb against Coinbase BTC/USD fe
 
 Strategy
 --------
-Polymarket does not have standardised 5-minute / 15-minute crypto series (unlike
-Kalshi's KXBTC15M). Instead it has daily/weekly "Will BTC be above $X by date?"
-markets. This bot:
+Polymarket runs perpetual 5-minute "Bitcoin Up or Down" markets.  Each window
+has a deterministic slug:
 
-  1. Discovers active BTC and ETH price-direction markets via the Gamma API
-     that close within MAX_HOURS_TO_CLOSE (default: 6 h).
-  2. Reuses the existing Coinbase WebSocket feed (latency/binance_feed.py) for
-     real-time BTC/USD price.
-  3. When BTC moves ≥ BTC_MOVE_PCT (0.3 %) over BTC_WINDOW_SECS (30 s) AND
-     the target Polymarket contract price has NOT moved ≥ STALE_THRESHOLD (1 ¢)
-     in the same window, we consider the contract price stale (lagging).
-  4. If the lag-adjusted expected price differs from the current ask by ≥
-     LAG_GAP_CENTS (4 ¢), we buy the correct side.
-  5. Paper mode: trade is logged to polymarket_trades.jsonl only.
-  6. Live mode: order is placed via the CLOB REST API with L2 HMAC signing.
+    btc-updown-5m-{window_ts}
+
+where window_ts = int(time.time()) - (int(time.time()) % 300).
+
+This bot:
+  1. Derives the current window slug, fetches the market from the Gamma API,
+     and extracts clobTokenIds (index 0 = UP/YES, index 1 = DOWN/NO).
+  2. Reads the CLOB order book every 2 seconds via GET /book?token_id=.
+  3. When Coinbase BTC moves ≥ 0.3 % in 10 s AND the Polymarket UP best_ask
+     has not moved > 1 ¢ in 30 s (price is stale / lagging), signal fires.
+  4. Paper mode: logs the intended trade to polymarket_trades.jsonl.
+  5. Live mode: places order via CLOB REST API with L2 HMAC signing.
+  6. At each 5-minute boundary the bot seamlessly rolls to the next window.
 
 Authentication (L1 + L2)
 ------------------------
@@ -125,29 +126,18 @@ CHAIN_ID   = 137   # Polygon mainnet
 
 PAPER_MODE = True  # flip to False only after funding and verifying credentials
 
-# Signal parameters (official 0x8dxd strategy spec)
-BTC_MOVE_PCT    = 0.003   # 0.3%: BTC must move this much in BTC_WINDOW_SECS to trigger
-BTC_WINDOW_SECS = 10.0    # look-back window for BTC move detection
-STALE_THRESHOLD = 0.01    # 1¢ in decimal: order book best_ask must NOT have moved more
-STALE_WINDOW    = 30.0    # seconds over which we check best_ask staleness
+# Signal parameters (0x8dxd strategy spec)
+BTC_MOVE_PCT    = 0.003   # 0.3 %: BTC must move this much in BTC_WINDOW_SECS
+BTC_WINDOW_SECS = 10.0    # look-back window for BTC move detection (seconds)
+STALE_THRESHOLD = 0.01    # 1 ¢ in decimal: UP best_ask must NOT have moved more than this
+STALE_WINDOW    = 30.0    # seconds over which we confirm best_ask is flat
 
-# Market discovery — Gamma API params (official docs)
-# https://gamma-api.polymarket.com/markets?active=true&closed=false&volume_num_min=10000&order=volume&ascending=false
-MAX_HOURS_TO_CLOSE  = 4.0    # only trade markets closing within 4h
-MIN_SECS_TO_CLOSE   = 120    # hard floor: never enter within 2 min of close
-REFRESH_SECS        = 120.0  # re-scan Gamma API every 2 min
-POLL_INTERVAL_S     = 0.5    # 500 ms per market poll cycle
-PRICE_HISTORY_LEN   = 180    # 180 × 0.5 s = 90 s of best_ask history per token
-
-# Client-side keyword filters applied after Gamma API returns results
-QUESTION_INCLUDE = ["above", "below", "higher", "lower", "over", "price up", "price down",
-                    "reach", "hit", "exceed", "close above", "close below", "end above",
-                    "end below", "finish above", "finish below"]
-
-ASSET_KEYWORDS = {
-    "BTC": ["btc", "bitcoin"],
-    "ETH": ["eth", "ethereum", "ether"],
-}
+# 5-minute window mechanics
+WINDOW_SECS     = 300          # each BTC Up/Down market lasts exactly 5 minutes
+SLUG_PREFIX     = "btc-updown-5m"  # deterministic slug format
+MIN_SECS_TO_CLOSE = 30         # don't enter in the last 30 s of a window
+POLL_INTERVAL_S = 2.0          # poll order books every 2 seconds (as specified)
+PRICE_HISTORY_LEN = 60         # 60 × 2 s = 120 s of best_ask history per token
 
 # Order sizing
 ORDER_SIZE_USDC = 50.0   # $50 USDC per trade — enough to move the needle at 10-20 trades/day
@@ -268,38 +258,38 @@ async def _ensure_api_credentials() -> bool:
 
 @dataclass
 class MarketWatch:
-    """One Polymarket market being monitored for lag signals."""
+    """One active 5-minute BTC Up/Down market window."""
     condition_id:  str
     question:      str
-    asset:         str        # "BTC" or "ETH"
-    yes_token_id:  str        # big-integer string from clobTokenIds[0]
-    no_token_id:   str        # big-integer string from clobTokenIds[1]
+    slug:          str          # btc-updown-5m-{window_ts}
+    up_token_id:   str          # clobTokenIds[0] = UP outcome
+    dn_token_id:   str          # clobTokenIds[1] = DOWN outcome
     close_time:    datetime
-    volume_usdc:   float = 0.0  # total market volume (for logging)
-    volume_24h:    float = 0.0  # 24-hour volume (more indicative of current liquidity)
+    volume_usdc:   float = 0.0
 
-    # Polled prices (updated every POLL_INTERVAL_S)
-    yes_ask: float = 0.0      # best ask for YES outcome (what you pay to buy)
-    no_ask:  float = 0.0      # best ask for NO outcome
+    # Polled order book prices (updated every POLL_INTERVAL_S)
+    up_bid: float = 0.0
+    up_ask: float = 0.0
+    dn_bid: float = 0.0
+    dn_ask: float = 0.0
 
-    # Price history deques: (unix_ts, price) tuples
-    yes_history: deque = field(default_factory=lambda: deque(maxlen=PRICE_HISTORY_LEN))
-    no_history:  deque = field(default_factory=lambda: deque(maxlen=PRICE_HISTORY_LEN))
+    # UP best_ask history for staleness check: (unix_ts, ask) tuples
+    up_history: deque = field(default_factory=lambda: deque(maxlen=PRICE_HISTORY_LEN))
 
     # Position tracking
-    in_position:   bool  = False
-    position_side: Optional[str]  = None   # "YES" or "NO"
-    entry_price:   float = 0.0
-    entry_time:    str   = ""
-    entry_btc:     float = 0.0             # BTC price at entry
+    in_position:   bool         = False
+    position_side: Optional[str] = None   # "UP" or "DOWN"
+    entry_price:   float        = 0.0
+    entry_time:    str          = ""
+    entry_btc:     float        = 0.0
 
     @property
-    def hours_to_close(self) -> float:
-        return (self.close_time - datetime.now(timezone.utc)).total_seconds() / 3600
+    def secs_left(self) -> float:
+        return (self.close_time - datetime.now(timezone.utc)).total_seconds()
 
 
-# Global position lock — same pattern as momentum_bot.py
-_open_positions: set[str] = set()  # condition_ids currently holding a position
+# Global: only one position at a time
+_in_position: bool = False
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -339,137 +329,70 @@ async def _post_json(session: aiohttp.ClientSession, url: str,
 # Market discovery (Gamma API)
 # ---------------------------------------------------------------------------
 
-def _classify_market(question: str) -> Optional[str]:
+def _current_window_ts() -> int:
+    """Return the Unix timestamp of the start of the current 5-minute window."""
+    ts = int(time.time())
+    return ts - (ts % WINDOW_SECS)
+
+
+async def get_current_market(
+    session: aiohttp.ClientSession,
+    window_ts: Optional[int] = None,
+) -> Optional[MarketWatch]:
     """
-    Return 'BTC' or 'ETH' if the question is a BTC/ETH price-direction market,
-    None otherwise.
+    Fetch the active 5-minute BTC Up/Down market for the given window.
 
-    Checks:
-    1. Question contains an asset keyword (btc/bitcoin, eth/ethereum)
-    2. Question contains a directional-price keyword (above, below, reach, etc.)
+    Uses the deterministic slug: btc-updown-5m-{window_ts}
+    If window_ts is None, derives it from the current time.
 
-    Uses case-insensitive matching on the question only — NOT the full description,
-    which avoids false-positives from event descriptions mentioning crypto tangentially.
+    Returns a MarketWatch or None if the market is not found / not tradeable.
     """
-    q = question.lower()
-    for asset, keywords in ASSET_KEYWORDS.items():
-        if any(kw in q for kw in keywords):
-            if any(kw in q for kw in QUESTION_INCLUDE):
-                return asset
-    return None
+    if window_ts is None:
+        window_ts = _current_window_ts()
 
-
-def _parse_close_time(m: dict) -> Optional[datetime]:
-    """
-    Extract and parse a market's close time from Gamma API response fields.
-
-    Field priority: endDate (full ISO) > endDateIso (date-only) > closeTime
-    The Gamma API returns endDateIso as "YYYY-MM-DD" — we treat that as
-    23:59:59 UTC on that day (not midnight, to avoid fencepost issues where
-    a same-day market appears to have already closed at 00:00 UTC).
-    """
-    # Full ISO timestamp first (most precise)
-    for field_name in ("endDate", "closeTime"):
-        ct_str = m.get(field_name)
-        if not ct_str or len(ct_str) < 16:
-            continue
-        try:
-            ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
-            return ct if ct.tzinfo else ct.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-    # Date-only fallback — treat as end of that UTC day
-    ct_str = m.get("endDateIso") or m.get("end_date_iso")
-    if ct_str and len(ct_str) == 10:
-        try:
-            ct = datetime.fromisoformat(ct_str + "T23:59:59+00:00")
-            return ct
-        except Exception:
-            pass
-
-    return None
-
-
-async def discover_markets(session: aiohttp.ClientSession) -> list[MarketWatch]:
-    """
-    Discover active BTC/ETH price-direction markets via the official Gamma API.
-
-    Query: GET https://gamma-api.polymarket.com/markets
-           ?active=true&closed=false&volume_num_min=10000&order=volume&ascending=false
-
-    The API returns markets sorted by volume (highest first), pre-filtered to
-    ≥$10k volume. We then apply:
-      - Client-side BTC/ETH keyword filter on the question field
-      - clobTokenIds present (index 0 = YES, index 1 = NO)
-      - Close time within MAX_HOURS_TO_CLOSE (4h) and above MIN_SECS_TO_CLOSE (2 min)
-
-    Returns list of tradeable MarketWatch objects sorted by close time (soonest first).
-    """
-    now  = datetime.now(timezone.utc)
-    data = await _get_json(session, f"{GAMMA_API}/markets", params={
-        "active":          "true",
-        "closed":          "false",
-        "volume_num_min":  10000,
-        "order":           "volume",
-        "ascending":       "false",
-    })
+    slug = f"{SLUG_PREFIX}-{window_ts}"
+    data = await _get_json(session, f"{GAMMA_API}/markets", params={"slug": slug})
     if not data:
-        return []
+        return None
 
     raw: list[dict] = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+    if not raw:
+        return None
 
-    tradeable: list[MarketWatch] = []
-    seen: set[str] = set()
+    m = raw[0]
+    if not m.get("enableOrderBook"):
+        log.warning(f"[POLY] {slug}: order book not enabled")
+        return None
 
-    for m in raw:
-        cid = m.get("conditionId", "")
-        if not cid or cid in seen:
-            continue
+    # Parse clobTokenIds — index 0 = UP, index 1 = DOWN
+    raw_ids = m.get("clobTokenIds", "[]")
+    try:
+        token_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else list(raw_ids)
+    except (json.JSONDecodeError, TypeError):
+        log.warning(f"[POLY] {slug}: could not parse clobTokenIds")
+        return None
+    if len(token_ids) < 2:
+        log.warning(f"[POLY] {slug}: fewer than 2 token IDs")
+        return None
 
-        # Client-side keyword filter — question must mention BTC/ETH + a direction word
-        question = m.get("question", "")
-        asset = _classify_market(question)
-        if asset is None:
-            continue
+    # Parse close time from endDate field
+    end_str = m.get("endDate", "")
+    try:
+        close_time = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+    except Exception:
+        log.warning(f"[POLY] {slug}: could not parse endDate '{end_str}'")
+        return None
 
-        # Must have an active CLOB order book
-        if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
-            continue
-
-        # Parse clobTokenIds — index 0 = YES token, index 1 = NO token
-        raw_ids = m.get("clobTokenIds", "[]")
-        try:
-            token_ids: list[str] = json.loads(raw_ids) if isinstance(raw_ids, str) else list(raw_ids)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if len(token_ids) < 2:
-            continue
-
-        ct = _parse_close_time(m)
-        if ct is None:
-            continue
-        secs_left = (ct - now).total_seconds()
-        if secs_left <= MIN_SECS_TO_CLOSE:
-            continue
-        if secs_left > MAX_HOURS_TO_CLOSE * 3600:
-            continue
-
-        seen.add(cid)
-        volume_total = float(m.get("volumeNum", 0) or 0)
-        volume_24h   = float(m.get("volume24hr", 0) or 0)
-        tradeable.append(MarketWatch(
-            condition_id=cid,
-            question=question,
-            asset=asset,
-            yes_token_id=str(token_ids[0]),
-            no_token_id=str(token_ids[1]),
-            close_time=ct,
-            volume_usdc=volume_total,
-            volume_24h=volume_24h,
-        ))
-
-    return sorted(tradeable, key=lambda m: m.close_time)
+    volume = float(m.get("volumeNum", 0) or 0)
+    return MarketWatch(
+        condition_id=m.get("conditionId", ""),
+        question=m.get("question", slug),
+        slug=slug,
+        up_token_id=str(token_ids[0]),
+        dn_token_id=str(token_ids[1]),
+        close_time=close_time,
+        volume_usdc=volume,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,12 +440,12 @@ async def fetch_market_books(
     market: MarketWatch,
 ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    Fetch both YES and NO order books for a market.
-    Returns (yes_bid, yes_ask, no_bid, no_ask) — all None on failure.
+    Fetch UP and DOWN order books for the current 5-minute window.
+    Returns (up_bid, up_ask, dn_bid, dn_ask) — all None on failure.
     """
-    yes_bid, yes_ask = await fetch_book(session, market.yes_token_id)
-    no_bid,  no_ask  = await fetch_book(session, market.no_token_id)
-    return yes_bid, yes_ask, no_bid, no_ask
+    up_bid, up_ask = await fetch_book(session, market.up_token_id)
+    dn_bid, dn_ask = await fetch_book(session, market.dn_token_id)
+    return up_bid, up_ask, dn_bid, dn_ask
 
 
 # ---------------------------------------------------------------------------
@@ -544,14 +467,14 @@ def detect_lag_signal(
     btc_before: float,
 ) -> Optional[str]:
     """
-    Returns "YES", "NO", or None.
+    Returns "UP", "DOWN", or None.
 
     Fires when ALL conditions hold:
       1. BTC moved ≥ BTC_MOVE_PCT (0.3%) over BTC_WINDOW_SECS (10 s).
-      2. The market's YES best_ask has NOT moved more than STALE_THRESHOLD (1¢)
-         over STALE_WINDOW (30 s) — the contract price is lagging the BTC move.
-      3. Direction: BTC up → buy YES; BTC down → buy NO.
-         Skipped if the target side is already above 95¢ (no upside left).
+      2. The UP best_ask has NOT moved more than STALE_THRESHOLD (1¢) over
+         STALE_WINDOW (30 s) — Polymarket hasn't repriced yet.
+      3. Direction: BTC up → buy UP; BTC down → buy DOWN.
+         Skip if the target side is already priced ≥ 95¢ (no edge left).
     """
     btc_move = (btc_now - btc_before) / btc_before
 
@@ -559,18 +482,18 @@ def detect_lag_signal(
     if abs(btc_move) < BTC_MOVE_PCT:
         return None
 
-    # 2. Staleness check — has YES best_ask been flat for the last STALE_WINDOW seconds?
-    yes_ago = _price_at(market.yes_history, STALE_WINDOW)
-    if yes_ago is None:
-        return None  # not enough history yet (need ≥30 s of polling)
-    if abs(market.yes_ask - yes_ago) > STALE_THRESHOLD:
-        return None  # contract already repriced; lag window has closed
+    # 2. Staleness — UP best_ask must have been flat for STALE_WINDOW seconds
+    up_ago = _price_at(market.up_history, STALE_WINDOW)
+    if up_ago is None:
+        return None  # need ≥30 s of history before signalling
+    if abs(market.up_ask - up_ago) > STALE_THRESHOLD:
+        return None  # already repriced — lag window closed
 
     # 3. Directional signal
-    if btc_move > 0 and market.yes_ask < 0.95:
-        return "YES"
-    if btc_move < 0 and market.no_ask < 0.95:
-        return "NO"
+    if btc_move > 0 and market.up_ask < 0.95:
+        return "UP"
+    if btc_move < 0 and market.dn_ask < 0.95:
+        return "DOWN"
 
     return None
 
@@ -593,7 +516,7 @@ async def place_order(
     if PAPER_MODE:
         log.info(
             f"[PAPER] BUY {side} '{market.question[:60]}' "
-            f"@ {price:.3f} ({price*100:.1f}¢) | asset={market.asset}"
+            f"@ {price:.3f} ({price*100:.1f}¢)"
         )
         return True
 
@@ -607,7 +530,7 @@ async def place_order(
         log.warning("Live order skipped — credentials incomplete")
         return False
 
-    token_id = market.yes_token_id if side == "YES" else market.no_token_id
+    token_id = market.up_token_id if side == "UP" else market.dn_token_id
     size = round(ORDER_SIZE_USDC / price, 2)  # shares = USDC / price
 
     def _sync_order():
@@ -650,48 +573,44 @@ async def place_order(
 
 def log_entry(market: MarketWatch, side: str, price: float,
               btc_price: float, btc_move_pct: float) -> None:
-    """Log a trade entry. btc_move_pct is a fraction (e.g. 0.008 = 0.8%)."""
-    hours_left = market.hours_to_close
-    regime = "NEAR" if hours_left < 1.0 else "FAR"
+    """Log a paper trade entry. btc_move_pct is a fraction (e.g. 0.003 = 0.3%)."""
     _write_trade_record({
         "platform":           "polymarket",
-        "asset":              market.asset,
-        "condition_id":       market.condition_id,
+        "market":             "btc-updown-5m",
+        "slug":               market.slug,
         "question":           market.question,
         "side":               side,
         "entry_price_cents":  round(price * 100, 2),
         "order_size_usdc":    ORDER_SIZE_USDC,
         "entry_time":         datetime.now(timezone.utc).isoformat(),
         "close_time":         market.close_time.isoformat(),
-        "hours_to_close":     round(hours_left, 3),
-        "regime":             regime,
+        "secs_left":          round(market.secs_left, 1),
         "btc_price_at_entry": round(btc_price, 2),
         "btc_move_pct":       round(btc_move_pct * 100, 4),
         "btc_window_secs":    BTC_WINDOW_SECS,
-        "volume_usdc":        round(market.volume_usdc, 0),
+        "volume_usdc":        round(market.volume_usdc, 2),
         "paper":              PAPER_MODE,
     })
 
 
 def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
-    raw_pnl = exit_price - market.entry_price if market.position_side == "YES" \
-              else market.entry_price - exit_price
+    raw_pnl = (exit_price - market.entry_price) if market.position_side == "UP" \
+              else (market.entry_price - exit_price)
     dollar_pnl = round(raw_pnl * (ORDER_SIZE_USDC / market.entry_price), 4)
-    hours_left = market.hours_to_close
     _write_trade_record({
         "platform":           "polymarket",
-        "asset":              market.asset,
-        "condition_id":       market.condition_id,
+        "market":             "btc-updown-5m",
+        "slug":               market.slug,
         "question":           market.question,
         "side":               market.position_side,
         "entry_price_cents":  round(market.entry_price * 100, 2),
         "exit_price_cents":   round(exit_price * 100, 2),
         "entry_time":         market.entry_time,
         "exit_time":          datetime.now(timezone.utc).isoformat(),
-        "hours_to_close":     round(hours_left, 3),
+        "secs_left_at_exit":  round(market.secs_left, 1),
         "exit_reason":        reason,
         "pnl_dollars":        dollar_pnl,
-        "volume_usdc":        round(market.volume_usdc, 0),
+        "volume_usdc":        round(market.volume_usdc, 2),
         "paper":              PAPER_MODE,
     })
 
@@ -703,116 +622,127 @@ def log_exit(market: MarketWatch, exit_price: float, reason: str) -> None:
 async def run_market(
     session: aiohttp.ClientSession,
     market: MarketWatch,
-    btc_feed,           # the latency.binance_feed module
+    btc_feed,
 ) -> None:
+    """
+    Monitor one 5-minute BTC Up/Down window until it closes.
+    Polls order books every POLL_INTERVAL_S (2 s).
+    Returns when the window closes — caller rolls to the next window.
+    """
+    global _in_position
+    secs_left = market.secs_left
     log.info(
-        f"[POLY] Monitoring: '{market.question[:65]}' "
-        f"| {market.asset} | vol=${market.volume_usdc:,.0f} "
-        f"| {market.hours_to_close:.2f}h left"
+        f"[POLY] ── Window: '{market.question}' "
+        f"| vol=${market.volume_usdc:,.2f} | {secs_left:.0f}s left"
     )
 
     while True:
         try:
             now_utc   = datetime.now(timezone.utc)
-            secs_left = (market.close_time - now_utc).total_seconds()
-            ts        = now_utc.strftime("%H:%M:%S.%f")[:-3]
+            secs_left = market.secs_left
+            ts        = now_utc.strftime("%H:%M:%S")
 
-            # Market has closed
+            # Window has closed — settle any open position and exit
             if secs_left <= 0:
                 if market.in_position:
-                    exit_price = market.yes_ask if market.position_side == "YES" else market.no_ask
+                    exit_price = market.up_ask if market.position_side == "UP" else market.dn_ask
                     log_exit(market, exit_price, "MARKET_CLOSED")
-                    _open_positions.discard(market.condition_id)
-                log.info(f"[{ts}] [POLY] Market closed: '{market.question[:40]}'")
+                    _in_position = False
+                    log.info(f"[{ts}] [POLY] Window closed — position settled at {exit_price:.3f}")
+                else:
+                    log.info(f"[{ts}] [POLY] Window closed — no position held")
                 return
 
-            # Hard-close before MIN_SECS_TO_CLOSE
+            # Hard-close in final MIN_SECS_TO_CLOSE seconds
             if market.in_position and secs_left < MIN_SECS_TO_CLOSE:
-                exit_price = market.yes_ask if market.position_side == "YES" else market.no_ask
+                exit_price = market.up_ask if market.position_side == "UP" else market.dn_ask
                 side = market.position_side
                 log_exit(market, exit_price, "HARD_CLOSE")
-                _open_positions.discard(market.condition_id)
+                _in_position = False
                 market.in_position   = False
                 market.position_side = None
                 log.info(
-                    f"[{ts}] [POLY] HARD_CLOSE {side} @ {exit_price:.3f} | {secs_left:.0f}s left"
+                    f"[{ts}] [POLY] HARD_CLOSE {side} @ {exit_price:.3f} "
+                    f"({exit_price*100:.1f}¢) | {secs_left:.0f}s left"
                 )
 
-            # Fetch YES and NO order books via GET /book?token_id=
-            yes_bid, yes_ask, no_bid, no_ask = await fetch_market_books(session, market)
-            if yes_ask is None or no_ask is None:
+            # Fetch UP and DOWN order books via GET /book?token_id=
+            up_bid, up_ask, dn_bid, dn_ask = await fetch_market_books(session, market)
+            if up_ask is None or dn_ask is None:
+                log.debug(f"[{ts}] [POLY] Book fetch failed — retrying")
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
 
-            market.yes_ask = yes_ask
-            market.no_ask  = no_ask
-            now_ts = time.time()
-            market.yes_history.append((now_ts, yes_ask))
-            market.no_history.append((now_ts, no_ask))
+            market.up_bid = up_bid or 0.0
+            market.up_ask = up_ask
+            market.dn_bid = dn_bid or 0.0
+            market.dn_ask = dn_ask
+            market.up_history.append((time.time(), up_ask))
 
-            # Holding — log unrealized P&L
+            # Holding — log unrealized P&L and wait for window close
             if market.in_position:
-                held = market.yes_ask if market.position_side == "YES" else market.no_ask
+                held = market.up_ask if market.position_side == "UP" else market.dn_ask
                 unrl = (held - market.entry_price) * (ORDER_SIZE_USDC / market.entry_price)
                 log.info(
                     f"[{ts}] [POLY] HOLDING {market.position_side} "
-                    f"| YES bid={yes_bid:.3f} ask={yes_ask:.3f} "
-                    f"| NO bid={no_bid:.3f} ask={no_ask:.3f} "
+                    f"| UP bid={up_bid:.3f} ask={up_ask:.3f} "
+                    f"| DN bid={dn_bid:.3f} ask={dn_ask:.3f} "
                     f"| unrealized=${unrl:+.2f} | {secs_left:.0f}s left"
                 )
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
 
-            # Global position lock
-            if _open_positions:
+            # Don't enter in the last MIN_SECS_TO_CLOSE seconds
+            if secs_left < MIN_SECS_TO_CLOSE or _in_position:
+                log.info(
+                    f"[{ts}] [POLY] WATCHING "
+                    f"| UP bid={up_bid:.3f} ask={up_ask:.3f} "
+                    f"| DN bid={dn_bid:.3f} ask={dn_ask:.3f} "
+                    f"| {secs_left:.0f}s left"
+                )
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
 
-            if secs_left < MIN_SECS_TO_CLOSE:
-                await asyncio.sleep(POLL_INTERVAL_S)
-                continue
-
-            # BTC feed
+            # BTC directional feed
             btc_now    = btc_feed.get_price()
             btc_before = btc_feed.get_price_ago(BTC_WINDOW_SECS)
             if btc_now is None or btc_before is None:
-                log.info(f"[{ts}] [POLY] BTC feed warming up...")
+                log.info(f"[{ts}] [POLY] BTC feed warming up — {secs_left:.0f}s left")
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
 
             btc_move = (btc_now - btc_before) / btc_before
             signal   = detect_lag_signal(market, btc_now, btc_before)
 
-            if signal is None:
-                log.info(
-                    f"[{ts}] [POLY] '{market.question[:40]}' "
-                    f"| YES bid={yes_bid:.3f} ask={yes_ask:.3f} "
-                    f"| NO bid={no_bid:.3f} ask={no_ask:.3f} "
-                    f"| BTC Δ{btc_move*100:+.3f}% ({BTC_WINDOW_SECS:.0f}s) "
-                    f"| {secs_left/60:.1f} min left"
-                )
-            else:
-                entry_price = market.yes_ask if signal == "YES" else market.no_ask
+            log.info(
+                f"[{ts}] [POLY] "
+                f"UP bid={up_bid:.3f} ask={up_ask:.3f} | "
+                f"DN bid={dn_bid:.3f} ask={dn_ask:.3f} | "
+                f"BTC Δ{btc_move*100:+.3f}% ({BTC_WINDOW_SECS:.0f}s) | "
+                f"{secs_left:.0f}s left"
+                + (f" | *** SIGNAL: BUY {signal} ***" if signal else "")
+            )
+
+            if signal:
+                entry_price = market.up_ask if signal == "UP" else market.dn_ask
                 ok = await place_order(session, market, signal, entry_price)
                 if ok:
+                    _in_position         = True
                     market.in_position   = True
                     market.position_side = signal
                     market.entry_price   = entry_price
                     market.entry_time    = now_utc.isoformat()
                     market.entry_btc     = btc_now
-                    _open_positions.add(market.condition_id)
                     log_entry(market, signal, entry_price, btc_now, btc_move)
                     log.info(
-                        f"[{ts}] [POLY] *** LAG SIGNAL: BUY {signal} *** "
-                        f"'{market.question[:50]}' "
-                        f"@ {entry_price:.3f} ({entry_price*100:.1f}¢) "
-                        f"| BTC Δ{btc_move*100:+.3f}% in {BTC_WINDOW_SECS:.0f}s "
-                        f"| YES ask was flat {STALE_WINDOW:.0f}s "
-                        f"| {'PAPER' if PAPER_MODE else 'LIVE'} | {secs_left/60:.1f} min left"
+                        f"[{ts}] [POLY] *** BUY {signal} @ {entry_price:.3f} "
+                        f"({entry_price*100:.1f}¢) | BTC Δ{btc_move*100:+.3f}% in "
+                        f"{BTC_WINDOW_SECS:.0f}s | UP ask flat {STALE_WINDOW:.0f}s | "
+                        f"{'PAPER' if PAPER_MODE else 'LIVE'} | {secs_left:.0f}s left ***"
                     )
 
         except asyncio.CancelledError:
-            log.info(f"[POLY] Task cancelled for '{market.question[:40]}'")
+            log.info(f"[POLY] run_market cancelled mid-window")
             return
         except Exception as exc:
             log.error(f"[POLY] run_market error: {exc}")
@@ -826,14 +756,15 @@ async def run_market(
 
 async def main() -> None:
     log.info("=" * 65)
-    log.info("Kalshi Bot — Path D: Polymarket Latency Arb")
-    log.info(f"Mode:           {'PAPER' if PAPER_MODE else 'LIVE'}")
-    log.info(f"BTC window:     {BTC_WINDOW_SECS:.0f}s | move threshold: ≥{BTC_MOVE_PCT*100:.1f}%")
-    log.info(f"Stale check:    best_ask must not move >{STALE_THRESHOLD*100:.0f}¢ in {STALE_WINDOW:.0f}s")
-    log.info(f"Market window:  closes within {MAX_HOURS_TO_CLOSE:.0f}h (hard floor: {MIN_SECS_TO_CLOSE}s)")
-    log.info(f"Order size:     ${ORDER_SIZE_USDC:.0f} USDC per trade")
-    log.info(f"Data sources:   Gamma API (markets) + CLOB /book (order books) — no auth needed")
-    log.info(f"Trade log:      {_TRADE_LOG_PATH}")
+    log.info("Kalshi Bot — Path D: Polymarket BTC Up/Down Latency Arb")
+    log.info(f"Mode:         {'PAPER' if PAPER_MODE else 'LIVE'}")
+    log.info(f"Market:       btc-updown-5m-{{window_ts}}  (deterministic 5-min slug)")
+    log.info(f"BTC signal:   ≥{BTC_MOVE_PCT*100:.1f}% move in {BTC_WINDOW_SECS:.0f}s via Coinbase feed")
+    log.info(f"Stale check:  UP best_ask must not move >{STALE_THRESHOLD*100:.0f}¢ in {STALE_WINDOW:.0f}s")
+    log.info(f"Poll rate:    every {POLL_INTERVAL_S:.0f}s | hard-close: last {MIN_SECS_TO_CLOSE}s of window")
+    log.info(f"Order size:   ${ORDER_SIZE_USDC:.0f} USDC per trade")
+    log.info(f"Data:         Gamma API (slug lookup) + CLOB /book (order books) — public, no auth")
+    log.info(f"Trade log:    {_TRADE_LOG_PATH}")
     log.info("=" * 65)
 
     # Start shared Coinbase BTC feed
@@ -856,58 +787,54 @@ async def main() -> None:
 
     connector = aiohttp.TCPConnector(ssl=_ssl_ctx, limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
-        active_tasks: dict[str, asyncio.Task] = {}
-
         try:
             while True:
+                # Derive current window slug deterministically
+                window_ts = _current_window_ts()
+                slug      = f"{SLUG_PREFIX}-{window_ts}"
+                secs_into_window = int(time.time()) % WINDOW_SECS
+                secs_left_in_window = WINDOW_SECS - secs_into_window
+
                 log.info(
-                    f"[POLY] Querying Gamma API: active=true, closed=false, "
-                    f"volume_num_min=10000, order=volume desc, window=<{MAX_HOURS_TO_CLOSE:.0f}h..."
+                    f"[POLY] Fetching market: {slug} "
+                    f"({secs_into_window}s into window, {secs_left_in_window}s left)"
                 )
-                tradeable = await discover_markets(session)
+                market = await get_current_market(session, window_ts)
 
-                if tradeable:
-                    log.info(f"[POLY] Found {len(tradeable)} BTC/ETH market(s) within {MAX_HOURS_TO_CLOSE:.0f}h:")
-                    for m in tradeable:
-                        # Fetch and display current order book for each discovered market
-                        yes_bid, yes_ask, no_bid, no_ask = await fetch_market_books(session, m)
-                        book_str = (
-                            f"YES bid={yes_bid:.3f} ask={yes_ask:.3f} | NO bid={no_bid:.3f} ask={no_ask:.3f}"
-                            if yes_ask is not None
-                            else "order book unavailable"
-                        )
-                        log.info(
-                            f"  [{m.asset}] '{m.question[:55]}' "
-                            f"| {m.hours_to_close:.2f}h left | vol=${m.volume_usdc:,.0f}"
-                        )
-                        log.info(f"           {book_str}")
-                else:
-                    log.info(
-                        f"[POLY] No BTC/ETH markets found within {MAX_HOURS_TO_CLOSE:.0f}h "
-                        f"(vol≥$10k). This is normal near UTC midnight after daily settlement. "
-                        f"Rescan in {REFRESH_SECS:.0f}s."
+                if market is None:
+                    log.warning(
+                        f"[POLY] No market found for {slug} — "
+                        f"retrying in 10s (may be between windows)"
                     )
+                    await asyncio.sleep(10)
+                    continue
 
-                # Launch monitor tasks
-                for market in tradeable:
-                    cid = market.condition_id
-                    if cid in active_tasks and not active_tasks[cid].done():
-                        continue
-                    task = asyncio.create_task(run_market(session, market, btc_feed))
-                    active_tasks[cid] = task
+                # Show order book snapshot at discovery
+                up_bid, up_ask, dn_bid, dn_ask = await fetch_market_books(session, market)
+                if up_ask is not None:
+                    log.info(
+                        f"[POLY] ✓ Market loaded: '{market.question}'"
+                        f"\n         vol=${market.volume_usdc:,.2f} | "
+                        f"UP  bid={up_bid:.4f} ask={up_ask:.4f} ({up_ask*100:.1f}¢)"
+                        f"\n         "
+                        f"DN  bid={dn_bid:.4f} ask={dn_ask:.4f} ({dn_ask*100:.1f}¢) | "
+                        f"{secs_left_in_window:.0f}s left in window"
+                    )
+                    # Seed initial history
+                    market.up_ask = up_ask
+                    market.up_history.append((time.time(), up_ask))
+                else:
+                    log.warning(f"[POLY] Could not read order book for {slug}")
 
-                # Prune finished tasks
-                for cid in [c for c, t in active_tasks.items() if t.done()]:
-                    del active_tasks[cid]
+                # Run the monitoring loop for this window (blocking until window closes)
+                await run_market(session, market, btc_feed)
 
-                await asyncio.sleep(REFRESH_SECS)
+                # Small pause before rolling to next window
+                await asyncio.sleep(2)
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             log.info("Shutting down...")
         finally:
-            for t in active_tasks.values():
-                t.cancel()
-            await asyncio.gather(*active_tasks.values(), return_exceptions=True)
             await btc_feed.stop()
             log.info("Polymarket bot stopped.")
 
