@@ -31,21 +31,26 @@ KALSHI_CUTOFF = "2026-04-29T18:24"  # filter pre-cleanup trades
 # ---------------------------------------------------------------------------
 
 def _is_running(script: str) -> tuple[bool, int]:
-    """Return (running, pid) for a Python script via pgrep."""
+    """Return (running, pid) for a Python script via pgrep -f."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", script],
             capture_output=True, text=True
         )
-        pids = [
-            int(p) for p in result.stdout.strip().split("\n")
-            if p.strip().isdigit() and int(p.strip()) != os.getpid()
-        ]
-        if pids:
-            return True, pids[0]
+        if result.returncode != 0:
+            return False, 0
+        # returncode 0 means at least one match; extract first non-self PID
+        own = os.getpid()
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pid = int(line)
+                if pid != own:
+                    return True, pid
+        # pgrep matched but only PID was our own (shouldn't happen); still running
+        return True, 0
     except Exception:
-        pass
-    return False, 0
+        return False, 0
 
 
 def _last_log_line(path: Path) -> str:
@@ -223,24 +228,50 @@ def api_restart(bot: str):
         "polymarket": "polymarket.log",
         "coinbase":   "coinbase.log",
     }
+    window_names = {
+        "kalshi":     "kalshi-bot",
+        "polymarket": "poly-bot",
+        "coinbase":   "cb-bot",
+    }
     if bot not in scripts:
         return jsonify({"ok": False, "error": "unknown bot"}), 400
 
-    script = scripts[bot]
+    script    = scripts[bot]
+    log_file  = BASE / log_files[bot]
+    win_name  = window_names[bot]
+
     try:
-        subprocess.run(["pkill", "-f", script], capture_output=True)
+        # Kill the running process
+        kill = subprocess.run(["pkill", "-f", script], capture_output=True, text=True)
+        app.logger.info("pkill %s rc=%d", script, kill.returncode)
         time.sleep(0.8)
-        log_file = BASE / log_files[bot]
+
+        # Try tmux first (session "kalshi" is the expected live session)
+        tmux_cmd = f"cd {BASE} && python3 {script} >> {log_file} 2>&1"
+        tmux = subprocess.run(
+            ["tmux", "new-window", "-t", "kalshi", "-n", win_name, tmux_cmd],
+            capture_output=True, text=True,
+        )
+        app.logger.info("tmux new-window rc=%d stderr=%r", tmux.returncode, tmux.stderr)
+
+        if tmux.returncode == 0:
+            return jsonify({"ok": True, "msg": f"{script} restarted in tmux window '{win_name}'"})
+
+        # tmux unavailable or no session — fall back to detached subprocess
+        app.logger.warning("tmux failed, falling back to Popen for %s", script)
         with open(log_file, "a") as lf:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 ["python3", str(BASE / script)],
                 cwd=str(BASE),
                 stdout=lf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-        return jsonify({"ok": True, "msg": f"{script} restarted"})
+        app.logger.info("Popen pid=%d for %s", proc.pid, script)
+        return jsonify({"ok": True, "msg": f"{script} restarted (pid {proc.pid})"})
+
     except Exception as e:
+        app.logger.exception("restart %s failed", script)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -264,7 +295,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kalshi Bot Monitor</title>
+<title>Trading Bot Tracker</title>
 <style>
 :root{
   --bg:#0d1117;--card:#161b22;--card2:#1c2128;
@@ -440,7 +471,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
 <body>
 
 <div class="hdr">
-  <div class="hdr-title">⬡ KALSHI BOT MONITOR</div>
+  <div class="hdr-title">⬡ TRADING BOT TRACKER</div>
   <div class="hdr-right">
     <span class="hdr-updated">Updated: <span id="ts">—</span></span>
     <div class="countdown" title="Next refresh">
