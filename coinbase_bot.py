@@ -128,13 +128,13 @@ CANDLE_GRAN_15M     = "FIFTEEN_MINUTE"
 N_CANDLES_5M        = 26      # fetch 26; [0] is still-forming, [1..] are completed
 N_CANDLES_15M       = 6       # fetch 6; same convention
 
-ENTRY_MOVE_PCT      = 0.0015  # 0.15% — last completed 5m candle must move at least this
+ENTRY_MOVE_PCT      = 0.003   # 0.30% — filter out weak signals
 VOL_AVG_WINDOW      = 20      # 20-candle rolling average for volume filter
 STOP_LOSS_PCT       = 0.0015  # −0.15% from entry price
 TAKE_PROFIT_PCT     = 0.0030  # +0.30% from entry price
 POSITION_SIZE_USD   = 50.0    # dollars per trade
 
-MAX_TRADES_PER_DAY  = 3       # hard cap on daily entries
+MAX_TRADES_PER_DAY  = 10      # paper mode — collect data
 DAILY_LOSS_LIMIT_USD = 10.0   # halt all entries if day P&L drops below −$10
 SESSION_HALT_MIN_LOSS = 2.0   # halt rest of session after a loss ≥ this (dollars)
 

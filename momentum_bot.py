@@ -81,8 +81,8 @@ def _write_trade_record(record: dict) -> None:
 SERIES = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 POLL_INTERVAL_S        = 0.70   # 700 ms
 ACTIVATE_MINS_BEFORE_CLOSE = 8
-ENTRY_THRESHOLD        = 90     # cents — grid search optimal (500 markets: Sharpe 8.93 vs 6.x at 87c)
-CONVICTION_THRESHOLD   = 93     # cents — bypass momentum cross + correlation at this price; outcome near-certain
+ENTRY_THRESHOLD        = 85     # cents — more signals, still above noise
+CONVICTION_THRESHOLD   = 90     # cents — matches new entry floor
 STOP_LOSS_THRESHOLD    = None   # disabled — no stop-loss (500-session backtest)
 HARD_CLOSE_SECS        = 30     # exit any open position with this many seconds left
 MIN_SECS_FOR_ENTRY     = 60     # grid search optimal (60s beats 90s/120s across all combos)
