@@ -1,218 +1,781 @@
+#!/usr/bin/env python3
 """
-dashboard.py — Live terminal dashboard for the Kalshi momentum bot.
-
-Polls momentum_trades.jsonl every 2 seconds and displays:
-  - Today's total P&L
-  - Overall win rate
-  - Trades remaining in session cap per series
-  - Last 5 trades
-
-Stdlib only — no rich, no curses.
-
-Usage:
-    python3 dashboard.py
+dashboard.py — Real-time web monitor for kalshi-bot bots.
+Run: python3 dashboard.py
+URL: http://localhost:5000
 """
-from __future__ import annotations
-
 import json
 import os
-import sys
+import subprocess
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-TRADE_LOG            = Path(__file__).parent / "momentum_trades.jsonl"
-POLL_INTERVAL        = 2.0      # seconds between refreshes
-MAX_TRADES_PER_SESSION = 3
-SERIES               = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
+from flask import Flask, jsonify, request, Response
 
+app = Flask(__name__)
+app.config["JSON_SORT_KEYS"] = False
+
+BASE = Path(__file__).parent
+MOMENTUM_LOG      = BASE / "momentum.log"
+POLYMARKET_LOG    = BASE / "polymarket.log"
+MOMENTUM_TRADES   = BASE / "momentum_trades.jsonl"
+POLYMARKET_TRADES = BASE / "polymarket_trades.jsonl"
+
+KALSHI_CUTOFF = "2026-04-29T18:24"  # filter pre-cleanup trades
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Helpers
 # ---------------------------------------------------------------------------
 
-def load_trades() -> list[dict]:
-    if not TRADE_LOG.exists():
+def _is_running(script: str) -> tuple[bool, int]:
+    """Return (running, pid) for a Python script via pgrep."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", script],
+            capture_output=True, text=True
+        )
+        pids = [
+            int(p) for p in result.stdout.strip().split("\n")
+            if p.strip().isdigit() and int(p.strip()) != os.getpid()
+        ]
+        if pids:
+            return True, pids[0]
+    except Exception:
+        pass
+    return False, 0
+
+
+def _last_log_line(path: Path) -> str:
+    if not path.exists():
+        return "(log not found)"
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = [l for l in chunk.splitlines() if l.strip()]
+        return lines[-1] if lines else "(empty)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def _last_n_lines(path: Path, n: int = 10) -> list[str]:
+    if not path.exists():
         return []
-    trades = []
-    with TRADE_LOG.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    trades.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-    return trades
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - n * 300))
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = [l for l in chunk.splitlines() if l.strip()]
+        return lines[-n:]
+    except Exception:
+        return []
 
 
-# ---------------------------------------------------------------------------
-# Derived stats
-# ---------------------------------------------------------------------------
+def _last_n_full_lines(path: Path, n: int = 100) -> str:
+    if not path.exists():
+        return "(log not found)"
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - n * 300))
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = chunk.splitlines()
+        return "\n".join(lines[-n:])
+    except Exception as e:
+        return f"(error: {e})"
 
-def today_prefix() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _load_jsonl(path: Path) -> list[dict]:
+    records = []
+    if not path.exists():
+        return records
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except Exception:
+        pass
+    return records
 
 
-def compute_stats(trades: list[dict]) -> dict:
-    today = today_prefix()
+def _get_status() -> dict:
+    # --- bot process status ---
+    m_running, m_pid = _is_running("momentum_bot.py")
+    p_running, p_pid = _is_running("polymarket_bot.py")
 
-    today_pnl = sum(
-        t.get("pnl_dollars", 0.0) for t in trades
-        if (t.get("entry_time") or "").startswith(today)
-    )
-    all_pnls  = [t.get("pnl_dollars", 0.0) for t in trades]
-    wins      = sum(1 for p in all_pnls if p > 0)
-    win_rate  = wins / len(all_pnls) if all_pnls else 0.0
+    # --- kalshi trades ---
+    all_trades = _load_jsonl(MOMENTUM_TRADES)
+    clean = [t for t in all_trades if t.get("entry_time", "") >= KALSHI_CUTOFF]
+    total  = len(clean)
+    wins   = sum(1 for t in clean if t.get("pnl_dollars", 0) > 0)
+    losses = sum(1 for t in clean if t.get("pnl_dollars", 0) < 0)
+    pnl    = sum(t.get("pnl_dollars", 0) for t in clean)
 
-    # Trades remaining per series: most recent ticker per series, count trades in it
-    latest_ticker: dict[str, str]  = {}
-    ticker_counts: dict[str, int]  = defaultdict(int)
-    for t in trades:
-        series = t.get("series", "")
-        ticker = t.get("ticker", "")
-        if not series or not ticker:
-            continue
-        # Keep lexicographically latest (which equals chronologically latest)
-        if series not in latest_ticker or ticker > latest_ticker[series]:
-            latest_ticker[series] = ticker
-    for t in trades:
-        series = t.get("series", "")
-        ticker = t.get("ticker", "")
-        if series and ticker == latest_ticker.get(series):
-            ticker_counts[series] += 1
+    recent_trades = []
+    for t in reversed(clean[-10:]):
+        pnl_val = t.get("pnl_dollars", 0)
+        recent_trades.append({
+            "time":        (t.get("entry_time") or "")[:16].replace("T", " "),
+            "series":      t.get("series", ""),
+            "entry_type":  t.get("entry_type", "MOM"),
+            "side":        t.get("side", ""),
+            "entry_price": t.get("entry_price_cents", ""),
+            "exit_price":  t.get("exit_price_cents", ""),
+            "exit_reason": t.get("exit_reason", ""),
+            "pnl":         round(pnl_val, 4),
+        })
 
-    remaining: dict[str, int] = {
-        s: max(0, MAX_TRADES_PER_SESSION - ticker_counts.get(s, 0))
-        for s in SERIES
-    }
-
-    last5 = trades[-5:][::-1]  # most recent first
+    # --- polymarket ---
+    poly_trades = _load_jsonl(POLYMARKET_TRADES)
+    poly_logs   = _last_n_lines(POLYMARKET_LOG, 10)
 
     return {
-        "today_pnl": today_pnl,
-        "total_trades": len(trades),
-        "wins": wins,
-        "win_rate": win_rate,
-        "remaining": remaining,
-        "latest_ticker": latest_ticker,
-        "last5": last5,
-        "now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "momentum": {
+            "running":  m_running,
+            "pid":      m_pid,
+            "last_log": _last_log_line(MOMENTUM_LOG),
+        },
+        "polymarket": {
+            "running":  p_running,
+            "pid":      p_pid,
+            "last_log": _last_log_line(POLYMARKET_LOG),
+        },
+        "kalshi": {
+            "total":    total,
+            "wins":     wins,
+            "losses":   losses,
+            "win_rate": round(wins / total * 100, 1) if total else 0,
+            "pnl":      round(pnl, 4),
+            "recent":   recent_trades,
+        },
+        "polymarket_trades": poly_trades[-10:],
+        "polymarket_logs":   poly_logs,
+        "cutoff":            KALSHI_CUTOFF,
+        "updated":           datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
     }
 
 
 # ---------------------------------------------------------------------------
-# Rendering
+# Routes
 # ---------------------------------------------------------------------------
 
-WIDTH = 64
-
-def _bar(value: float, total: float, width: int = 20, char: str = "█") -> str:
-    if total <= 0:
-        return "─" * width
-    filled = max(0, min(width, round(value / total * width)))
-    return char * filled + "░" * (width - filled)
+@app.route("/api/status")
+def api_status():
+    return jsonify(_get_status())
 
 
-def render(stats: dict) -> str:
-    lines: list[str] = []
-    W = WIDTH
+@app.route("/api/restart/<bot>", methods=["POST"])
+def api_restart(bot: str):
+    scripts = {
+        "kalshi":     "momentum_bot.py",
+        "polymarket": "polymarket_bot.py",
+    }
+    if bot not in scripts:
+        return jsonify({"ok": False, "error": "unknown bot"}), 400
 
-    def hr(ch: str = "─") -> None:
-        lines.append(ch * W)
-
-    def row(left: str, right: str = "", bold: bool = False) -> None:
-        gap = W - len(left) - len(right)
-        lines.append(left + " " * max(1, gap) + right)
-
-    hr("═")
-    row("  Kalshi Momentum Bot — Live Dashboard", stats["now"])
-    hr("═")
-
-    # P&L block
-    pnl = stats["today_pnl"]
-    pnl_str = f"${pnl:+.4f}"
-    sign = "▲" if pnl > 0 else ("▼" if pnl < 0 else "·")
-    row(f"  {sign} Today's P&L", pnl_str + "  ")
-    lines.append("")
-
-    # Win rate
-    n = stats["total_trades"]
-    w = stats["wins"]
-    wr = stats["win_rate"]
-    bar = _bar(w, n, width=24)
-    row(f"  Win rate  {bar}  {wr:.1%} ({w}W/{n-w}L)  ")
-    lines.append("")
-
-    # Session cap remaining
-    hr()
-    row("  Session cap remaining (cap = 3 per series):")
-    for series in SERIES:
-        rem  = stats["remaining"].get(series, MAX_TRADES_PER_SESSION)
-        used = MAX_TRADES_PER_SESSION - rem
-        pip  = "●" * used + "○" * rem
-        ticker = stats["latest_ticker"].get(series, "—")
-        short_ticker = ticker.split("-")[-2] + "-" + ticker.split("-")[-1] if "-" in ticker else ticker
-        row(f"    {series:<12}  {pip}  {rem} left  ({short_ticker})")
-    lines.append("")
-
-    # Last 5 trades
-    hr()
-    row("  Last 5 trades:")
-    lines.append(
-        f"  {'Series':<12}  {'Side':<4}  {'Entry':>6}  {'Exit':>6}  "
-        f"{'P&L':>8}  {'Reason'}"
-    )
-    hr()
-    last5 = stats["last5"]
-    if not last5:
-        lines.append("  (no trades yet)")
-    for t in last5:
-        series  = (t.get("series") or "?")[:10]
-        side    = t.get("side", "?")
-        entry   = t.get("entry_price_cents", 0.0)
-        exit_   = t.get("exit_price_cents", 0.0)
-        pnl_t   = t.get("pnl_dollars", 0.0)
-        reason  = t.get("exit_reason", "?")[:12]
-        pnl_s   = f"${pnl_t:+.4f}"
-        entry_s = f"{entry:.0f}¢"
-        exit_s  = f"{exit_:.0f}¢"
-        lines.append(
-            f"  {series:<12}  {side:<4}  {entry_s:>6}  {exit_s:>6}  "
-            f"{pnl_s:>8}  {reason}"
-        )
-
-    hr("═")
-    lines.append(f"  Refreshing every {POLL_INTERVAL:.0f}s — Ctrl+C to quit")
-    hr("═")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
-def clear() -> None:
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
-
-
-def main() -> None:
-    print("Starting dashboard — waiting for first poll…")
-    time.sleep(0.5)
+    script = scripts[bot]
     try:
-        while True:
-            trades = load_trades()
-            stats  = compute_stats(trades)
-            output = render(stats)
-            clear()
-            print(output)
-            time.sleep(POLL_INTERVAL)
-    except KeyboardInterrupt:
-        clear()
-        print("Dashboard stopped.")
+        subprocess.run(["pkill", "-f", script], capture_output=True)
+        time.sleep(0.8)
+        log_file = BASE / ("momentum.log" if bot == "kalshi" else "polymarket.log")
+        with open(log_file, "a") as lf:
+            subprocess.Popen(
+                ["python3", str(BASE / script)],
+                cwd=str(BASE),
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return jsonify({"ok": True, "msg": f"{script} restarted"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
+
+@app.route("/api/logs/momentum")
+def api_logs_momentum():
+    content = _last_n_full_lines(MOMENTUM_LOG, 100)
+    return Response(content, mimetype="text/plain")
+
+
+@app.route("/")
+def index():
+    return HTML
+
+
+# ---------------------------------------------------------------------------
+# Embedded HTML (dark-theme single-page app)
+# ---------------------------------------------------------------------------
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kalshi Bot Monitor</title>
+<style>
+:root{
+  --bg:#0d1117;--card:#161b22;--card2:#1c2128;
+  --border:#30363d;--border2:#21262d;
+  --text:#c9d1d9;--dim:#8b949e;--dimmer:#484f58;
+  --green:#3fb950;--red:#f85149;--yellow:#d29922;
+  --blue:#58a6ff;--purple:#bc8cff;--orange:#ffa657;
+  --green-bg:rgba(63,185,80,.08);--red-bg:rgba(248,81,73,.08);
+  --blue-bg:rgba(88,166,255,.08);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'SF Mono','Monaco','Fira Code',monospace;font-size:12px;min-height:100vh}
+
+/* Header */
+.hdr{
+  position:sticky;top:0;z-index:50;
+  background:rgba(22,27,34,.96);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border);
+  padding:0 20px;display:flex;align-items:center;justify-content:space-between;height:48px;
+}
+.hdr-title{font-size:14px;font-weight:700;color:var(--blue);letter-spacing:1.5px}
+.hdr-right{display:flex;align-items:center;gap:16px;color:var(--dim);font-size:11px}
+.hdr-updated{color:var(--dimmer)}
+.countdown{
+  display:flex;align-items:center;gap:5px;
+  background:var(--card2);border:1px solid var(--border2);
+  border-radius:4px;padding:3px 8px;
+}
+.countdown-ring{width:12px;height:12px;position:relative}
+.countdown-ring svg{transform:rotate(-90deg)}
+.countdown-ring circle{fill:none;stroke:var(--border);stroke-width:2}
+.countdown-ring .arc{stroke:var(--blue);stroke-dasharray:34;stroke-dashoffset:34;stroke-linecap:round;transition:stroke-dashoffset 1s linear}
+
+/* Layout */
+.main{padding:16px;display:grid;grid-template-columns:260px 1fr;gap:14px;align-items:start}
+.sidebar{display:flex;flex-direction:column;gap:14px}
+.content{display:flex;flex-direction:column;gap:14px}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.card-hdr{
+  padding:10px 14px;border-bottom:1px solid var(--border2);
+  display:flex;align-items:center;justify-content:space-between;
+  background:var(--card2);
+}
+.card-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
+.card-body{padding:14px}
+
+/* Status dots */
+.bot-row{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.bot-row:last-child{margin-bottom:0}
+.bot-status{display:flex;align-items:center;gap:8px}
+.dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.dot-on{background:var(--green);box-shadow:0 0 7px var(--green)}
+.dot-off{background:var(--red)}
+.bot-name{font-weight:600;font-size:12px}
+.bot-pid{color:var(--dimmer);font-size:10px;margin-left:auto}
+.bot-log{
+  font-size:10px;color:var(--dim);
+  background:var(--bg);border:1px solid var(--border2);border-radius:4px;
+  padding:5px 7px;line-height:1.5;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+
+/* Stats row */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.stat{
+  background:var(--card2);border:1px solid var(--border2);border-radius:6px;
+  padding:12px 14px;text-align:center;
+}
+.stat-val{font-size:22px;font-weight:700;line-height:1}
+.stat-lbl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-top:5px}
+.pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--blue)}
+
+/* Table */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{
+  text-align:left;padding:7px 10px;font-size:10px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.5px;color:var(--dim);
+  border-bottom:1px solid var(--border);white-space:nowrap;
+}
+td{padding:7px 10px;border-bottom:1px solid var(--border2);vertical-align:middle;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.badge{
+  display:inline-block;padding:1px 6px;border-radius:3px;
+  font-size:10px;font-weight:600;
+}
+.badge-MOM{background:var(--blue-bg);color:var(--blue)}
+.badge-MOM_OVERRIDE{background:rgba(188,140,255,.1);color:var(--purple)}
+.badge-MAKER{background:rgba(255,166,87,.1);color:var(--orange)}
+.reason-HARD_CLOSE{color:var(--blue)}
+.reason-STOP_LOSS,.reason-TRAIL_STOP{color:var(--red)}
+.reason-TAKE_PROFIT{color:var(--green)}
+.reason-SESSION_END,.reason-SESSION_RESET{color:var(--dimmer)}
+
+/* Polymarket log */
+.log-lines{display:flex;flex-direction:column;gap:2px}
+.log-line{
+  font-size:10px;color:var(--dim);padding:3px 6px;border-radius:3px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  background:var(--bg);border-left:2px solid var(--border2);
+}
+.log-line:hover{overflow:visible;white-space:normal;z-index:10;position:relative;background:var(--card2)}
+.empty-state{color:var(--dimmer);font-size:11px;text-align:center;padding:16px 0}
+
+/* Buttons */
+.btn{
+  display:block;width:100%;margin-bottom:8px;
+  padding:9px 12px;border-radius:6px;cursor:pointer;
+  font-family:inherit;font-size:12px;font-weight:600;
+  text-align:left;border:1px solid;
+  transition:background .15s,opacity .15s;
+  display:flex;align-items:center;gap:8px;
+}
+.btn:last-child{margin-bottom:0}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-blue{background:var(--blue-bg);border-color:var(--blue);color:var(--blue)}
+.btn-blue:hover:not(:disabled){background:rgba(88,166,255,.16)}
+.btn-red{background:var(--red-bg);border-color:var(--red);color:var(--red)}
+.btn-red:hover:not(:disabled){background:rgba(248,81,73,.16)}
+.btn-green{background:var(--green-bg);border-color:var(--green);color:var(--green)}
+.btn-green:hover:not(:disabled){background:rgba(63,185,80,.16)}
+.btn-icon{font-size:14px;line-height:1}
+
+/* Modal */
+#modal{
+  display:none;position:fixed;inset:0;z-index:200;
+  background:rgba(0,0,0,.75);backdrop-filter:blur(4px);
+  padding:32px;overflow:auto;
+}
+#modal.open{display:flex;align-items:flex-start}
+.modal-box{
+  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  width:100%;max-width:900px;margin:auto;overflow:hidden;
+}
+.modal-hdr{
+  background:var(--card2);border-bottom:1px solid var(--border);
+  padding:12px 16px;display:flex;align-items:center;justify-content:space-between;
+}
+.modal-title{font-size:12px;font-weight:600;color:var(--text)}
+.modal-close{
+  background:none;border:1px solid var(--border);border-radius:4px;
+  color:var(--dim);padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit;
+}
+.modal-close:hover{border-color:var(--text);color:var(--text)}
+#modal-content{
+  padding:16px;max-height:70vh;overflow-y:auto;
+  font-size:11px;line-height:1.6;color:var(--dim);
+  white-space:pre;overflow-x:auto;
+}
+
+/* Toast */
+#toast{
+  position:fixed;bottom:20px;right:20px;z-index:300;
+  background:var(--card);border:1px solid var(--border);border-radius:6px;
+  padding:10px 16px;font-size:12px;
+  opacity:0;transform:translateY(6px);
+  transition:opacity .2s,transform .2s;pointer-events:none;
+}
+#toast.show{opacity:1;transform:translateY(0)}
+#toast.ok{border-color:var(--green);color:var(--green)}
+#toast.err{border-color:var(--red);color:var(--red)}
+
+/* Responsive */
+@media(max-width:900px){
+  .main{grid-template-columns:1fr}
+  .stats-grid{grid-template-columns:repeat(2,1fr)}
+}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="hdr-title">⬡ KALSHI BOT MONITOR</div>
+  <div class="hdr-right">
+    <span class="hdr-updated">Updated: <span id="ts">—</span></span>
+    <div class="countdown" title="Next refresh">
+      <div class="countdown-ring">
+        <svg viewBox="0 0 12 12" width="12" height="12">
+          <circle cx="6" cy="6" r="4.5" stroke-width="2"/>
+          <circle class="arc" id="arc" cx="6" cy="6" r="4.5" stroke-width="2"/>
+        </svg>
+      </div>
+      <span id="cdtxt">10s</span>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Sidebar -->
+  <div class="sidebar">
+
+    <!-- Bot Status -->
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Bot Status</span></div>
+      <div class="card-body">
+
+        <div class="bot-row">
+          <div class="bot-status">
+            <div class="dot" id="m-dot"></div>
+            <span class="bot-name">Kalshi</span>
+            <span class="bot-pid" id="m-pid"></span>
+          </div>
+          <div class="bot-log" id="m-log" title=""></div>
+        </div>
+
+        <div class="bot-row">
+          <div class="bot-status">
+            <div class="dot" id="p-dot"></div>
+            <span class="bot-name">Polymarket</span>
+            <span class="bot-pid" id="p-pid"></span>
+          </div>
+          <div class="bot-log" id="p-log" title=""></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Quick Actions</span></div>
+      <div class="card-body">
+        <button class="btn btn-red" id="btn-restart-kalshi">
+          <span class="btn-icon">↺</span> Restart Kalshi bot
+        </button>
+        <button class="btn btn-red" id="btn-restart-poly">
+          <span class="btn-icon">↺</span> Restart Polymarket bot
+        </button>
+        <button class="btn btn-blue" id="btn-view-log">
+          <span class="btn-icon">≡</span> View momentum.log (100 lines)
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Main content -->
+  <div class="content">
+
+    <!-- Kalshi Stats -->
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">Kalshi Trades</span>
+        <span class="card-title" id="cutoff-badge" style="color:var(--dimmer)"></span>
+      </div>
+      <div class="card-body" style="padding-bottom:10px">
+        <div class="stats-grid" style="margin-bottom:14px">
+          <div class="stat">
+            <div class="stat-val neu" id="k-total">—</div>
+            <div class="stat-lbl">Total Trades</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val" id="k-wins">—</div>
+            <div class="stat-lbl">Wins / Losses</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val" id="k-wr">—</div>
+            <div class="stat-lbl">Win Rate</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val" id="k-pnl">—</div>
+            <div class="stat-lbl">Total P&L</div>
+          </div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time (UTC)</th>
+                <th>Series</th>
+                <th>Type</th>
+                <th>Side</th>
+                <th>Entry ¢</th>
+                <th>Exit ¢</th>
+                <th>Reason</th>
+                <th>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody id="k-trades-body">
+              <tr><td colspan="8" class="empty-state">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Polymarket -->
+    <div class="card">
+      <div class="card-hdr"><span class="card-title">Polymarket</span></div>
+      <div class="card-body">
+
+        <div style="margin-bottom:10px">
+          <div class="card-title" style="margin-bottom:8px">polymarket.log (last 10 lines)</div>
+          <div class="log-lines" id="poly-logs">
+            <div class="empty-state">No log data</div>
+          </div>
+        </div>
+
+        <div>
+          <div class="card-title" style="margin:10px 0 8px">polymarket_trades.jsonl</div>
+          <div class="tbl-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th><th>Market</th><th>Side</th>
+                  <th>Entry</th><th>Exit</th><th>Reason</th><th>P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody id="poly-trades-body">
+                <tr><td colspan="7" class="empty-state">No trades recorded yet</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Log Modal -->
+<div id="modal">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <span class="modal-title" id="modal-title">momentum.log — last 100 lines</span>
+      <button class="modal-close" onclick="closeModal()">✕ Close</button>
+    </div>
+    <pre id="modal-content">Loading…</pre>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const REFRESH_SECS = 10;
+let countdown = REFRESH_SECS;
+let timer = null;
+
+// ── Countdown ring ────────────────────────────────────────────────────────
+const arc = document.getElementById('arc');
+const CIRC = 2 * Math.PI * 4.5; // 28.27
+function updateRing(secs) {
+  const pct = secs / REFRESH_SECS;
+  arc.style.strokeDashoffset = CIRC * (1 - pct);
+  document.getElementById('cdtxt').textContent = secs + 's';
+}
+
+function startCountdown() {
+  countdown = REFRESH_SECS;
+  updateRing(countdown);
+  if (timer) clearInterval(timer);
+  timer = setInterval(() => {
+    countdown--;
+    if (countdown <= 0) {
+      clearInterval(timer);
+      refresh();
+    } else {
+      updateRing(countdown);
+    }
+  }, 1000);
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+function toast(msg, type='ok') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'show ' + type;
+  setTimeout(() => { t.className = ''; }, 3000);
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────
+function setText(id, val) { document.getElementById(id).textContent = val; }
+function setHTML(id, html) { document.getElementById(id).innerHTML = html; }
+function setClass(id, cls) { document.getElementById(id).className = cls; }
+
+function pnlFmt(v) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return '—';
+  return (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(4);
+}
+function pnlClass(v) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return '';
+  return n > 0 ? 'pos' : n < 0 ? 'neg' : '';
+}
+
+// ── Render ────────────────────────────────────────────────────────────────
+function render(d) {
+  setText('ts', d.updated);
+
+  // Bot status
+  const m = d.momentum, p = d.polymarket;
+  setClass('m-dot', 'dot ' + (m.running ? 'dot-on' : 'dot-off'));
+  setText('m-pid', m.running ? 'pid ' + m.pid : 'offline');
+  const mLog = document.getElementById('m-log');
+  mLog.textContent = m.last_log;
+  mLog.title = m.last_log;
+
+  setClass('p-dot', 'dot ' + (p.running ? 'dot-on' : 'dot-off'));
+  setText('p-pid', p.running ? 'pid ' + p.pid : 'offline');
+  const pLog = document.getElementById('p-log');
+  pLog.textContent = p.last_log;
+  pLog.title = p.last_log;
+
+  // Kalshi stats
+  const k = d.kalshi;
+  setText('cutoff-badge', 'post ' + d.cutoff);
+  setText('k-total', k.total);
+
+  const winsEl = document.getElementById('k-wins');
+  winsEl.textContent = k.wins + ' / ' + k.losses;
+  winsEl.className = 'stat-val ' + (k.wins >= k.losses ? 'pos' : 'neg');
+
+  const wrEl = document.getElementById('k-wr');
+  wrEl.textContent = k.total ? k.win_rate + '%' : '—';
+  wrEl.className = 'stat-val ' + (k.win_rate >= 50 ? 'pos' : 'neg');
+
+  const pnlEl = document.getElementById('k-pnl');
+  pnlEl.textContent = pnlFmt(k.pnl);
+  pnlEl.className = 'stat-val ' + pnlClass(k.pnl);
+
+  // Kalshi trades table
+  let rows = '';
+  if (k.recent.length === 0) {
+    rows = '<tr><td colspan="8" class="empty-state">No trades in this window</td></tr>';
+  } else {
+    for (const t of k.recent) {
+      const pnlStr = pnlFmt(t.pnl);
+      const pnlCls = pnlClass(t.pnl);
+      const reasonCls = 'reason-' + (t.exit_reason || '');
+      const typeCls   = 'badge badge-' + (t.entry_type || 'MOM');
+      rows += `<tr>
+        <td>${t.time}</td>
+        <td>${t.series}</td>
+        <td><span class="${typeCls}">${t.entry_type || 'MOM'}</span></td>
+        <td>${t.side}</td>
+        <td>${t.entry_price}</td>
+        <td>${t.exit_price}</td>
+        <td><span class="${reasonCls}">${t.exit_reason}</span></td>
+        <td class="${pnlCls}">${pnlStr}</td>
+      </tr>`;
+    }
+  }
+  setHTML('k-trades-body', rows);
+
+  // Polymarket logs
+  const logs = d.polymarket_logs;
+  if (logs.length === 0) {
+    setHTML('poly-logs', '<div class="empty-state">No log data</div>');
+  } else {
+    setHTML('poly-logs', logs.map(l =>
+      `<div class="log-line" title="${escHtml(l)}">${escHtml(l)}</div>`
+    ).join(''));
+  }
+
+  // Polymarket trades table
+  const pt = d.polymarket_trades;
+  let ptRows = '';
+  if (pt.length === 0) {
+    ptRows = '<tr><td colspan="7" class="empty-state">No trades recorded yet</td></tr>';
+  } else {
+    for (const t of [...pt].reverse()) {
+      const pnlStr = pnlFmt(t.pnl_dollars ?? t.pnl);
+      const pnlCls = pnlClass(t.pnl_dollars ?? t.pnl);
+      const time = (t.entry_time || t.time || '').slice(0, 16).replace('T', ' ');
+      const market = t.market_slug || t.market || t.ticker || '';
+      ptRows += `<tr>
+        <td>${escHtml(time)}</td>
+        <td>${escHtml(market)}</td>
+        <td>${escHtml(t.side || '')}</td>
+        <td>${t.entry_price_cents ?? t.entry_price ?? ''}</td>
+        <td>${t.exit_price_cents ?? t.exit_price ?? ''}</td>
+        <td>${escHtml(t.exit_reason || '')}</td>
+        <td class="${pnlCls}">${pnlStr}</td>
+      </tr>`;
+    }
+  }
+  setHTML('poly-trades-body', ptRows);
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+// ── Fetch & refresh ───────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    render(data);
+  } catch (e) {
+    toast('Fetch error: ' + e.message, 'err');
+  }
+  startCountdown();
+}
+
+// ── Quick actions ─────────────────────────────────────────────────────────
+async function restartBot(bot) {
+  const btn = document.getElementById('btn-restart-' + bot);
+  btn.disabled = true;
+  btn.textContent = '↻ Restarting…';
+  try {
+    const res = await fetch('/api/restart/' + bot, {method:'POST'});
+    const j = await res.json();
+    toast(j.msg || j.error, j.ok ? 'ok' : 'err');
+    setTimeout(refresh, 2000);
+  } catch(e) {
+    toast('Error: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<span class="btn-icon">↺</span> Restart ' + (bot === 'kalshi' ? 'Kalshi' : 'Polymarket') + ' bot';
+  }
+}
+
+document.getElementById('btn-restart-kalshi').addEventListener('click', () => restartBot('kalshi'));
+document.getElementById('btn-restart-poly').addEventListener('click', () => restartBot('poly'));
+
+document.getElementById('btn-view-log').addEventListener('click', async () => {
+  document.getElementById('modal-content').textContent = 'Loading…';
+  document.getElementById('modal').classList.add('open');
+  try {
+    const res = await fetch('/api/logs/momentum');
+    document.getElementById('modal-content').textContent = await res.text();
+    const pre = document.getElementById('modal-content');
+    pre.scrollTop = pre.scrollHeight;
+  } catch(e) {
+    document.getElementById('modal-content').textContent = 'Error: ' + e.message;
+  }
+});
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+}
+document.getElementById('modal').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+refresh();
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
-    main()
+    print("Starting dashboard on http://localhost:5000  (Ctrl-C to stop)")
+    app.run(host="127.0.0.1", port=5000, debug=False)
