@@ -128,7 +128,7 @@ CANDLE_GRAN_15M     = "FIFTEEN_MINUTE"
 N_CANDLES_5M        = 26      # fetch 26; [0] is still-forming, [1..] are completed
 N_CANDLES_15M       = 6       # fetch 6; same convention
 
-ENTRY_MOVE_PCT      = 0.003   # 0.30% — last completed 5m candle must move at least this
+ENTRY_MOVE_PCT      = 0.0015  # 0.15% — last completed 5m candle must move at least this
 VOL_AVG_WINDOW      = 20      # 20-candle rolling average for volume filter
 STOP_LOSS_PCT       = 0.0015  # −0.15% from entry price
 TAKE_PROFIT_PCT     = 0.0030  # +0.30% from entry price
@@ -496,10 +496,10 @@ def _compute_signal(
     if abs(move_pct) < ENTRY_MOVE_PCT:
         return None
 
-    # 2. Volume filter
+    # 2. Volume filter — require 1.5× avg to compensate for the lower price threshold
     vol_avg = sum(c.volume for c in completed_5m[-VOL_AVG_WINDOW - 1:-1]) / VOL_AVG_WINDOW
     vol_ratio = last_5m.volume / vol_avg if vol_avg > 0 else 0.0
-    if last_5m.volume <= vol_avg:
+    if vol_ratio < 1.5:
         return None
 
     # 3. 15-minute trend confirmation
@@ -840,7 +840,7 @@ async def main() -> None:
     log.info(f"Mode:            {'PAPER' if PAPER_MODE else 'LIVE'}")
     log.info(f"Product:         {PRODUCT_ID}")
     log.info(f"Candles:         {CANDLE_GRAN_5M} (signal) + {CANDLE_GRAN_15M} (trend filter)")
-    log.info(f"Entry threshold: >{ENTRY_MOVE_PCT*100:.2f}% 5m move + volume above {VOL_AVG_WINDOW}-candle avg")
+    log.info(f"Entry threshold: >{ENTRY_MOVE_PCT*100:.2f}% 5m move + volume ≥1.5× {VOL_AVG_WINDOW}-candle avg")
     log.info(f"Stop-loss:       -{STOP_LOSS_PCT*100:.2f}% from entry")
     log.info(f"Take-profit:     +{TAKE_PROFIT_PCT*100:.2f}% from entry  ({TAKE_PROFIT_PCT/STOP_LOSS_PCT:.0f}:1 R/R)")
     log.info(f"Position size:   ${POSITION_SIZE_USD:.0f} USD per trade")
