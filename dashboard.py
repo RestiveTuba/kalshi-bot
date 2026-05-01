@@ -19,8 +19,10 @@ app.config["JSON_SORT_KEYS"] = False
 BASE = Path(__file__).parent
 MOMENTUM_LOG      = BASE / "momentum.log"
 POLYMARKET_LOG    = BASE / "polymarket.log"
+COINBASE_LOG      = BASE / "coinbase.log"
 MOMENTUM_TRADES   = BASE / "momentum_trades.jsonl"
 POLYMARKET_TRADES = BASE / "polymarket_trades.jsonl"
+COINBASE_TRADES   = BASE / "coinbase_trades.jsonl"
 
 KALSHI_CUTOFF = "2026-04-29T18:24"  # filter pre-cleanup trades
 
@@ -113,6 +115,28 @@ def _get_status() -> dict:
     # --- bot process status ---
     m_running, m_pid = _is_running("momentum_bot.py")
     p_running, p_pid = _is_running("polymarket_bot.py")
+    c_running, c_pid = _is_running("coinbase_bot.py")
+
+    # --- coinbase trades (today only) ---
+    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cb_all = _load_jsonl(COINBASE_TRADES)
+    cb_today = [t for t in cb_all if (t.get("entry_time") or "").startswith(today_prefix)]
+    cb_total  = len(cb_today)
+    cb_wins   = sum(1 for t in cb_today if t.get("pnl_dollars", 0) > 0)
+    cb_losses = sum(1 for t in cb_today if t.get("pnl_dollars", 0) < 0)
+    cb_pnl    = sum(t.get("pnl_dollars", 0) for t in cb_today)
+
+    cb_recent = []
+    for t in reversed(cb_today[-10:]):
+        pv = t.get("pnl_dollars", 0)
+        cb_recent.append({
+            "time":       (t.get("entry_time") or "")[:16].replace("T", " "),
+            "side":       t.get("side", ""),
+            "entry_price": round(t.get("entry_price", 0), 2),
+            "exit_price":  round(t.get("exit_price", 0), 2),
+            "exit_reason": t.get("exit_reason", ""),
+            "pnl":         round(pv, 4),
+        })
 
     # --- kalshi trades ---
     all_trades = _load_jsonl(MOMENTUM_TRADES)
@@ -151,6 +175,18 @@ def _get_status() -> dict:
             "pid":      p_pid,
             "last_log": _last_log_line(POLYMARKET_LOG),
         },
+        "coinbase": {
+            "running":  c_running,
+            "pid":      c_pid,
+            "last_log": _last_log_line(COINBASE_LOG),
+            "total":    cb_total,
+            "wins":     cb_wins,
+            "losses":   cb_losses,
+            "win_rate": round(cb_wins / cb_total * 100, 1) if cb_total else 0,
+            "pnl":      round(cb_pnl, 4),
+            "recent":   cb_recent,
+            "today":    today_prefix,
+        },
         "kalshi": {
             "total":    total,
             "wins":     wins,
@@ -180,6 +216,12 @@ def api_restart(bot: str):
     scripts = {
         "kalshi":     "momentum_bot.py",
         "polymarket": "polymarket_bot.py",
+        "coinbase":   "coinbase_bot.py",
+    }
+    log_files = {
+        "kalshi":     "momentum.log",
+        "polymarket": "polymarket.log",
+        "coinbase":   "coinbase.log",
     }
     if bot not in scripts:
         return jsonify({"ok": False, "error": "unknown bot"}), 400
@@ -188,7 +230,7 @@ def api_restart(bot: str):
     try:
         subprocess.run(["pkill", "-f", script], capture_output=True)
         time.sleep(0.8)
-        log_file = BASE / ("momentum.log" if bot == "kalshi" else "polymarket.log")
+        log_file = BASE / log_files[bot]
         with open(log_file, "a") as lf:
             subprocess.Popen(
                 ["python3", str(BASE / script)],
@@ -440,6 +482,15 @@ tr:hover td{background:rgba(255,255,255,.02)}
           <div class="bot-log" id="p-log" title=""></div>
         </div>
 
+        <div class="bot-row">
+          <div class="bot-status">
+            <div class="dot" id="cb-dot"></div>
+            <span class="bot-name">Coinbase</span>
+            <span class="bot-pid" id="cb-pid"></span>
+          </div>
+          <div class="bot-log" id="cb-log" title=""></div>
+        </div>
+
       </div>
     </div>
 
@@ -452,6 +503,9 @@ tr:hover td{background:rgba(255,255,255,.02)}
         </button>
         <button class="btn btn-red" id="btn-restart-poly">
           <span class="btn-icon">↺</span> Restart Polymarket bot
+        </button>
+        <button class="btn btn-red" id="btn-restart-coinbase">
+          <span class="btn-icon">↺</span> Restart Coinbase bot
         </button>
         <button class="btn btn-blue" id="btn-view-log">
           <span class="btn-icon">≡</span> View momentum.log (100 lines)
@@ -506,6 +560,48 @@ tr:hover td{background:rgba(255,255,255,.02)}
             </thead>
             <tbody id="k-trades-body">
               <tr><td colspan="8" class="empty-state">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Coinbase Performance -->
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">Coinbase Performance</span>
+        <span class="card-title" id="cb-date-badge" style="color:var(--dimmer)"></span>
+      </div>
+      <div class="card-body" style="padding-bottom:10px">
+        <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:14px">
+          <div class="stat">
+            <div class="stat-val neu" id="cb-total">—</div>
+            <div class="stat-lbl">Trades Today</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val" id="cb-wr">—</div>
+            <div class="stat-lbl">Win Rate</div>
+          </div>
+          <div class="stat">
+            <div class="stat-val" id="cb-pnl">—</div>
+            <div class="stat-lbl">P&amp;L Today</div>
+          </div>
+        </div>
+
+        <div class="tbl-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time (UTC)</th>
+                <th>Side</th>
+                <th>Entry $</th>
+                <th>Exit $</th>
+                <th>Reason</th>
+                <th>P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody id="cb-trades-body">
+              <tr><td colspan="6" class="empty-state">No trades today</td></tr>
             </tbody>
           </table>
         </div>
@@ -618,7 +714,7 @@ function render(d) {
   setText('ts', d.updated);
 
   // Bot status
-  const m = d.momentum, p = d.polymarket;
+  const m = d.momentum, p = d.polymarket, cb = d.coinbase;
   setClass('m-dot', 'dot ' + (m.running ? 'dot-on' : 'dot-off'));
   setText('m-pid', m.running ? 'pid ' + m.pid : 'offline');
   const mLog = document.getElementById('m-log');
@@ -630,6 +726,47 @@ function render(d) {
   const pLog = document.getElementById('p-log');
   pLog.textContent = p.last_log;
   pLog.title = p.last_log;
+
+  setClass('cb-dot', 'dot ' + (cb.running ? 'dot-on' : 'dot-off'));
+  setText('cb-pid', cb.running ? 'pid ' + cb.pid : 'offline');
+  const cbLog = document.getElementById('cb-log');
+  cbLog.textContent = cb.last_log;
+  cbLog.title = cb.last_log;
+
+  // Coinbase panel
+  setText('cb-date-badge', cb.today);
+  setText('cb-total', cb.total);
+
+  const cbWrEl = document.getElementById('cb-wr');
+  cbWrEl.textContent = cb.total ? cb.win_rate + '%' : '—';
+  cbWrEl.className = 'stat-val ' + (cb.win_rate >= 50 ? 'pos' : (cb.total ? 'neg' : 'neu'));
+
+  const cbPnlEl = document.getElementById('cb-pnl');
+  cbPnlEl.textContent = pnlFmt(cb.pnl);
+  cbPnlEl.className = 'stat-val ' + pnlClass(cb.pnl);
+
+  let cbRows = '';
+  if (!cb.recent || cb.recent.length === 0) {
+    cbRows = '<tr><td colspan="6" class="empty-state">No trades today</td></tr>';
+  } else {
+    for (const t of cb.recent) {
+      const pnlStr = pnlFmt(t.pnl);
+      const pnlCls = pnlClass(t.pnl);
+      const sideCls = t.side === 'LONG' ? 'pos' : 'neg';
+      const reasonCls = t.exit_reason === 'TAKE_PROFIT' ? 'reason-TAKE_PROFIT'
+                      : t.exit_reason === 'STOP_LOSS'   ? 'reason-STOP_LOSS'
+                      : 'reason-SESSION_END';
+      cbRows += `<tr>
+        <td>${escHtml(t.time)}</td>
+        <td class="${sideCls}">${escHtml(t.side)}</td>
+        <td>$${escHtml(String(t.entry_price))}</td>
+        <td>$${escHtml(String(t.exit_price))}</td>
+        <td><span class="${reasonCls}">${escHtml(t.exit_reason)}</span></td>
+        <td class="${pnlCls}">${pnlStr}</td>
+      </tr>`;
+    }
+  }
+  setHTML('cb-trades-body', cbRows);
 
   // Kalshi stats
   const k = d.kalshi;
@@ -741,12 +878,14 @@ async function restartBot(bot) {
     toast('Error: ' + e.message, 'err');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<span class="btn-icon">↺</span> Restart ' + (bot === 'kalshi' ? 'Kalshi' : 'Polymarket') + ' bot';
+    const label = bot === 'kalshi' ? 'Kalshi' : bot === 'poly' ? 'Polymarket' : 'Coinbase';
+    btn.innerHTML = '<span class="btn-icon">↺</span> Restart ' + label + ' bot';
   }
 }
 
 document.getElementById('btn-restart-kalshi').addEventListener('click', () => restartBot('kalshi'));
 document.getElementById('btn-restart-poly').addEventListener('click', () => restartBot('poly'));
+document.getElementById('btn-restart-coinbase').addEventListener('click', () => restartBot('coinbase'));
 
 document.getElementById('btn-view-log').addEventListener('click', async () => {
   document.getElementById('modal-content').textContent = 'Loading…';
