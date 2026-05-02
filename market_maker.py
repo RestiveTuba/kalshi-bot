@@ -17,9 +17,11 @@ import json
 import logging
 import logging.handlers
 import os
+import random
 import sys
 import time
 import uuid as _uuid_mod
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +46,9 @@ MID_MOVE_REQUOTE_CENTS    = 3.0
 MAX_LIMIT_CENTS           = 90
 ORDER_COUNT               = 1       # contracts per quote leg
 MAX_YES_INVENTORY         = 10      # pause YES quotes while above this net YES contracts
+
+# Paper: limit fill only if bid crosses limit; then Bernoulli gate
+PAPER_FILL_PROBABILITY    = 0.20
 
 DAILY_LOSS_LIMIT_USD       = 30.0
 SESSION_HALT_MIN_LOSS_USD  = 1.0
@@ -357,11 +362,9 @@ class MMState:
     posted_no_limit: float = 0.0    # NO cents (conventional)
     mid_at_post: float = 0.0
     last_requote_check: float = 0.0
-    # inventory (paper + logical for risk)
-    yes_inventory: int = 0
-    yes_cost_cents: float = 0.0  # sum of entry YES prices * count for avg
-    no_inventory: int = 0
-    no_cost_cents: float = 0.0
+    # Filled YES / NO notionals — one deque entry = 1 contract @ limit cents (FIFO pairing)
+    yes_prices: deque[float] = field(default_factory=deque)
+    no_prices: deque[float] = field(default_factory=deque)
     session_pnl: float = 0.0
     session_halted: bool = False
     active: bool = False
@@ -390,10 +393,8 @@ def _reset_session_state(st: MMState) -> None:
     st.posted_no_limit = 0.0
     st.mid_at_post = 0.0
     st.last_requote_check = 0.0
-    st.yes_inventory = 0
-    st.yes_cost_cents = 0.0
-    st.no_inventory = 0
-    st.no_cost_cents = 0.0
+    st.yes_prices.clear()
+    st.no_prices.clear()
     st.session_pnl = 0.0
     st.session_halted = False
     st.active = False
@@ -489,85 +490,93 @@ async def _order_is_live(
         return True
 
 
-def _maybe_fill_yes(
-    st: MMState, yes_bid: float, yes_ask: float, ts: str,
-) -> None:
-    if not st.yes_order_id or st.posted_yes_limit <= 0:
+def _maybe_fill_yes(st: MMState, yes_bid: float, ts: str) -> None:
+    """Paper: YES BUY limit fills when market bid lifts to/at our limit, then probabilistic."""
+    if not PAPER_MODE or not st.yes_order_id or st.posted_yes_limit <= 0:
         return
     lim = st.posted_yes_limit
-    # Aggressive YES bid: fill if offer trades through our price
-    if yes_ask <= lim + 0.5 or yes_bid >= lim - 0.5:
-        if st.yes_inventory >= MAX_YES_INVENTORY:
-            return
-        st.yes_inventory += ORDER_COUNT
-        st.yes_cost_cents += lim * ORDER_COUNT
-        log.info(
-            "[%s] %s FILL YES @ %.1fc (inv=%d)",
-            st.series, ts, lim, st.yes_inventory,
-        )
-        _tg_alert(
-            f"MM FILL {st.series} YES @ {lim:.0f}¢ ×{ORDER_COUNT} | inv={st.yes_inventory}"
-        )
-        st.yes_order_id = ""
-        st.posted_yes_limit = 0.0
+    if yes_bid < lim:
+        return
+    if random.random() >= PAPER_FILL_PROBABILITY:
+        return
+    if len(st.yes_prices) + ORDER_COUNT > MAX_YES_INVENTORY:
+        return
+    for _ in range(ORDER_COUNT):
+        st.yes_prices.append(lim)
+    n_y = len(st.yes_prices)
+    log.info("[%s] %s FILL YES @ %.1fc (yes_inv=%d)", st.series, ts, lim, n_y)
+    _tg_alert(f"MM FILL {st.series} YES @ {lim:.0f}¢ ×{ORDER_COUNT} | yes_inv={n_y}")
+    st.yes_order_id = ""
+    st.posted_yes_limit = 0.0
 
 
-def _maybe_fill_no(
-    st: MMState, yes_bid: float, yes_ask: float, ts: str,
-) -> None:
-    if not st.no_order_id or st.posted_no_limit <= 0:
+def _maybe_fill_no(st: MMState, no_bid: float, ts: str) -> None:
+    """Paper: NO BUY limit fills when NO bid lifts to/at our limit, then probabilistic."""
+    if not PAPER_MODE or not st.no_order_id or st.posted_no_limit <= 0:
         return
     nlim = st.posted_no_limit
-    yes_equiv = 100.0 - nlim
-    # Buying NO when YES weakens (YES bid drops to / through our yes_equiv)
-    if yes_bid <= yes_equiv + 0.5 or yes_ask <= yes_equiv + 0.5:
-        st.no_inventory += ORDER_COUNT
-        st.no_cost_cents += nlim * ORDER_COUNT
-        log.info(
-            "[%s] %s FILL NO @ %.1fc (inv=%d)",
-            st.series, ts, nlim, st.no_inventory,
-        )
-        _tg_alert(
-            f"MM FILL {st.series} NO @ {nlim:.0f}¢ ×{ORDER_COUNT} | NO inv={st.no_inventory}"
-        )
-        st.no_order_id = ""
-        st.posted_no_limit = 0.0
+    if no_bid < nlim:
+        return
+    if random.random() >= PAPER_FILL_PROBABILITY:
+        return
+    for _ in range(ORDER_COUNT):
+        st.no_prices.append(nlim)
+    n_n = len(st.no_prices)
+    log.info("[%s] %s FILL NO @ %.1fc (no_inv=%d)", st.series, ts, nlim, n_n)
+    _tg_alert(f"MM FILL {st.series} NO @ {nlim:.0f}¢ ×{ORDER_COUNT} | no_inv={n_n}")
+    st.no_order_id = ""
+    st.posted_no_limit = 0.0
 
 
 def _flatten_all(
     st: MMState, yes_bid: float, no_bid: float, reason: str, ts: str,
 ) -> None:
+    """
+    Session close settlement:
+      - FIFO-pair YES+NO locks in (1 - yes$ - no$) per paired contract at expiry.
+      - Unpaired YES / NO residual marked at current bids (paper exit).
+    """
     pnl = 0.0
-    if st.yes_inventory > 0 and st.yes_cost_cents > 0:
-        avg = st.yes_cost_cents / st.yes_inventory
-        pnl += (yes_bid - avg) * st.yes_inventory / 100.0
-    if st.no_inventory > 0 and st.no_cost_cents > 0:
-        avg_n = st.no_cost_cents / st.no_inventory
-        pnl += (no_bid - avg_n) * st.no_inventory / 100.0
+    paired = 0
+    while st.yes_prices and st.no_prices:
+        yc = st.yes_prices.popleft()
+        nc = st.no_prices.popleft()
+        y_usd = yc / 100.0
+        n_usd = nc / 100.0
+        pnl += (1.0 - y_usd - n_usd) * 1.0  # one contract per deque step
+        paired += 1
 
-    if st.yes_inventory or st.no_inventory:
+    orphan_y = 0
+    while st.yes_prices:
+        yc = st.yes_prices.popleft()
+        pnl += (yes_bid - yc) / 100.0
+        orphan_y += 1
+
+    orphan_n = 0
+    while st.no_prices:
+        nc = st.no_prices.popleft()
+        pnl += (no_bid - nc) / 100.0
+        orphan_n += 1
+
+    if paired or orphan_y or orphan_n:
         log.info(
-            "[%s] %s HARD_CLOSE %s YES=%d NO=%d @ bid P&L=$%+.4f",
+            "[%s] %s %s | pairs=%d orphan_YES=%d orphan_NO=%d | P&L=$%+.4f",
             st.series,
             ts,
             reason,
-            st.yes_inventory,
-            st.no_inventory,
+            paired,
+            orphan_y,
+            orphan_n,
             pnl,
         )
         _tg_alert(
-            f"MM CLOSE {st.series} {reason} | P&L ${pnl:+.4f} | "
-            f"flattened YES×{st.yes_inventory} NO×{st.no_inventory}"
+            f"MM CLOSE {st.series} {reason} | pairs×{paired} unpair Y{orphan_y}/N{orphan_n} | "
+            f"P&L ${pnl:+.4f}"
         )
         st.session_pnl += pnl
         _record_realized_pnl(pnl)
         if pnl <= -SESSION_HALT_MIN_LOSS_USD:
             st.session_halted = True
-
-    st.yes_inventory = 0
-    st.yes_cost_cents = 0.0
-    st.no_inventory = 0
-    st.no_cost_cents = 0.0
 
 
 async def _cancel_both_quotes(
@@ -602,7 +611,7 @@ async def _post_both_sides(
     )
     post_yes = (
         not blocked
-        and st.yes_inventory <= MAX_YES_INVENTORY
+        and len(st.yes_prices) + ORDER_COUNT <= MAX_YES_INVENTORY
     )
 
     if post_yes:
@@ -610,10 +619,10 @@ async def _post_both_sides(
             client, ticker, "YES", y_lim, ts, st.series
         )
         st.posted_yes_limit = y_lim if st.yes_order_id else 0.0
-    elif st.yes_inventory > MAX_YES_INVENTORY:
+    elif len(st.yes_prices) >= MAX_YES_INVENTORY:
         log.info(
-            "[%s] %s SKIP YES quote — inventory %d > %d",
-            st.series, ts, st.yes_inventory, MAX_YES_INVENTORY,
+            "[%s] %s SKIP YES quote — at YES cap (%d contracts)",
+            st.series, ts, len(st.yes_prices),
         )
         st.yes_order_id = ""
         st.posted_yes_limit = 0.0
@@ -709,17 +718,17 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # Paper fills
+            # Paper fills: bid must cross limit, then 20% Bernoulli
             if PAPER_MODE:
-                _maybe_fill_yes(st, yes_bid, yes_ask, ts)
-                _maybe_fill_no(st, yes_bid, yes_ask, ts)
+                _maybe_fill_yes(st, yes_bid, ts)
+                _maybe_fill_no(st, no_bid, ts)
 
             # 30s check: live order status + mid drift
             now = time.time()
             want_yes = (
                 _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
-                and st.yes_inventory <= MAX_YES_INVENTORY
+                and len(st.yes_prices) + ORDER_COUNT <= MAX_YES_INVENTORY
             )
             want_no = (
                 _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
@@ -754,14 +763,16 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
             log.info(
                 "[%s] %s MM | mid=%.1f post_mid=%.1f | Ylim=%s Nlim=%s | "
-                "YESinv=%d | sessP&L=$%+.3f day=$%+.2f halted=%s",
+                "yes=%d no=%d paired=%d | sessP&L=$%+.3f day=$%+.2f halted=%s",
                 series,
                 ts,
                 mid,
                 st.mid_at_post or mid,
                 f"{st.posted_yes_limit:.0f}" if st.posted_yes_limit else "—",
                 f"{st.posted_no_limit:.0f}" if st.posted_no_limit else "—",
-                st.yes_inventory,
+                len(st.yes_prices),
+                len(st.no_prices),
+                min(len(st.yes_prices), len(st.no_prices)),
                 st.session_pnl,
                 _get_today_pnl(),
                 st.session_halted,
@@ -794,9 +805,11 @@ async def main() -> None:
         MID_MOVE_REQUOTE_CENTS,
     )
     log.info(
-        "Inventory cap: YES>%d ⇒ pause YES quotes | size=%s | halt session if loss>$%.2f day>$%.2f",
+        "Inventory cap: YES≤%d contracts | size=%s | paper fill: bid crosses limit + %.0f%% prob | "
+        "halt session if loss>$%.2f day>$%.2f",
         MAX_YES_INVENTORY,
         ORDER_COUNT,
+        PAPER_FILL_PROBABILITY * 100,
         SESSION_HALT_MIN_LOSS_USD,
         DAILY_LOSS_LIMIT_USD,
     )
