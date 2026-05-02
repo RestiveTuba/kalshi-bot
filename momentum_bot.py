@@ -96,7 +96,7 @@ CORR_WINDOW_SECS       = 45.0   # grid search optimal (45s corr window, Sharpe 8
 TRAILING_STOP_CENTS    = 5.0    # exit if price drops >5¢ below the highest price seen since entry
 
 # Time-of-day filter (live data: 12–14 UTC and 20–23 UTC are loss-dominated)
-BLOCKED_UTC_HOURS      = {12, 13, 20, 21, 22, 23}
+BLOCKED_UTC_HOURS      = {12, 13}
 
 # Directional filter: look back this many seconds on BTC/USD to confirm direction
 DIRECTION_WINDOW_SECS  = 60.0   # BTC must have moved UP (for YES) or DOWN (for NO) in last 60s

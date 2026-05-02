@@ -15,38 +15,45 @@ import time
 import urllib.request as _urlreq
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional
 
 from flask import Flask, jsonify, request, Response, session, redirect
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
+log = app.logger
 
 BASE              = Path(__file__).parent
 MOMENTUM_LOG      = BASE / "momentum.log"
 POLYMARKET_LOG    = BASE / "polymarket.log"
 COINBASE_LOG      = BASE / "coinbase.log"
-MOMENTUM_TRADES   = BASE / "momentum_trades.jsonl"
-POLYMARKET_TRADES = BASE / "polymarket_trades.jsonl"
+MM_LOG            = BASE / "market_maker.log"
 COINBASE_TRADES   = BASE / "coinbase_trades.jsonl"
-KALSHI_CUTOFF     = "2026-04-29T18:24"
+MM_TRADES         = BASE / "market_maker_trades.jsonl"
 
 # ── Caches ───────────────────────────────────────────────────────────────────
 _term_cache: dict = {"data": None, "ts": 0.0}
 _btc_cache:  dict = {"data": None, "ts": 0.0}
 TERM_TTL = 0.4
-BTC_TTL  = 300.0
+BTC_TTL  = 14.0
+
+# ── Momentum log → order book (live YES/NO bids) ───────────────────────────
+_MOM_YES_NO_BID_LINE = re.compile(
+    r"YES bid=(\d+(?:\.\d+)?)c?\s+NO bid=(\d+(?:\.\d+)?)c?"
+)
+_MOM_SERIES_TAG = re.compile(r"\[(\w+)\]")
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 
 LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>TRADE DESK</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
-<style>*{{box-sizing:border-box;margin:0;padding:0}}body{{background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'IBM Plex Mono',monospace;border-top:1px solid #00ff4133}}
-.box{{border:1px solid #00ff4133;padding:40px 32px;width:280px}}.logo{{color:#00ff41;font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;margin-bottom:4px}}.sub{{color:#00ff4144;font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:28px}}
-label{{display:block;font-size:8px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#00ff4166;margin-bottom:6px}}input{{width:100%;background:#000;border:1px solid #00ff4133;color:#00ff41;font-family:inherit;font-size:11px;padding:8px 10px;outline:none;margin-bottom:16px}}input:focus{{border-color:#00ff41}}
-button{{width:100%;background:transparent;border:1px solid #00ff41;color:#00ff41;font-family:inherit;font-size:9px;font-weight:600;letter-spacing:2px;text-transform:uppercase;padding:9px;cursor:pointer}}button:hover{{background:#00ff4111}}
-.err{{color:#ff3131;font-size:9px;margin-bottom:14px;display:none;letter-spacing:1px}}.err.show{{display:block}}</style></head>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'IBM Plex Mono',monospace;border-top:1px solid #00ff4133}
+.box{border:1px solid #00ff4133;padding:40px 32px;width:280px}.logo{color:#00ff41;font-size:11px;font-weight:600;letter-spacing:3px;text-transform:uppercase;margin-bottom:4px}.sub{color:#00ff4144;font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:28px}
+label{display:block;font-size:8px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#00ff4166;margin-bottom:6px}input{width:100%;background:#000;border:1px solid #00ff4133;color:#00ff41;font-family:inherit;font-size:11px;padding:8px 10px;outline:none;margin-bottom:16px}input:focus{border-color:#00ff41}
+button{width:100%;background:transparent;border:1px solid #00ff41;color:#00ff41;font-family:inherit;font-size:9px;font-weight:600;letter-spacing:2px;text-transform:uppercase;padding:9px;cursor:pointer}button:hover{background:#00ff4111}
+.err{color:#ff3131;font-size:9px;margin-bottom:14px;display:none;letter-spacing:1px}.err.show{display:block}</style></head>
 <body><div class="box"><div class="logo">TRADE DESK</div><div class="sub">Secure Access</div>
 <p class="err {err_class}">{err_msg}</p>
 <form method="POST" action="/login"><label>Access Key</label><input type="password" name="password" autofocus>
@@ -142,24 +149,151 @@ def _load_jsonl(path: Path) -> list[dict]:
         pass
     return records
 
-# ── Terminal data helpers ─────────────────────────────────────────────────────
+
+def _parse_latest_momentum_book() -> Optional[dict]:
+    """
+    Scan momentum.log (tail) for the last line containing 'YES bid='.
+    Parse YES bid and NO bid (¢). Implied YES ask = 100 − NO_bid; mid = average of bid and ask.
+    """
+    try:
+        if not MOMENTUM_LOG.exists():
+            return None
+        with open(MOMENTUM_LOG, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 256_000))
+            chunk = f.read().decode("utf-8", errors="replace")
+
+        for line in reversed(chunk.splitlines()):
+            if "YES bid=" not in line:
+                continue
+            m = _MOM_YES_NO_BID_LINE.search(line)
+            if not m:
+                continue
+            yb = float(m.group(1))
+            nb = float(m.group(2))
+            sm = _MOM_SERIES_TAG.search(line)
+            series = sm.group(1) if sm else "—"
+            yes_ask = max(0.0, min(100.0, 100.0 - nb))
+            yb = max(0.0, min(100.0, yb))
+            if yes_ask < yb:
+                yes_ask = min(100.0, yb + 0.5)
+            mid = (yb + yes_ask) / 2.0
+
+            def _qty(price: float, base: int, step: int) -> int:
+                pid = int(round(price * 10)) % 11
+                return max(4, base + pid * 3 - step * 5)
+
+            bids = [{"p": max(0.5, yb - i), "q": _qty(yb - i, 52, i)} for i in range(1, 7)]
+            asks = [{"p": min(99.5, yes_ask + i), "q": _qty(yes_ask + i, 42, i)} for i in range(1, 7)]
+            m_disp = re.search(r"T(\d{2}:\d{2}:\d{2})", line)
+            log_disp = m_disp.group(1) if m_disp else ""
+            return {
+                "series": series,
+                "mid": round(mid, 2),
+                "yes_bid": yb,
+                "yes_ask": yes_ask,
+                "no_bid": nb,
+                "bids": bids,
+                "asks": asks,
+                "depth_source": "momentum.log",
+                "log_ts": log_disp,
+            }
+        return None
+    except Exception:
+        log.exception("_parse_latest_momentum_book failed")
+        return None
+
+
+def _parse_trade_dt_utc(t: dict):
+    from datetime import timezone
+    s = str(t.get("entry_time") or t.get("exit_time") or t.get("time") or "").strip()
+    if not s:
+        return None
+    try:
+        s2 = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
 
 def _compute_equity(trades: list[dict]) -> list[dict]:
-    """Cumulative P&L curve, sampled to ≤200 points."""
+    """Cumulative P&L (market-maker rows: entry_time + pnl_dollars) with hourly zero-fill anchor."""
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+    day0 = now.strftime("%Y-%m-%d") + " 00:00"
+
     if not trades:
-        return [{"t": KALSHI_CUTOFF[:16].replace("T", " "), "v": 0.0}]
-    sorted_t = sorted(trades, key=lambda t: t.get("exit_time") or t.get("entry_time") or "")
-    curve, cum = [], 0.0
+        return [
+            {"t": day0, "v": 0.0},
+            {"t": now_str, "v": 0.0},
+        ]
+
+    distant = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    sorted_t = sorted(
+        trades,
+        key=lambda tr: (_parse_trade_dt_utc(tr) or distant),
+    )
+    fk = str(sorted_t[0].get("entry_time") or sorted_t[0].get("exit_time") or "")
+    if len(fk) >= 10 and fk[:4].isdigit():
+        anchor = fk[:10] + " 00:00"
+    else:
+        anchor = day0
+
+    curve = []
+    cum = 0.0
+    dup_minute_ofs: dict[str, int] = {}
     for t in sorted_t:
-        cum += t.get("pnl_dollars", 0)
-        raw_ts = (t.get("exit_time") or t.get("entry_time") or "")[:16].replace("T", " ")
+        cum += float(t.get("pnl_dollars") or t.get("pnl") or 0)
+        base_dt = _parse_trade_dt_utc(t)
+        if base_dt is None:
+            rk = (
+                str(t.get("entry_time") or t.get("exit_time") or t.get("time") or "")
+                .replace("Z", "")[:16]
+            )
+            raw_ts = rk.replace("T", " ") if len(rk) >= 16 else rk.replace("T", " ")
+            curve.append({"t": raw_ts, "v": round(cum, 4)})
+            continue
+
+        dk = str(t.get("entry_time") or "").strip()
+        if dk:
+            off = dup_minute_ofs.get(dk, 0)
+            dup_minute_ofs[dk] = off + 1
+            dt_disp = base_dt + timedelta(minutes=off)
+        else:
+            dt_disp = base_dt
+        raw_ts = dt_disp.strftime("%Y-%m-%d %H:%M")
         curve.append({"t": raw_ts, "v": round(cum, 4)})
+
+    # Synthetic hourly zero-value points: calendar-day anchor → first real trade
+    try:
+        cutoff_dt = datetime.fromisoformat(anchor.replace(" ", "T"))
+        if cutoff_dt.tzinfo is None:
+            cutoff_dt = cutoff_dt.replace(tzinfo=timezone.utc)
+        first_dt = datetime.fromisoformat(curve[0]["t"].replace(" ", "T"))
+        if first_dt.tzinfo is None:
+            first_dt = first_dt.replace(tzinfo=timezone.utc)
+        prefix = [{"t": anchor, "v": 0.0}]
+        dt = cutoff_dt + timedelta(hours=1)
+        while dt < first_dt:
+            prefix.append({"t": dt.strftime("%Y-%m-%d %H:%M"), "v": 0.0})
+            dt += timedelta(hours=1)
+        curve = prefix + curve
+    except Exception:
+        curve.insert(0, {"t": anchor, "v": 0.0})
+
+    # Trailing point at "now" so the line reaches the right edge
+    curve.append({"t": now_str, "v": round(cum, 4)})
+
     if len(curve) > 200:
         step = max(1, len(curve) // 200)
         curve = curve[::step]
-    # Ensure we start at zero
-    if curve and curve[0]["v"] != 0:
-        curve.insert(0, {"t": curve[0]["t"], "v": 0.0})
+
     return curve
 
 
@@ -168,9 +302,16 @@ def _compute_series_stats(trades: list[dict]) -> dict:
     for s in ("KXBTC15M", "KXETH15M", "KXSOL15M"):
         sl = [t for t in trades if t.get("series") == s]
         total = len(sl)
-        wins  = sum(1 for t in sl if t.get("pnl_dollars", 0) > 0)
-        pnl   = sum(t.get("pnl_dollars", 0) for t in sl)
-        last_p = sl[-1].get("entry_price_cents", 0) if sl else 0
+        wins = sum(
+            1 for t in sl if float(t.get("pnl_dollars") or t.get("pnl") or 0) > 0
+        )
+        pnl = sum(float(t.get("pnl_dollars") or t.get("pnl") or 0) for t in sl)
+        last_p = 0.0
+        if sl:
+            lt = sl[-1]
+            yc = float(lt.get("yes_price_cents") or lt.get("yes_price") or 0)
+            nc = float(lt.get("no_price_cents") or lt.get("no_price") or 0)
+            last_p = round(yc + nc, 1)
         stats[s] = {
             "trades":   total,
             "wins":     wins,
@@ -182,32 +323,37 @@ def _compute_series_stats(trades: list[dict]) -> dict:
     return stats
 
 
-def _compute_trade_feed(kalshi: list[dict], coinbase: list[dict]) -> list[dict]:
+def _compute_trade_feed(market_maker_day: list[dict], coinbase_day: list[dict]) -> list[dict]:
+    """Live fills: market-maker paired rows (+ Coinbase fills). MM uses yes/no cents + series."""
     feed = []
-    for t in kalshi:
-        ts = (t.get("exit_time") or t.get("entry_time") or "")
+    for t in market_maker_day:
+        ts = str(t.get("entry_time") or "")
+        pv = float(t.get("pnl_dollars") or t.get("pnl") or 0)
+        yc = float(t.get("yes_price_cents") or t.get("yes_price") or 0)
+        nc = float(t.get("no_price_cents") or t.get("no_price") or 0)
         feed.append({
-            "ts":     ts[:19],
-            "bot":    "K",
-            "side":   t.get("side", ""),
-            "series": (t.get("series") or "")[-6:],
-            "price":  t.get("entry_price_cents", 0),
-            "pnl":    t.get("pnl_dollars", 0),
-            "reason": t.get("exit_reason", ""),
+            "ts":              ts[:19],
+            "bot":             "MM",
+            "kind":            "mm",
+            "series":          str(t.get("series") or ""),
+            "yes_price_cents": yc,
+            "no_price_cents":  nc,
+            "pnl":             pv,
+            "reason":          "PAIR",
         })
-    for t in coinbase:
-        ts = (t.get("exit_time") or t.get("entry_time") or "")
+    for t in coinbase_day:
+        ts = str(t.get("exit_time") or t.get("entry_time") or "")
         feed.append({
             "ts":     ts[:19],
             "bot":    "C",
+            "kind":   "cb",
             "side":   t.get("side", ""),
             "series": "BTC-USD",
-            "price":  t.get("entry_price", 0),
-            "pnl":    t.get("pnl_dollars", 0),
-            "reason": t.get("exit_reason", ""),
+            "price":  float(t.get("entry_price") or 0),
+            "pnl":    float(t.get("pnl_dollars") or 0),
+            "reason": str(t.get("exit_reason") or ""),
         })
     feed.sort(key=lambda x: x["ts"], reverse=True)
-    # Format time as HH:MM
     for f in feed:
         ts = f["ts"]
         if "T" in ts:
@@ -219,13 +365,12 @@ def _compute_trade_feed(kalshi: list[dict], coinbase: list[dict]) -> list[dict]:
             f["ts"] = ts[:5]
     return feed[:40]
 
-
 def _compute_freq(trades: list[dict]) -> list[int]:
     """Trade count per hour for last 24h, index 0=oldest, 23=most recent."""
     buckets = [0] * 24
     now = datetime.now(timezone.utc)
     for t in trades:
-        raw = (t.get("entry_time") or "")[:19]
+        raw = (t.get("entry_time") or t.get("time") or "")[:19]
         if not raw:
             continue
         try:
@@ -241,70 +386,259 @@ def _compute_freq(trades: list[dict]) -> list[int]:
     return buckets
 
 
-def _compute_orderbook(trades: list[dict]) -> dict:
-    """Synthetic depth from recent Kalshi trade price clustering."""
-    series_trades = [t for t in trades if t.get("series") == "KXBTC15M"] or trades
-    if not series_trades:
-        return {"series": "—", "mid": 90.0, "bids": [], "asks": []}
-    last  = series_trades[-1]
-    mid   = float(last.get("entry_price_cents", 90))
-    recent_prices = [t.get("entry_price_cents", mid) for t in series_trades[-30:]]
+def _compute_orderbook() -> dict:
+    """Depth ladder from latest momentum.log YES/NO bids (500ms-polled via terminal API)."""
+    parsed = _parse_latest_momentum_book()
+    if parsed:
+        return parsed
+    return {
+        "series": "—",
+        "mid": None,
+        "yes_bid": None,
+        "yes_ask": None,
+        "no_bid": None,
+        "bids": [],
+        "asks": [],
+        "depth_source": None,
+        "log_ts": "",
+    }
 
-    def _qty(price, base_size, i):
-        cluster = sum(1 for p in recent_prices if abs(p - price) < 0.5)
-        return max(4, cluster * 9 + base_size - i * 6 + (abs(hash(str(price))) % 10))
 
-    bids = [{"p": mid - i, "q": _qty(mid - i, 44, i)} for i in range(1, 7)]
-    asks = [{"p": mid + i, "q": _qty(mid + i, 38, i)} for i in range(1, 7)]
-    return {"series": last.get("series", "KXBTC15M"), "mid": mid, "bids": bids, "asks": asks}
+def _terminal_safe_default() -> dict:
+    """Minimal valid /api/terminal payload when aggregation fails."""
+    now_hms = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    now_pts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    day_anchor = datetime.now(timezone.utc).strftime("%Y-%m-%d") + " 00:00"
+    series_blank = {}
+    for s in ("KXBTC15M", "KXETH15M", "KXSOL15M"):
+        series_blank[s] = {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "pnl": 0.0,
+            "last_price": 0,
+        }
+    empty_ob = {
+        "series": "—",
+        "mid": None,
+        "yes_bid": None,
+        "yes_ask": None,
+        "no_bid": None,
+        "bids": [],
+        "asks": [],
+        "depth_source": None,
+        "log_ts": "",
+    }
+    return {
+        "bots": {
+            "kalshi":     {"running": False, "pid": 0},
+            "polymarket": {"running": False, "pid": 0},
+            "coinbase":   {"running": False, "pid": 0},
+        },
+        "summary": {
+            "total_pnl":    0.0,
+            "total_trades": 0,
+            "win_rate":     0.0,
+            "avg_spread":   0.0,
+        },
+        "equity": [
+            {"t": day_anchor, "v": 0.0},
+            {"t": now_pts, "v": 0.0},
+        ],
+        "feed":      [],
+        "orderbook": empty_ob,
+        "series":    series_blank,
+        "freq":      [0] * 24,
+        "console":   [],
+        "mm": {
+            "running":  False,
+            "pid":      0,
+            "last_log": "—",
+            "trades":   0,
+            "wins":     0,
+            "losses":   0,
+            "win_rate": 0.0,
+            "pnl":      0.0,
+        },
+        "updated": now_hms,
+    }
+
+
+def _ensure_terminal_shape(d: Optional[dict]) -> dict:
+    """Guarantee keys/types the dashboard JS expects (avoids blank UI on partial JSON)."""
+    z = _terminal_safe_default()
+    if not isinstance(d, dict):
+        return z
+
+    nb = d.get("bots")
+    if isinstance(nb, dict):
+        for k in ("kalshi", "polymarket", "coinbase"):
+            b = nb.get(k)
+            if isinstance(b, dict):
+                z["bots"][k] = {
+                    "running": bool(b.get("running", False)),
+                    "pid": int(b.get("pid") or 0),
+                }
+
+    ns = d.get("summary")
+    if isinstance(ns, dict):
+        z["summary"] = {
+            "total_pnl": float(ns.get("total_pnl") or 0),
+            "total_trades": int(ns.get("total_trades") or 0),
+            "win_rate": float(ns.get("win_rate") or 0),
+            "avg_spread": float(ns.get("avg_spread") or 0),
+        }
+
+    eq = d.get("equity")
+    if isinstance(eq, list) and eq:
+        cleaned: list[dict] = []
+        for p in eq:
+            if isinstance(p, dict) and p.get("t") is not None and p.get("v") is not None:
+                cleaned.append({"t": str(p["t"]), "v": float(p["v"])})
+        if cleaned:
+            z["equity"] = cleaned
+
+    if isinstance(d.get("feed"), list):
+        z["feed"] = d["feed"]
+
+    ob = d.get("orderbook")
+    if isinstance(ob, dict):
+        bids = ob.get("bids") if isinstance(ob.get("bids"), list) else []
+        asks = ob.get("asks") if isinstance(ob.get("asks"), list) else []
+        z["orderbook"] = {
+            "series": str(ob.get("series") or z["orderbook"]["series"]),
+            "mid": ob.get("mid"),
+            "yes_bid": ob.get("yes_bid"),
+            "yes_ask": ob.get("yes_ask"),
+            "no_bid": ob.get("no_bid"),
+            "bids": bids,
+            "asks": asks,
+            "depth_source": ob.get("depth_source"),
+            "log_ts": str(ob.get("log_ts") or ""),
+        }
+
+    se = d.get("series")
+    if isinstance(se, dict):
+        for s in ("KXBTC15M", "KXETH15M", "KXSOL15M"):
+            row = se.get(s)
+            if isinstance(row, dict):
+                tot = int(row.get("trades") or 0)
+                wins = int(row.get("wins") or 0)
+                z["series"][s] = {
+                    "trades": tot,
+                    "wins": wins,
+                    "losses": int(row.get("losses") if row.get("losses") is not None else (tot - wins)),
+                    "win_rate": float(row.get("win_rate") or 0),
+                    "pnl": float(row.get("pnl") or 0),
+                    "last_price": row.get("last_price", 0) or 0,
+                }
+
+    mm = d.get("mm")
+    if isinstance(mm, dict):
+        tot = int(mm.get("trades") or 0)
+        wins = int(mm.get("wins") or 0)
+        z["mm"] = {
+            "running": bool(mm.get("running", False)),
+            "pid": int(mm.get("pid") or 0),
+            "last_log": str(mm.get("last_log") or "—")[:80],
+            "trades": tot,
+            "wins": wins,
+            "losses": int(mm.get("losses") if mm.get("losses") is not None else (tot - wins)),
+            "win_rate": float(mm.get("win_rate") or 0),
+            "pnl": float(mm.get("pnl") or 0),
+        }
+
+    if isinstance(d.get("console"), list):
+        z["console"] = [str(line) for line in d["console"]]
+
+    fr = d.get("freq")
+    if isinstance(fr, list) and fr:
+        buckets = [int(x) for x in fr[:24]]
+        while len(buckets) < 24:
+            buckets.append(0)
+        z["freq"] = buckets[:24]
+
+    if d.get("updated"):
+        z["updated"] = str(d["updated"])
+
+    return z
+
+
+def _compute_mm_stats() -> dict:
+    running, pid = _is_running("market_maker.py")
+    mm_all   = _load_jsonl(MM_TRADES)
+    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    mm_today = [t for t in mm_all if (t.get("entry_time") or t.get("time") or "").startswith(today)]
+    wins     = sum(1 for t in mm_today if (t.get("pnl_dollars") or t.get("pnl") or 0) > 0)
+    total    = len(mm_today)
+    pnl      = sum((t.get("pnl_dollars") or t.get("pnl") or 0) for t in mm_today)
+    last     = _last_log_line(MM_LOG)
+    return {
+        "running":  running,
+        "pid":      pid,
+        "last_log": last[:80] if last and last != "(log not found)" else "—",
+        "trades":   total,
+        "wins":     wins,
+        "losses":   total - wins,
+        "win_rate": round(wins / total * 100, 1) if total else 0,
+        "pnl":      round(pnl, 4),
+    }
 
 
 def _compute_terminal_data() -> dict:
-    m_run, m_pid = _is_running("momentum_bot.py")
-    p_run, p_pid = _is_running("polymarket_bot.py")
-    c_run, c_pid = _is_running("coinbase_bot.py")
+    try:
+        m_run, m_pid = _is_running("momentum_bot.py")
+        p_run, p_pid = _is_running("polymarket_bot.py")
+        c_run, c_pid = _is_running("coinbase_bot.py")
 
-    all_k    = _load_jsonl(MOMENTUM_TRADES)
-    clean    = [t for t in all_k if t.get("entry_time", "") >= KALSHI_CUTOFF]
-    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cb_all   = _load_jsonl(COINBASE_TRADES)
-    cb_today = [t for t in cb_all if (t.get("entry_time") or "").startswith(today)]
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        mm_all = _load_jsonl(MM_TRADES)
+        mm_day = [
+            t
+            for t in mm_all
+            if str(t.get("entry_time") or t.get("time") or "").startswith(today)
+        ]
+        mt = len(mm_day)
+        mw = sum(
+            1 for t in mm_day if float(t.get("pnl_dollars") or t.get("pnl") or 0) > 0
+        )
+        mpnl = sum(float(t.get("pnl_dollars") or t.get("pnl") or 0) for t in mm_day)
 
-    k_total = len(clean)
-    k_wins  = sum(1 for t in clean if t.get("pnl_dollars", 0) > 0)
-    k_pnl   = sum(t.get("pnl_dollars", 0) for t in clean)
-    cb_total = len(cb_today)
-    cb_wins  = sum(1 for t in cb_today if t.get("pnl_dollars", 0) > 0)
-    cb_pnl   = sum(t.get("pnl_dollars", 0) for t in cb_today)
+        combo_edges = []
+        for t in mm_day:
+            yc = float(t.get("yes_price_cents") or t.get("yes_price") or 0)
+            nc = float(t.get("no_price_cents") or t.get("no_price") or 0)
+            if yc or nc:
+                combo_edges.append(100.0 - yc - nc)
+        avg_combo = round(sum(combo_edges) / len(combo_edges), 2) if combo_edges else 0.0
 
-    total_trades = k_total + cb_total
-    total_wins   = k_wins  + cb_wins
-    total_pnl    = k_pnl   + cb_pnl
+        cb_all = _load_jsonl(COINBASE_TRADES)
 
-    spreads = [abs(t.get("exit_price_cents", 0) - t.get("entry_price_cents", 0))
-               for t in clean if t.get("entry_price_cents") and t.get("exit_price_cents")]
-    avg_spread = sum(spreads) / len(spreads) if spreads else 0.0
-
-    return {
-        "bots": {
-            "kalshi":     {"running": m_run, "pid": m_pid},
-            "polymarket": {"running": p_run, "pid": p_pid},
-            "coinbase":   {"running": c_run, "pid": c_pid},
-        },
-        "summary": {
-            "total_pnl":    round(total_pnl, 4),
-            "total_trades": total_trades,
-            "win_rate":     round(total_wins / total_trades * 100, 1) if total_trades else 0,
-            "avg_spread":   round(avg_spread, 2),
-        },
-        "equity":    _compute_equity(clean),
-        "feed":      _compute_trade_feed(clean, cb_today),
-        "orderbook": _compute_orderbook(clean),
-        "series":    _compute_series_stats(clean),
-        "freq":      _compute_freq(clean),
-        "console":   _last_n_lines(MOMENTUM_LOG, 18),
-        "updated":   datetime.now(timezone.utc).strftime("%H:%M:%S"),
-    }
+        return {
+            "bots": {
+                "kalshi":     {"running": m_run, "pid": m_pid},
+                "polymarket": {"running": p_run, "pid": p_pid},
+                "coinbase":   {"running": c_run, "pid": c_pid},
+            },
+            "summary": {
+                "total_pnl": round(mpnl, 4),
+                "total_trades": mt,
+                "win_rate": round(mw / mt * 100, 1) if mt else 0,
+                "avg_spread": avg_combo,
+            },
+            "equity":    _compute_equity(mm_all),
+            "feed":      _compute_trade_feed(mm_day, []),
+            "orderbook": _compute_orderbook(),
+            "series":    _compute_series_stats(mm_day),
+            "freq":      _compute_freq(mm_all + cb_all),
+            "console":   _last_n_lines(MOMENTUM_LOG, 18),
+            "mm":        _compute_mm_stats(),
+            "updated":   datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        }
+    except Exception:
+        log.exception("_compute_terminal_data failed")
+        return _terminal_safe_default()
 
 
 # ── Legacy _get_status (kept for /api/status backward compat) ────────────────
@@ -331,23 +665,27 @@ def _get_status() -> dict:
             "exit_reason": t.get("exit_reason", ""),
             "pnl":         round(pv, 4),
         })
-    all_trades = _load_jsonl(MOMENTUM_TRADES)
-    clean  = [t for t in all_trades if t.get("entry_time", "") >= KALSHI_CUTOFF]
-    total  = len(clean); wins = sum(1 for t in clean if t.get("pnl_dollars", 0) > 0)
-    losses = sum(1 for t in clean if t.get("pnl_dollars", 0) < 0)
-    pnl    = sum(t.get("pnl_dollars", 0) for t in clean)
+    mm_all = _load_jsonl(MM_TRADES)
+    mm_day = [
+        t
+        for t in mm_all
+        if str(t.get("entry_time") or "").startswith(today_prefix)
+    ]
+    total = len(mm_day)
+    wins = sum(1 for t in mm_day if float(t.get("pnl_dollars") or t.get("pnl") or 0) > 0)
+    losses = sum(1 for t in mm_day if float(t.get("pnl_dollars") or t.get("pnl") or 0) < 0)
+    pnl = sum(float(t.get("pnl_dollars") or t.get("pnl") or 0) for t in mm_day)
     recent_trades = []
-    for t in reversed(clean[-10:]):
-        pnl_val = t.get("pnl_dollars", 0)
+    for t in reversed(mm_day[-10:]):
+        pnl_val = float(t.get("pnl_dollars") or t.get("pnl") or 0)
+        yc = float(t.get("yes_price_cents") or t.get("yes_price") or 0)
+        nc = float(t.get("no_price_cents") or t.get("no_price") or 0)
         recent_trades.append({
-            "time":        (t.get("entry_time") or "")[:16].replace("T", " "),
-            "series":      t.get("series", ""),
-            "entry_type":  t.get("entry_type", "MOM"),
-            "side":        t.get("side", ""),
-            "entry_price": t.get("entry_price_cents", ""),
-            "exit_price":  t.get("exit_price_cents", ""),
-            "exit_reason": t.get("exit_reason", ""),
-            "pnl":         round(pnl_val, 4),
+            "time":            (str(t.get("entry_time") or "")[:16].replace("T", " ")),
+            "series":          t.get("series", ""),
+            "yes_price_cents": yc,
+            "no_price_cents":  nc,
+            "pnl":             round(pnl_val, 4),
         })
     poly_all   = _load_jsonl(POLYMARKET_TRADES)
     poly_today = [t for t in poly_all if (t.get("entry_time") or t.get("time") or "").startswith(today_prefix)]
@@ -370,7 +708,7 @@ def _get_status() -> dict:
                              "pnl": round(pnl,4), "recent": recent_trades},
         "polymarket_trades": poly_all[-10:],
         "polymarket_logs":   poly_logs,
-        "cutoff":            KALSHI_CUTOFF,
+        "cutoff":            today_prefix,
         "updated":           datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
     }
 
@@ -407,9 +745,9 @@ def api_status():
 @auth_required
 def api_terminal():
     now = time.time()
-    if _term_cache["data"] and now - _term_cache["ts"] < TERM_TTL:
-        return jsonify(_term_cache["data"])
-    data = _compute_terminal_data()
+    if _term_cache["data"] is not None and now - _term_cache["ts"] < TERM_TTL:
+        return jsonify(_ensure_terminal_shape(_term_cache["data"]))
+    data = _ensure_terminal_shape(_compute_terminal_data())
     _term_cache["data"] = data
     _term_cache["ts"]   = now
     return jsonify(data)
@@ -422,13 +760,26 @@ def api_btc_candles():
     if _btc_cache["data"] is not None and now - _btc_cache["ts"] < BTC_TTL:
         return jsonify(_btc_cache["data"])
     try:
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60"
         req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
         with _urlreq.urlopen(req, timeout=10) as r:
             raw = json.loads(r.read())
-        candles = [{"t": c[0], "l": c[1], "h": c[2], "o": c[3], "c": c[4], "v": c[5]}
-                   for c in raw[:60]]
-        candles.sort(key=lambda x: x["t"])
+        raw_sorted = sorted(
+            (c for c in raw if isinstance(c, (list, tuple)) and len(c) >= 6),
+            key=lambda x: float(x[0]),
+        )
+        tail = raw_sorted[-80:] if len(raw_sorted) > 80 else raw_sorted
+        candles = []
+        for row in tail:
+            t_f, lo, hi, opn, clo, vol = (
+                float(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
+            )
+            candles.append({"t": t_f, "l": lo, "h": hi, "o": opn, "c": clo, "v": vol})
         _btc_cache["data"] = candles
         _btc_cache["ts"]   = now
         return jsonify(candles)
@@ -534,6 +885,10 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .tb-lbl{color:#00ff4155;font-size:8px;text-transform:uppercase;letter-spacing:1.5px;margin-right:3px}
 .tb-val{color:#00ff41;font-size:12px;font-weight:500}
 .tb-spacer{flex:1;min-width:8px}
+#tb-api-error{display:none;color:#ff3131;font-size:8px;font-weight:600;letter-spacing:0.5px;
+  margin:0 8px 0 4px;max-width:38vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  vertical-align:middle;text-shadow:0 0 6px #ff313166}
+#tb-api-error.show{display:inline-block}
 #tb-updated{color:#00ff4133;font-size:8px;letter-spacing:1px;margin-right:10px}
 .bot-tag{
   display:inline-flex;align-items:center;gap:4px;
@@ -573,7 +928,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 #feed-list{flex:1;overflow-y:auto;overflow-x:hidden}
 .frow{
   display:grid;
-  grid-template-columns:36px 28px 68px 40px 20px 1fr;
+  grid-template-columns:32px 22px minmax(0,1fr) 32px 32px 20px 58px;
   gap:0;padding:2px 6px;
   border-bottom:1px solid #00ff410a;
   align-items:center;cursor:default;
@@ -589,6 +944,8 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .f-long{color:#00ff41;font-size:9px;font-weight:600}
 .f-short{color:#ff3131;font-size:9px;font-weight:600}
 .f-series{color:#00ff41bb;font-size:9px;overflow:hidden;text-overflow:ellipsis}
+.f-mm-y{color:#00ff41;font-size:9px;font-weight:600;text-align:right}
+.f-mm-n{color:#4af;font-size:9px;font-weight:600;text-align:right}
 .f-price{color:#00ff4188;font-size:9px;text-align:right}
 .f-reason{font-size:7px;text-align:center}
 .r-hc{color:#00ff4166}.r-tp{color:#00ff41}.r-sl{color:#ff3131}.r-ts{color:#ffaa00}.r-sr{color:#00ff4133}
@@ -651,7 +1008,9 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 }
 #fr-pane{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid #00ff4118}
 #btc-pane{display:flex;flex-direction:column;overflow:hidden}
-#fr-wrap,#btc-wrap{flex:1;position:relative;min-height:0;padding:2px 4px}
+#fr-wrap,#btc-wrap{flex:1;position:relative;padding:2px 4px}
+#fr-wrap{min-height:0}
+#btc-wrap{min-height:88px}
 #freq-chart{width:100%!important;height:100%!important}
 #btc-canvas{display:block;width:100%;height:100%}
 </style>
@@ -672,6 +1031,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <span class="tb-lbl">FILLS</span><span id="tb-fills" class="tb-val">—</span>
     <span class="tb-sep">│</span>
     <span class="tb-lbl">SPD</span><span id="tb-spread" class="tb-val">—</span>
+    <span id="tb-api-error" class="tb-api-err"></span>
     <div class="tb-spacer"></div>
     <span id="tb-updated"></span>
     <div class="bot-tag"><span class="bdot" id="dot-kalshi"></span>KALSHI</div>
@@ -710,7 +1070,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
       <div id="ob-pane">
         <div class="ph">
           <span class="ph-title" id="ob-title">Market Depth</span>
-          <span class="ph-meta g-faint">SYNTHETIC DEPTH</span>
+          <span class="ph-meta g-faint" id="ob-depth-src">—</span>
         </div>
         <div id="ob-body"></div>
       </div>
@@ -723,7 +1083,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
       <div id="sp-pane">
         <div class="ph">
           <span class="ph-title">Series Performance</span>
-          <span class="ph-meta">KALSHI POST-CUTOFF</span>
+          <span class="ph-meta">MM · TODAY UTC</span>
         </div>
         <div id="sp-body"></div>
       </div>
@@ -757,7 +1117,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <div id="btc-pane">
       <div class="ph">
         <span class="ph-title">BTC/USD</span>
-        <span class="ph-meta" id="btc-price-lbl">5M CANDLES</span>
+        <span class="ph-meta" id="btc-price-lbl">1M CANDLES</span>
       </div>
       <div id="btc-wrap">
         <canvas id="btc-canvas"></canvas>
@@ -772,7 +1132,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 
 // ── Constants ────────────────────────────────────────────
 const POLL_MS      = 500;
-const BTC_POLL_MS  = 60000;
+const BTC_POLL_MS  = 15000;
 
 // ── State ────────────────────────────────────────────────
 let equityChart  = null;
@@ -780,7 +1140,7 @@ let freqChart    = null;
 let btcCandles   = [];
 let lastBtcFetch = 0;
 let lastFeedTs   = '';
-
+let btcLayoutRetries = 0;
 // ── Clock ────────────────────────────────────────────────
 function updateClock() {
   const d = new Date();
@@ -794,6 +1154,169 @@ updateClock();
 // ── HTML escape ──────────────────────────────────────────
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+const FETCH_CRED = { credentials: 'include' };
+
+function setTerminalApiError(msg) {
+  const el = document.getElementById('tb-api-error');
+  if (!el) return;
+  if (msg) {
+    el.textContent = msg;
+    el.classList.add('show');
+    el.style.display = 'inline-block';
+  } else {
+    el.textContent = '';
+    el.classList.remove('show');
+    el.style.display = 'none';
+  }
+}
+
+function defaultSeriesRow() {
+  return { trades: 0, wins: 0, losses: 0, win_rate: 0, pnl: 0, last_price: 0 };
+}
+
+/** Ensures shapes expected by render*(); prevents blank dashboard on partial responses. */
+function normalizeTerminalPayload(d) {
+  const z = {
+    bots: {
+      kalshi:     { running: false, pid: 0 },
+      coinbase:   { running: false, pid: 0 },
+      polymarket: { running: false, pid: 0 },
+    },
+    summary: { total_pnl: 0, total_trades: 0, win_rate: 0, avg_spread: 0 },
+    equity: [{ t: '00:00', v: 0 }, { t: '00:00', v: 0 }],
+    feed: [],
+    orderbook: {
+      series: '—',
+      mid: null,
+      yes_bid: null,
+      yes_ask: null,
+      no_bid: null,
+      bids: [],
+      asks: [],
+      depth_source: null,
+      log_ts: '',
+    },
+    series: {
+      KXBTC15M: defaultSeriesRow(),
+      KXETH15M: defaultSeriesRow(),
+      KXSOL15M: defaultSeriesRow(),
+    },
+    mm: {
+      running: false,
+      pid: 0,
+      last_log: '—',
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      win_rate: 0,
+      pnl: 0,
+    },
+    console: [],
+    freq: Array.from({ length: 24 }, () => 0),
+    updated: '—',
+  };
+
+  if (!d || typeof d !== 'object') return z;
+
+  if (d.bots && typeof d.bots === 'object') {
+    ['kalshi', 'coinbase', 'polymarket'].forEach(k => {
+      const b = d.bots[k];
+      if (b && typeof b === 'object') {
+        z.bots[k].running = !!b.running;
+        z.bots[k].pid = Number(b.pid) || 0;
+      }
+    });
+  }
+
+  if (d.summary && typeof d.summary === 'object') {
+    z.summary.total_pnl = Number(d.summary.total_pnl) || 0;
+    z.summary.total_trades = Number(d.summary.total_trades) || 0;
+    z.summary.win_rate = Number(d.summary.win_rate) || 0;
+    z.summary.avg_spread = Number(d.summary.avg_spread) || 0;
+  }
+
+  if (Array.isArray(d.equity) && d.equity.length) {
+    const eq = d.equity
+      .map(p => {
+        if (!p || typeof p !== 'object') return null;
+        return {
+          t: String(p.t != null ? p.t : ''),
+          v: Number(p.v) || 0,
+        };
+      })
+      .filter(p => p && p.t);
+    if (eq.length) z.equity = eq;
+  }
+
+  if (Array.isArray(d.feed)) z.feed = d.feed;
+
+  if (d.orderbook && typeof d.orderbook === 'object') {
+    const ob = d.orderbook;
+    z.orderbook.series = ob.series != null ? String(ob.series) : z.orderbook.series;
+    z.orderbook.mid = ob.mid;
+    z.orderbook.yes_bid = ob.yes_bid;
+    z.orderbook.yes_ask = ob.yes_ask;
+    z.orderbook.no_bid = ob.no_bid;
+    z.orderbook.bids = Array.isArray(ob.bids) ? ob.bids : [];
+    z.orderbook.asks = Array.isArray(ob.asks) ? ob.asks : [];
+    z.orderbook.depth_source = ob.depth_source != null ? ob.depth_source : null;
+    z.orderbook.log_ts = ob.log_ts != null ? String(ob.log_ts) : '';
+  }
+
+  if (d.series && typeof d.series === 'object') {
+    ['KXBTC15M', 'KXETH15M', 'KXSOL15M'].forEach(k => {
+      const r = d.series[k];
+      if (r && typeof r === 'object') {
+        const tot = Number(r.trades) || 0;
+        const wins = Number(r.wins) || 0;
+        const losses = r.losses != null && r.losses !== ''
+          ? Number(r.losses)
+          : Math.max(0, tot - wins);
+        z.series[k] = {
+          trades: tot,
+          wins,
+          losses,
+          win_rate: Number(r.win_rate) || 0,
+          pnl: Number(r.pnl) || 0,
+          last_price: r.last_price != null ? r.last_price : 0,
+        };
+      }
+    });
+  }
+
+  if (d.mm && typeof d.mm === 'object') {
+    const mm = d.mm;
+    const mt = Number(mm.trades) || 0;
+    const mw = Number(mm.wins) || 0;
+    const mloss =
+      mm.losses != null && mm.losses !== ''
+        ? Number(mm.losses)
+        : Math.max(0, mt - mw);
+    z.mm = {
+      running: !!mm.running,
+      pid: Number(mm.pid) || 0,
+      last_log: mm.last_log != null ? String(mm.last_log).slice(0, 80) : '—',
+      trades: mt,
+      wins: mw,
+      losses: mloss,
+      win_rate: Number(mm.win_rate) || 0,
+      pnl: Number(mm.pnl) || 0,
+    };
+  }
+
+  if (Array.isArray(d.console)) z.console = d.console.map(x => String(x));
+
+  if (Array.isArray(d.freq) && d.freq.length) {
+    const fr = d.freq.slice(0, 24).map(x => Number(x) || 0);
+    while (fr.length < 24) fr.push(0);
+    z.freq = fr;
+  }
+
+  if (d.updated != null && d.updated !== '') z.updated = String(d.updated);
+
+  return z;
 }
 
 // ── Chart.js init ────────────────────────────────────────
@@ -881,31 +1404,36 @@ function initCharts() {
 
 // ── Render: top bar ──────────────────────────────────────
 function renderTopBar(d) {
-  const s = d.summary;
+  const s = d.summary || {};
+  const pnl = Number(s.total_pnl) || 0;
   const pnlEl = document.getElementById('tb-pnl');
-  const sign  = s.total_pnl >= 0 ? '+' : '';
-  pnlEl.textContent  = sign + '$' + Math.abs(s.total_pnl).toFixed(4);
-  pnlEl.className    = 'tb-val ' + (s.total_pnl >= 0 ? 'pos glow' : 'neg');
+  const sign  = pnl >= 0 ? '+' : '';
+  pnlEl.textContent  = sign + '$' + Math.abs(pnl).toFixed(4);
+  pnlEl.className    = 'tb-val ' + (pnl >= 0 ? 'pos glow' : 'neg');
 
   const wrEl = document.getElementById('tb-wr');
-  wrEl.textContent = s.total_trades ? s.win_rate + '%' : '—';
-  wrEl.className   = 'tb-val ' + (s.win_rate >= 50 ? 'pos' : s.total_trades ? 'neg' : '');
+  const nt = Number(s.total_trades) || 0;
+  const wr = Number(s.win_rate) || 0;
+  wrEl.textContent = nt ? wr + '%' : '—';
+  wrEl.className   = 'tb-val ' + (wr >= 50 ? 'pos' : nt ? 'neg' : '');
 
-  document.getElementById('tb-fills').textContent  = s.total_trades || '0';
-  document.getElementById('tb-spread').textContent = s.avg_spread.toFixed(1) + '¢';
-  document.getElementById('tb-updated').textContent = d.updated + ' UTC';
+  document.getElementById('tb-fills').textContent  = String(nt || '0');
+  document.getElementById('tb-spread').textContent = (Number(s.avg_spread) || 0).toFixed(1) + '¢';
+  document.getElementById('tb-updated').textContent = (d.updated || '—') + ' UTC';
 
-  ['kalshi','coinbase','polymarket'].forEach(b => {
+  const bots = d.bots || {};
+  ['kalshi', 'coinbase', 'polymarket'].forEach(b => {
     const el = document.getElementById('dot-' + b);
-    if (el) el.className = 'bdot ' + (d.bots[b].running ? 'don' : 'doff');
+    const row = bots[b] || {};
+    if (el) el.className = 'bdot ' + (row.running ? 'don' : 'doff');
   });
 }
 
 // ── Render: equity curve ─────────────────────────────────
 function renderEquity(pts) {
   if (!equityChart || !pts.length) return;
-  const labels = pts.map(p => p.t.slice(-5));  // show HH:MM
-  const values = pts.map(p => p.v);
+  const labels = pts.map(p => String(p.t != null ? p.t : '').slice(-5));  // show HH:MM
+  const values = pts.map(p => Number(p.v) || 0);
   equityChart.data.labels            = labels;
   equityChart.data.datasets[0].data  = values;
   equityChart.update('none');
@@ -918,6 +1446,7 @@ function renderEquity(pts) {
 
 // ── Render: trade feed ───────────────────────────────────
 function renderFeed(trades) {
+  if (!Array.isArray(trades)) trades = [];
   const el    = document.getElementById('feed-list');
   const count = document.getElementById('feed-count');
   count.textContent = trades.length + ' TRADES';
@@ -932,29 +1461,47 @@ function renderFeed(trades) {
   lastFeedTs  = trades[0]?.ts || '';
 
   const REASON_MAP = {
-    HARD_CLOSE: ['HC', 'r-hc'], TAKE_PROFIT: ['TP', 'r-tp'],
-    STOP_LOSS:  ['SL', 'r-sl'], TRAIL_STOP:  ['TS', 'r-ts'],
+    PAIR:        ['PAIR', 'r-hc'],
+    HARD_CLOSE:  ['HC', 'r-hc'], TAKE_PROFIT: ['TP', 'r-tp'],
+    STOP_LOSS:   ['SL', 'r-sl'], TRAIL_STOP: ['TS', 'r-ts'],
     SESSION_RESET: ['SR', 'r-sr'], DAY_CLOSE: ['DC', 'r-sr'],
   };
   const SIDE_MAP = { YES: 'f-yes', NO: 'f-no', LONG: 'f-long', SHORT: 'f-short' };
 
   let html = '';
   trades.forEach((t, i) => {
-    const pnlCls = t.pnl > 0 ? 'pos' : t.pnl < 0 ? 'neg' : 'zer';
-    const pnlStr = t.pnl > 0 ? '+$'+t.pnl.toFixed(4) : t.pnl < 0 ? '-$'+Math.abs(t.pnl).toFixed(4) : '±0';
-    const sideCls = SIDE_MAP[t.side] || 'f-yes';
-    const [rLabel, rCls] = REASON_MAP[t.reason] || ['—', 'r-sr'];
-    const priceStr = t.bot === 'K'
-      ? t.price + '¢'
-      : '$' + Number(t.price).toLocaleString('en', {maximumFractionDigits:0});
+    const pnlN = Number(t.pnl);
+    const pnlCls = pnlN > 0 ? 'pos' : pnlN < 0 ? 'neg' : 'zer';
+    const pnlStr = pnlN > 0 ? '+$' + pnlN.toFixed(4) : pnlN < 0 ? '-$' + Math.abs(pnlN).toFixed(4) : '$0';
+
+    const isMm = t.kind === 'mm' || t.bot === 'MM';
+    let col4 = '';
+    let col5 = '';
+    let rsnSpan = '';
+
+    if (isMm) {
+      const y = Number(t.yes_price_cents);
+      const n = Number(t.no_price_cents);
+      col4 = '<span class="f-mm-y">' + (Number.isFinite(y) ? String(Math.round(y)) + '¢' : '—') + '</span>';
+      col5 = '<span class="f-mm-n">' + (Number.isFinite(n) ? String(Math.round(n)) + '¢' : '—') + '</span>';
+      rsnSpan = '<span class="f-reason r-hc">PAIR</span>';
+    } else {
+      const sideCls = SIDE_MAP[t.side] || 'f-yes';
+      col4 = '<span class="' + sideCls + '">' + esc(String(t.side || '—')) + '</span>';
+      const px = '$' + Number(t.price).toLocaleString('en', { maximumFractionDigits: 0 });
+      col5 = '<span class="f-price">' + esc(px) + '</span>';
+      const [rLabel, rCls] = REASON_MAP[t.reason] || ['—', 'r-sr'];
+      rsnSpan = '<span class="f-reason ' + rCls + '">' + rLabel + '</span>';
+    }
+
     const rowCls = (i === 0 && isNew) ? 'frow new' : 'frow';
     html += `<div class="${rowCls}">
       <span class="f-ts">${esc(t.ts)}</span>
       <span class="f-bot">${esc(t.bot)}</span>
-      <span class="${sideCls}">${esc(t.side)}</span>
       <span class="f-series">${esc(t.series)}</span>
-      <span class="f-price">${esc(priceStr)}</span>
-      <span class="f-reason ${rCls}">${rLabel}</span>
+      ${col4}
+      ${col5}
+      ${rsnSpan}
       <span class="f-pnl ${pnlCls}">${pnlStr}</span>
     </div>`;
   });
@@ -963,32 +1510,58 @@ function renderFeed(trades) {
 
 // ── Render: order book ───────────────────────────────────
 function renderOrderBook(ob) {
+  ob = ob || {};
   const el = document.getElementById('ob-body');
-  document.getElementById('ob-title').textContent =
-    ob.series ? 'Depth — ' + ob.series : 'Market Depth';
+  const titleEl = document.getElementById('ob-title');
+  const depthSrc = document.getElementById('ob-depth-src');
+  titleEl.textContent = (ob.series && ob.series !== '—')
+    ? 'Depth — ' + ob.series
+    : 'Market Depth';
 
-  if (!ob.bids.length && !ob.asks.length) {
+  if (depthSrc) {
+    if (ob.depth_source && ob.yes_bid != null && ob.yes_ask != null) {
+      let s = ob.depth_source + ' · Yb ' + Number(ob.yes_bid).toFixed(1) +
+        '/Ya ' + Number(ob.yes_ask).toFixed(1) + '¢';
+      if (ob.log_ts)
+        s += ' · ' + ob.log_ts + ' UTC';
+      depthSrc.textContent = s;
+    } else {
+      depthSrc.textContent = 'NO YES BID LINE IN LOG';
+    }
+  }
+
+  const bidsList = Array.isArray(ob.bids) ? ob.bids : [];
+  const asksList = Array.isArray(ob.asks) ? ob.asks : [];
+
+  if (!bidsList.length && !asksList.length) {
     el.innerHTML = '<div class="empty-msg">NO DATA</div>'; return;
   }
 
-  const allQ  = [...ob.bids, ...ob.asks].map(x => x.q);
+  const allQ  = [...bidsList, ...asksList].map(x => x.q);
   const maxQ  = Math.max(...allQ, 1);
+  const now   = Date.now();  // time-based jitter so bars pulse on each 500ms poll
 
   let html = '';
+  const midTxt = (ob.mid != null && Number.isFinite(Number(ob.mid)))
+    ? Number(ob.mid).toFixed(1) + '¢ — MID'
+    : '— — MID';
+
   // Asks reversed (highest at top)
-  [...ob.asks].reverse().forEach(a => {
-    const w = ((a.q / maxQ) * 100).toFixed(0);
+  [...asksList].reverse().forEach((a, i) => {
+    const jitter = 0.87 + 0.13 * Math.sin(now / 600 + i * 1.9);
+    const w = ((a.q / maxQ) * 100 * jitter).toFixed(0);
     html += `<div class="obr">
-      <span class="obp neg">${a.p.toFixed(1)}¢</span>
+      <span class="obp neg">${Number(a.p).toFixed(1)}¢</span>
       <div class="obbar"><div class="obask" style="width:${w}%"></div></div>
       <span class="obq">${a.q}</span>
     </div>`;
   });
-  html += `<div class="ob-mid">${ob.mid.toFixed(1)}¢ &mdash; LAST</div>`;
-  ob.bids.forEach(b => {
-    const w = ((b.q / maxQ) * 100).toFixed(0);
+  html += `<div class="ob-mid">${esc(midTxt)}</div>`;
+  bidsList.forEach((b, i) => {
+    const jitter = 0.87 + 0.13 * Math.sin(now / 600 + i * 1.9 + Math.PI);
+    const w = ((b.q / maxQ) * 100 * jitter).toFixed(0);
     html += `<div class="obr">
-      <span class="obp pos">${b.p.toFixed(1)}¢</span>
+      <span class="obp pos">${Number(b.p).toFixed(1)}¢</span>
       <div class="obbar"><div class="obbid" style="width:${w}%"></div></div>
       <span class="obq">${b.q}</span>
     </div>`;
@@ -997,7 +1570,8 @@ function renderOrderBook(ob) {
 }
 
 // ── Render: series stats ─────────────────────────────────
-function renderSeries(series) {
+function renderSeries(series, mm) {
+  series = series && typeof series === 'object' ? series : {};
   const el = document.getElementById('sp-body');
   const NAMES = ['KXBTC15M', 'KXETH15M', 'KXSOL15M'];
   const SHORT  = { KXBTC15M: 'BTC', KXETH15M: 'ETH', KXSOL15M: 'SOL' };
@@ -1016,76 +1590,138 @@ function renderSeries(series) {
       <div class="sb-meta">
         <span>WIN <span class="${d.win_rate>=50?'pos':'neg'}">${d.win_rate}%</span></span>
         <span>FLS <span class="g">${d.trades}</span></span>
-        <span>LAST <span class="amb">${lastStr}</span></span>
+        <span>Y+N <span class="amb">${lastStr}</span></span>
       </div>
       <hr class="sb-div">
     </div>`;
   });
+  // Market maker totals (bot process + session stats)
+  if (mm && typeof mm === 'object') {
+    const mpcl   = mm.pnl >= 0 ? 'pos' : 'neg';
+    const mpnl   = (mm.pnl >= 0 ? '+' : '') + '$' + Math.abs(mm.pnl).toFixed(4);
+    const mstat  = mm.running ? '<span class="pos">&#9679; RUN</span>' : '<span class="neg">&#9675; OFF</span>';
+    html += `<div class="sb">
+      <div class="sb-hdr">
+        <span class="sb-name">MM <span class="sb-sub g-faint">TODAY TOTAL</span></span>
+        <span class="sb-pnl ${mpcl}">${mpnl}</span>
+      </div>
+      <div class="sb-meta">
+        <span>FLS <span class="g">${mm.trades}</span></span>
+        <span>WIN <span class="${mm.win_rate>=50?'pos':'neg'}">${mm.win_rate}%</span></span>
+        <span>${mstat}</span>
+      </div>
+      <hr class="sb-div">
+    </div>`;
+  }
   el.innerHTML = html;
 }
 
 // ── Render: console log ──────────────────────────────────
 function renderConsole(lines) {
+  if (!Array.isArray(lines)) lines = [];
   const el = document.getElementById('con-body');
   if (!lines.length) {
     el.innerHTML = '<div class="empty-msg">NO LOG</div>'; return;
   }
-  // Strip leading timestamp + log level
+  // Strip leading timestamp + log level; show oldest→newest so newest lands at bottom
   const strip = l => l.replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\s+\w+\s+/, '');
   let html = '';
-  [...lines].reverse().forEach(l => {
+  lines.forEach(l => {
     html += `<div class="cline">${esc(strip(l))}</div>`;
   });
   el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
 }
 
 // ── Render: frequency chart ──────────────────────────────
 function renderFreq(freq) {
   if (!freqChart) return;
-  freqChart.data.datasets[0].data = freq;
+  let f = Array.isArray(freq) ? [...freq] : [];
+  while (f.length < 24) f.push(0);
+  freqChart.data.datasets[0].data = f.slice(0, 24);
   freqChart.update('none');
 }
 
+
+// ── BTC OHLC (Coinbase arrays → numeric fields). Bad rows dropped.
+function normalizeBtcCandle(c) {
+  const row = {
+    t: Number(c.t),
+    o: Number(c.o),
+    h: Number(c.h),
+    l: Number(c.l),
+    c: Number(c.c),
+  };
+  if (![row.t, row.o, row.h, row.l, row.c].every(x => Number.isFinite(x))) return null;
+  if (row.l > row.h) { const x = row.l; row.l = row.h; row.h = x; }
+  return row;
+}
+
 // ── Render: BTC candlestick (raw canvas) ─────────────────
-function renderBtcCandles(candles) {
-  if (!candles || candles.length < 2) return;
+function renderBtcCandles(rawCandles) {
+  if (!rawCandles || rawCandles.length < 2) return;
+
+  const candles = rawCandles.map(normalizeBtcCandle).filter(Boolean);
+  if (candles.length < 2) return;
 
   const wrap   = document.getElementById('btc-wrap');
   const canvas = document.getElementById('btc-canvas');
-  const dpr    = window.devicePixelRatio || 1;
-  const W0     = wrap.clientWidth  || 600;
-  const H0     = wrap.clientHeight || 96;
+  const br       = wrap.getBoundingClientRect();
+  let W0         = Math.round(br.width)  || wrap.clientWidth  || 0;
+  let H0         = Math.round(br.height) || wrap.clientHeight || 0;
 
-  canvas.width  = W0 * dpr;
-  canvas.height = H0 * dpr;
+  if (W0 < 120 || H0 < 36) {
+    if (btcLayoutRetries < 30) {
+      btcLayoutRetries += 1;
+      requestAnimationFrame(() => renderBtcCandles(rawCandles));
+      return;
+    }
+    W0 = W0 || 640;
+    H0 = Math.max(H0 || 0, 100);
+  }
+  btcLayoutRetries = 0;
+
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.max(1, Math.round(W0 * dpr));
+  canvas.height = Math.max(1, Math.round(H0 * dpr));
   canvas.style.width  = W0 + 'px';
   canvas.style.height = H0 + 'px';
 
   const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W0, H0);
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W0, H0);
 
   const n      = Math.min(candles.length, 80);
   const recent = candles.slice(-n);
-  const hi     = Math.max(...recent.map(c => c.h));
-  const lo     = Math.min(...recent.map(c => c.l));
-  const range  = hi - lo || 1;
+  const tailRaw = rawCandles[rawCandles.length - 1];
+  const liveCand = normalizeBtcCandle(tailRaw);
+  const fallbackC = Number(recent[recent.length - 1].c);
+  const liveClose = Number.isFinite(Number(liveCand && liveCand.c))
+    ? Number(liveCand.c)
+    : fallbackC;
+
+  let hi     = Math.max(...recent.map(x => x.h));
+  let lo     = Math.min(...recent.map(x => x.l));
+  if (Number.isFinite(liveClose)) {
+    hi = Math.max(hi, liveClose);
+    lo = Math.min(lo, liveClose);
+  }
+  const rng    = (hi > lo) ? (hi - lo) : 1e-12;
 
   const PAD_T = 6, PAD_B = 14, PAD_L = 4, PAD_R = 54;
-  const CW = W0 - PAD_L - PAD_R;
-  const CH = H0 - PAD_T - PAD_B;
+  const CW = Math.max(W0 - PAD_L - PAD_R, 1);
+  const CH = Math.max(H0 - PAD_T - PAD_B, 1);
   const cw = CW / n;
   const bw = Math.max(1, cw * 0.6);
-  const toY = p => PAD_T + CH - ((p - lo) / range) * CH;
+  const toY = (px) => PAD_T + CH - ((Number(px) - lo) / rng) * CH;
 
-  // Grid lines + price labels
   ctx.font      = '7px IBM Plex Mono';
   ctx.textAlign = 'left';
   for (let i = 0; i <= 3; i++) {
     const y = PAD_T + (i / 3) * CH;
-    const p = hi - (i / 3) * range;
+    const p = hi - (i / 3) * rng;
     ctx.strokeStyle = '#001a00';
     ctx.lineWidth   = 0.5;
     ctx.beginPath(); ctx.moveTo(PAD_L, y); ctx.lineTo(W0 - PAD_R, y); ctx.stroke();
@@ -1093,93 +1729,158 @@ function renderBtcCandles(candles) {
     ctx.fillText(p.toLocaleString('en',{maximumFractionDigits:0}), W0 - PAD_R + 3, y + 3);
   }
 
-  // Candles
   recent.forEach((c, i) => {
     const x     = PAD_L + i * cw + cw / 2;
     const bull  = c.c >= c.o;
     const color = bull ? '#00ff41' : '#ff3131';
     const fillA = bull ? 'rgba(0,255,65,0.25)' : 'rgba(255,49,49,0.25)';
-    // Wick
     ctx.strokeStyle = color;
     ctx.lineWidth   = 0.8;
     ctx.beginPath();
     ctx.moveTo(x, toY(c.h)); ctx.lineTo(x, toY(c.l));
     ctx.stroke();
-    // Body
     const yO = toY(c.o), yC = toY(c.c);
     const y  = Math.min(yO, yC);
-    const h  = Math.max(1, Math.abs(yO - yC));
+    const hBody  = Math.max(1, Math.abs(yO - yC));
     ctx.fillStyle   = fillA;
     ctx.strokeStyle = color;
     ctx.lineWidth   = 0.8;
-    ctx.fillRect(x - bw/2, y, bw, h);
-    ctx.strokeRect(x - bw/2, y, bw, h);
+    ctx.fillRect(x - bw/2, y, bw, hBody);
+    ctx.strokeRect(x - bw/2, y, bw, hBody);
   });
 
-  // Last price dashed line + label
-  const last = recent[recent.length - 1];
-  const ly   = toY(last.c);
-  ctx.setLineDash([2, 3]);
-  ctx.strokeStyle = '#ffaa0066'; ctx.lineWidth = 0.5;
-  ctx.beginPath(); ctx.moveTo(PAD_L, ly); ctx.lineTo(W0 - PAD_R, ly); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = '#ffaa00'; ctx.font = 'bold 8px IBM Plex Mono'; ctx.textAlign = 'left';
-  ctx.fillText('$' + last.c.toLocaleString('en',{maximumFractionDigits:0}), W0 - PAD_R + 3, ly + 3);
+  // Live BTC (last fetched close): vertical mark at newest bar + horizontal reference
+  if (recent.length >= 2 && Number.isFinite(liveClose)) {
+    const ly   = toY(liveClose);
+    const lx   = PAD_L + (n - 1) * cw + cw / 2;
+    const plotB = PAD_T + CH;
 
-  // Time labels
+    ctx.save();
+    ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = 'rgba(230,170,0,0.55)';
+    ctx.lineWidth = 0.65;
+    ctx.beginPath(); ctx.moveTo(lx, PAD_T); ctx.lineTo(lx, plotB); ctx.stroke();
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = '#e6aa00cc';
+    ctx.lineWidth = 0.95;
+    ctx.beginPath(); ctx.moveTo(PAD_L, ly); ctx.lineTo(W0 - PAD_R, ly); ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = '#ffaa00';
+    ctx.font = 'bold 8px IBM Plex Mono';
+    ctx.textAlign = 'left';
+    ctx.fillText(
+      '$' + liveClose.toLocaleString('en', {maximumFractionDigits: 0}),
+      W0 - PAD_R + 3,
+      ly + 3,
+    );
+  }
+
   ctx.fillStyle = '#00ff4133'; ctx.font = '7px IBM Plex Mono'; ctx.textAlign = 'center';
-  const labelEvery = Math.ceil(n / 6);
+  const labelEvery = Math.max(1, Math.ceil(n / 6));
   recent.forEach((c, i) => {
     if (i % labelEvery !== 0) return;
     const x  = PAD_L + i * cw + cw / 2;
-    const dt = new Date(c.t * 1000);
+    const dt = new Date(Math.floor(Number(c.t) * 1000));
     const lbl = dt.getUTCHours().toString().padStart(2,'0') + ':' + dt.getUTCMinutes().toString().padStart(2,'0');
     ctx.fillText(lbl, x, H0 - 2);
   });
 
-  // Update label
   document.getElementById('btc-price-lbl').textContent =
-    '$' + last.c.toLocaleString('en', {maximumFractionDigits: 0});
+    Number.isFinite(liveClose)
+      ? ('$' + liveClose.toLocaleString('en', {maximumFractionDigits: 0}))
+      : '1M CANDLES';
 }
 
 // ── Main poll ────────────────────────────────────────────
+let __terminalProbeLogged = false;
+
 async function pollTerminal() {
   try {
-    const res  = await fetch('/api/terminal');
-    const data = await res.json();
+    const res = await fetch('/api/terminal', FETCH_CRED);
+
+    const bodyText = await res.text();
+    if (!res.ok) {
+      console.error('[terminal] HTTP', res.status, bodyText && bodyText.slice(0, 300));
+      setTerminalApiError(
+        res.status === 401 ? 'API 401 — session / login?' : ('API ERROR ' + res.status)
+      );
+      return;
+    }
+
+    let data;
+    try {
+      data = bodyText ? JSON.parse(bodyText) : null;
+    } catch (parseErr) {
+      console.error('[terminal] JSON parse error', parseErr, bodyText && bodyText.slice(0, 500));
+      setTerminalApiError('BAD JSON RESPONSE');
+      return;
+    }
+
+    if (!__terminalProbeLogged) {
+      __terminalProbeLogged = true;
+      console.log('/api/terminal (full response on load):', data);
+    }
+
+    data = normalizeTerminalPayload(data);
+    setTerminalApiError('');
+
     renderTopBar(data);
     renderFeed(data.feed);
     renderEquity(data.equity);
     renderOrderBook(data.orderbook);
-    renderSeries(data.series);
+    renderSeries(data.series, data.mm);
     renderConsole(data.console);
     renderFreq(data.freq);
   } catch (e) {
-    console.warn('Terminal poll error:', e.message);
+    console.error('[terminal] pollTerminal', e);
+    setTerminalApiError(String(e.message || e));
   }
+  // Keep BTC canvas sized after equity/layout updates (wrapped in rAF)
+  if (btcCandles.length)
+    requestAnimationFrame(() => renderBtcCandles(btcCandles));
 }
+
 
 async function pollBtcCandles() {
   try {
-    const res  = await fetch('/api/btc-candles');
+    const res  = await fetch('/api/btc-candles', FETCH_CRED);
+    if (!res.ok) {
+      console.warn('[btc-candles] HTTP', res.status);
+      throw new Error('HTTP ' + res.status);
+    }
     const data = await res.json();
-    if (data.length) {
+    if (Array.isArray(data) && data.length) {
       btcCandles = data;
-      renderBtcCandles(btcCandles);
+      if (!window.__btcSampleLogged) {
+        console.log('[btc-candles] first candle object (shape sample):', data[0]);
+        window.__btcSampleLogged = true;
+      }
     }
   } catch (e) {
     console.warn('BTC candles error:', e.message);
   }
+  if (btcCandles.length)
+    renderBtcCandles(btcCandles);
 }
 
 // ── Boot ─────────────────────────────────────────────────
-initCharts();
-pollTerminal();
-pollBtcCandles();
+requestAnimationFrame(() => {
+  initCharts();
+  pollTerminal();
+});
+requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    pollBtcCandles();
+  });
+});
 setInterval(pollTerminal, POLL_MS);
 setInterval(pollBtcCandles, BTC_POLL_MS);
 // Redraw candles on resize
-window.addEventListener('resize', () => { if (btcCandles.length) renderBtcCandles(btcCandles); });
+window.addEventListener('resize', () => {
+  if (btcCandles.length)
+    requestAnimationFrame(() => renderBtcCandles(btcCandles));
+});
 </script>
 </body>
 </html>

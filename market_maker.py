@@ -38,7 +38,7 @@ import ssl
 SERIES                     = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 ACTIVATE_MINS_BEFORE_CLOSE = 8
 HARD_CLOSE_SECS             = 30
-PAPER_MODE                  = True  # must stay True unless you change code + accept live risk
+PAPER_MODE                  = False  # must stay True unless you change code + accept live risk
 
 POLL_INTERVAL_SEC           = 2.0     # fast enough to hit hard-close window
 REQUOTE_CHECK_INTERVAL_SEC  = 30.0    # mid-drift / live order check cadence
@@ -47,11 +47,21 @@ MAX_LIMIT_CENTS           = 90
 ORDER_COUNT               = 1       # contracts per quote leg
 MAX_YES_INVENTORY         = 10      # pause YES quotes while above this net YES contracts
 
-# Paper: limit fill only if bid crosses limit; then Bernoulli gate
-PAPER_FILL_PROBABILITY    = 0.20
+# Paper: each poll in the activation window, open YES/NO orders fill independently
+# at this probability (no bid-cross check — P&L test harness).
+PAPER_YES_FILL_PROBABILITY_PER_POLL = 0.40
+PAPER_NO_FILL_PROBABILITY_PER_POLL = 0.15
 
-DAILY_LOSS_LIMIT_USD       = 30.0
-SESSION_HALT_MIN_LOSS_USD  = 1.0
+# Avoid unpaired NO: only quote NO when YES inventory ≥ 1; cancel/post NO blocked when backlog >= threshold
+MAX_UNPAIRED_NO_BACKLOG = 3  # forbid NO quoting when no_inv - yes_inv >= this (max 2 extra NO)
+# Post YES limit only while yes_limit + NO_bid stays at or below this (else YES session latched off)
+YES_LIMIT_PLUS_NO_BID_MAX = 99
+# Paired YES+NO P&L: only when total cost in [MIN, MAX] ¢ ($1 payout); excludes overpay (sum > $1)
+MIN_PAIRED_YES_NO_COST_CENTS = 94
+MAX_PAIRED_YES_NO_COST_CENTS = 99
+
+DAILY_LOSS_LIMIT_USD       = 5.0   # test: halt quotes when cumulative day P&L <= -this
+SESSION_HALT_MIN_LOSS_USD  = 0.50  # test: halt current session after one close this bad
 
 _MAX_RETRIES  = 3
 _BASE_BACKOFF = 0.5
@@ -362,12 +372,17 @@ class MMState:
     posted_no_limit: float = 0.0    # NO cents (conventional)
     mid_at_post: float = 0.0
     last_requote_check: float = 0.0
-    # Filled YES / NO notionals — one deque entry = 1 contract @ limit cents (FIFO pairing)
+    # One deque entry = 1 contract @ limit cents (FIFO)
     yes_prices: deque[float] = field(default_factory=deque)
     no_prices: deque[float] = field(default_factory=deque)
     session_pnl: float = 0.0
     session_halted: bool = False
     active: bool = False
+    # Telegram: at most one close summary per ticker (session window)
+    telegram_close_sent: bool = False
+    # HARD_CLOSE flattens once per session; avoid repeating every poll
+    hard_close_sent: bool = False
+    skip_yes_tight_spread: bool = False  # latched YES off for session once spread too thin
 
 
 _daily_pnl: dict[str, float] = {}
@@ -398,6 +413,20 @@ def _reset_session_state(st: MMState) -> None:
     st.session_pnl = 0.0
     st.session_halted = False
     st.active = False
+    st.telegram_close_sent = False
+    st.hard_close_sent = False
+    st.skip_yes_tight_spread = False
+
+
+def _eligible_to_post_no(st: MMState) -> bool:
+    """NO quotes only with ≥1 YES filled; stop NO when unpaired backlog hits cap."""
+    y = len(st.yes_prices)
+    n = len(st.no_prices)
+    if y < 1:
+        return False
+    if n - y >= MAX_UNPAIRED_NO_BACKLOG:
+        return False
+    return True
 
 
 def _target_yes_limit(yes_bid: float) -> float:
@@ -446,10 +475,6 @@ async def _post_limit_buy(
             ORDER_COUNT,
             oid,
         )
-        _tg_alert(
-            f"PAPER MM quote {series} BUY {side} @ {limit_side_cents:.0f}¢ "
-            f"(yes_px={yes_price_api}) ×{ORDER_COUNT}"
-        )
         return oid
 
     resp = await client.post(
@@ -469,8 +494,23 @@ async def _post_limit_buy(
         log.warning("[%s] POST order returned empty id: %r", series, resp)
         return ""
     log.info("[%s] %s LIVE LIMIT BUY %s yes_price=%d oid=%s", series, ts, side, yes_price_api, oid)
-    _tg_alert(f"LIVE MM quote {series} BUY {side} yes_px={yes_price_api} ×{ORDER_COUNT}")
     return oid
+
+
+async def _cancel_resting_no_if_ineligible(client: _SimpleClient, st: MMState, ts: str) -> None:
+    """Cancel resting NO when inventory rules disallow new NO quoting."""
+    if not st.no_order_id or _eligible_to_post_no(st):
+        return
+    await _cancel_order(client, st.no_order_id, ts, st.series)
+    st.no_order_id = ""
+    st.posted_no_limit = 0.0
+    log.info(
+        "[%s] %s cancelled resting NO (yes_inv=%d no_inv=%d)",
+        st.series,
+        ts,
+        len(st.yes_prices),
+        len(st.no_prices),
+    )
 
 
 async def _order_is_live(
@@ -490,14 +530,12 @@ async def _order_is_live(
         return True
 
 
-def _maybe_fill_yes(st: MMState, yes_bid: float, ts: str) -> None:
-    """Paper: YES BUY limit fills when market bid lifts to/at our limit, then probabilistic."""
+def _maybe_fill_yes(st: MMState, ts: str) -> None:
+    """Paper: open YES order may fill each poll (activation window) with fixed probability."""
     if not PAPER_MODE or not st.yes_order_id or st.posted_yes_limit <= 0:
         return
     lim = st.posted_yes_limit
-    if yes_bid < lim:
-        return
-    if random.random() >= PAPER_FILL_PROBABILITY:
+    if random.random() >= PAPER_YES_FILL_PROBABILITY_PER_POLL:
         return
     if len(st.yes_prices) + ORDER_COUNT > MAX_YES_INVENTORY:
         return
@@ -505,77 +543,153 @@ def _maybe_fill_yes(st: MMState, yes_bid: float, ts: str) -> None:
         st.yes_prices.append(lim)
     n_y = len(st.yes_prices)
     log.info("[%s] %s FILL YES @ %.1fc (yes_inv=%d)", st.series, ts, lim, n_y)
-    _tg_alert(f"MM FILL {st.series} YES @ {lim:.0f}¢ ×{ORDER_COUNT} | yes_inv={n_y}")
     st.yes_order_id = ""
     st.posted_yes_limit = 0.0
 
 
-def _maybe_fill_no(st: MMState, no_bid: float, ts: str) -> None:
-    """Paper: NO BUY limit fills when NO bid lifts to/at our limit, then probabilistic."""
+def _maybe_fill_no(st: MMState, ts: str) -> None:
+    """Paper: open NO order may fill each poll (activation window) with fixed probability."""
     if not PAPER_MODE or not st.no_order_id or st.posted_no_limit <= 0:
         return
     nlim = st.posted_no_limit
-    if no_bid < nlim:
-        return
-    if random.random() >= PAPER_FILL_PROBABILITY:
+    if random.random() >= PAPER_NO_FILL_PROBABILITY_PER_POLL:
         return
     for _ in range(ORDER_COUNT):
         st.no_prices.append(nlim)
     n_n = len(st.no_prices)
     log.info("[%s] %s FILL NO @ %.1fc (no_inv=%d)", st.series, ts, nlim, n_n)
-    _tg_alert(f"MM FILL {st.series} NO @ {nlim:.0f}¢ ×{ORDER_COUNT} | no_inv={n_n}")
     st.no_order_id = ""
     st.posted_no_limit = 0.0
 
 
+def _pair_pnl_usd(yes_cents: float, no_cents: float) -> float:
+    """
+    Locked-box P&L for one paired YES+NO contract (one deque YES + one deque NO).
+    (1.0 - yes$ - no$) * contracts * 100¢ in dollars is (1 - y$ - n$) * contracts;
+    each deque pair is one contract, so contracts=1 per call.
+    """
+    y_usd = yes_cents / 100.0
+    n_usd = no_cents / 100.0
+    return (1.0 - y_usd - n_usd)
+
+
+MM_TRADES_JSONL = Path(__file__).resolve().parent / "market_maker_trades.jsonl"
+
+
+def _append_mm_trades_hard_close(
+    series: str, qualifying_pairs: list[tuple[float, float]], entry_time: str,
+) -> None:
+    """One JSON line per qualifying YES+NO pair (HARD_CLOSE only)."""
+    if not qualifying_pairs:
+        return
+    try:
+        with open(MM_TRADES_JSONL, "a", encoding="utf-8") as f:
+            for yc, nc in qualifying_pairs:
+                pnl_u = _pair_pnl_usd(yc, nc)
+                row = {
+                    "entry_time": entry_time,
+                    "series": series,
+                    "yes_price_cents": round(float(yc), 4),
+                    "no_price_cents": round(float(nc), 4),
+                    "pnl_dollars": round(pnl_u, 4),
+                    "paper": bool(PAPER_MODE),
+                }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("[%s] market_maker_trades.jsonl append failed: %s", series, exc)
+
+
 def _flatten_all(
-    st: MMState, yes_bid: float, no_bid: float, reason: str, ts: str,
+    st: MMState, _yes_bid: float, _no_bid: float, reason: str, ts: str,
 ) -> None:
     """
-    Session close settlement:
-      - FIFO-pair YES+NO locks in (1 - yes$ - no$) per paired contract at expiry.
-      - Unpaired YES / NO residual marked at current bids (paper exit).
+    Session close: FIFO-match YES/NO contracts; **P&L only** on pairs with
+    MIN_PAIRED_YES_NO_COST_CENTS <= YES_price + NO_price <= MAX_PAIRED_YES_NO_COST_CENTS
+    (profitable boxed payout — excludes impossible sim arbs and overpaid pairs).
+    Non-qualifying FIFO pairs discard at $0. Unpaired legs discard at $0.
+    At most **one Telegram** per ticker per session via `telegram_close_sent`.
     """
-    pnl = 0.0
-    paired = 0
+    paired_qualifying: list[tuple[float, float]] = []
+    discarded_arb_pairs = 0
+    pnl_pairs = 0.0
+
     while st.yes_prices and st.no_prices:
         yc = st.yes_prices.popleft()
         nc = st.no_prices.popleft()
-        y_usd = yc / 100.0
-        n_usd = nc / 100.0
-        pnl += (1.0 - y_usd - n_usd) * 1.0  # one contract per deque step
-        paired += 1
+        pair_sum = yc + nc
+        if (
+            MIN_PAIRED_YES_NO_COST_CENTS <= pair_sum <= MAX_PAIRED_YES_NO_COST_CENTS
+        ):
+            paired_qualifying.append((yc, nc))
+            pnl_pairs += _pair_pnl_usd(yc, nc)
+        else:
+            discarded_arb_pairs += 1
 
     orphan_y = 0
     while st.yes_prices:
-        yc = st.yes_prices.popleft()
-        pnl += (yes_bid - yc) / 100.0
+        st.yes_prices.popleft()
         orphan_y += 1
 
     orphan_n = 0
     while st.no_prices:
-        nc = st.no_prices.popleft()
-        pnl += (no_bid - nc) / 100.0
+        st.no_prices.popleft()
         orphan_n += 1
 
-    if paired or orphan_y or orphan_n:
-        log.info(
-            "[%s] %s %s | pairs=%d orphan_YES=%d orphan_NO=%d | P&L=$%+.4f",
-            st.series,
-            ts,
-            reason,
-            paired,
-            orphan_y,
-            orphan_n,
-            pnl,
+    close_iso = ""
+    if reason == "HARD_CLOSE":
+        close_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
+
+    total_move = (
+        paired_qualifying or discarded_arb_pairs or orphan_y or orphan_n
+    )
+    log.info(
+        "[%s] %s %s | qualifying_pairs=%d discarded_arb_pairs=%d "
+        "orphan_YES=%d orphan_NO=%d | pair_P&L=$%+.4f",
+        st.series,
+        ts,
+        reason,
+        len(paired_qualifying),
+        discarded_arb_pairs,
+        orphan_y,
+        orphan_n,
+        pnl_pairs,
+    )
+
+    if total_move:
+        lines = []
+        for i, (yc, nc) in enumerate(paired_qualifying, 1):
+            pu = _pair_pnl_usd(yc, nc)
+            lines.append(f"  {i}) YES@{yc:.0f}¢ + NO@{nc:.0f}¢ (${pu:+.4f})")
+        discard_line = (
+            (
+                f"discarded paired (YES+NO not in {MIN_PAIRED_YES_NO_COST_CENTS}–"
+                f"{MAX_PAIRED_YES_NO_COST_CENTS}¢): "
+                f"{discarded_arb_pairs} ($0 P&L)\n"
+            )
+            if discarded_arb_pairs
+            else ""
         )
-        _tg_alert(
-            f"MM CLOSE {st.series} {reason} | pairs×{paired} unpair Y{orphan_y}/N{orphan_n} | "
-            f"P&L ${pnl:+.4f}"
+        body = (
+            f"MM [{st.series}] {reason}\n"
+            f"ticker {st.ticker}\n"
+            f"pairs {MIN_PAIRED_YES_NO_COST_CENTS}≤YES+NO≤{MAX_PAIRED_YES_NO_COST_CENTS}¢: "
+            f"{len(paired_qualifying)}\n"
+            + ("\n".join(lines) if lines else "  (none — paired fills outside cost band)\n")
+            + discard_line
+            + f"pair P&L: ${pnl_pairs:+.4f}\n"
+            f"discarded unpaired: YES×{orphan_y} NO×{orphan_n} (not in P&L)\n"
+            f"cumulative sess: ${st.session_pnl + pnl_pairs:+.4f}"
         )
-        st.session_pnl += pnl
-        _record_realized_pnl(pnl)
-        if pnl <= -SESSION_HALT_MIN_LOSS_USD:
+        log.info("[%s] session close detail:\n%s", st.series, body.replace("\n", " | "))
+        if not st.telegram_close_sent:
+            _tg_alert(body[:3900])
+            st.telegram_close_sent = True
+
+    if pnl_pairs:
+        st.session_pnl += pnl_pairs
+        _record_realized_pnl(pnl_pairs)
+        if pnl_pairs <= -SESSION_HALT_MIN_LOSS_USD:
             st.session_halted = True
 
 
@@ -612,7 +726,20 @@ async def _post_both_sides(
     post_yes = (
         not blocked
         and len(st.yes_prices) + ORDER_COUNT <= MAX_YES_INVENTORY
+        and not st.skip_yes_tight_spread
     )
+    if post_yes and y_lim + no_bid > float(YES_LIMIT_PLUS_NO_BID_MAX):
+        st.skip_yes_tight_spread = True
+        post_yes = False
+        log.info(
+            "[%s] %s SKIP YES for session — YES_lim+NO_bid=%.1f+%.1f=%.1f>%d",
+            st.series,
+            ts,
+            y_lim,
+            no_bid,
+            y_lim + no_bid,
+            YES_LIMIT_PLUS_NO_BID_MAX,
+        )
 
     if post_yes:
         st.yes_order_id = await _post_limit_buy(
@@ -627,12 +754,25 @@ async def _post_both_sides(
         st.yes_order_id = ""
         st.posted_yes_limit = 0.0
 
-    if not blocked:
+    if not blocked and _eligible_to_post_no(st):
         st.no_order_id = await _post_limit_buy(
             client, ticker, "NO", n_lim, ts, st.series
         )
         st.posted_no_limit = n_lim if st.no_order_id else 0.0
     else:
+        if not blocked and (
+            len(st.yes_prices) < 1
+            or len(st.no_prices) - len(st.yes_prices) >= MAX_UNPAIRED_NO_BACKLOG
+        ):
+            why = (
+                "yes_inv==0"
+                if len(st.yes_prices) < 1
+                else "unpaired backlog (no-yes)>=%d" % MAX_UNPAIRED_NO_BACKLOG
+            )
+            log.info(
+                "[%s] %s SKIP NO quote — %s (y=%d n=%d)",
+                st.series, ts, why, len(st.yes_prices), len(st.no_prices),
+            )
         st.no_order_id = ""
         st.posted_no_limit = 0.0
 
@@ -703,6 +843,25 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                     no_bid,
                 )
 
+            y_lim_gate = _target_yes_limit(yes_bid)
+            if not st.skip_yes_tight_spread and (
+                y_lim_gate + no_bid > float(YES_LIMIT_PLUS_NO_BID_MAX)
+            ):
+                st.skip_yes_tight_spread = True
+                log.info(
+                    "[%s] %s SKIP YES for session — YES_lim+NO_bid=%.1f+%.1f=%.1f>%d",
+                    series,
+                    ts,
+                    y_lim_gate,
+                    no_bid,
+                    y_lim_gate + no_bid,
+                    YES_LIMIT_PLUS_NO_BID_MAX,
+                )
+                if st.yes_order_id:
+                    await _cancel_order(client, st.yes_order_id, ts, series)
+                    st.yes_order_id = ""
+                    st.posted_yes_limit = 0.0
+
             # Risk: daily circuit
             if _get_today_pnl() <= -DAILY_LOSS_LIMIT_USD:
                 if st.yes_order_id or st.no_order_id:
@@ -711,17 +870,21 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # Hard close inventory + cancel quotes
+            # Hard close inventory + cancel quotes (once per session)
             if secs_left is not None and secs_left <= HARD_CLOSE_SECS:
-                await _cancel_both_quotes(client, st, ts)
-                _flatten_all(st, yes_bid, no_bid, "HARD_CLOSE", ts)
+                if not st.hard_close_sent:
+                    await _cancel_both_quotes(client, st, ts)
+                    _flatten_all(st, yes_bid, no_bid, "HARD_CLOSE", ts)
+                    st.hard_close_sent = True
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # Paper fills: bid must cross limit, then 20% Bernoulli
+            # Paper fills: per-poll probability while order is open (activation window only)
             if PAPER_MODE:
-                _maybe_fill_yes(st, yes_bid, ts)
-                _maybe_fill_no(st, no_bid, ts)
+                _maybe_fill_yes(st, ts)
+                _maybe_fill_no(st, ts)
+
+            await _cancel_resting_no_if_ineligible(client, st, ts)
 
             # 30s check: live order status + mid drift
             now = time.time()
@@ -729,10 +892,12 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
                 and len(st.yes_prices) + ORDER_COUNT <= MAX_YES_INVENTORY
+                and not st.skip_yes_tight_spread
             )
             want_no = (
                 _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
+                and _eligible_to_post_no(st)
             )
             if now - st.last_requote_check >= REQUOTE_CHECK_INTERVAL_SEC:
                 if not PAPER_MODE:
@@ -805,20 +970,18 @@ async def main() -> None:
         MID_MOVE_REQUOTE_CENTS,
     )
     log.info(
-        "Inventory cap: YES≤%d contracts | size=%s | paper fill: bid crosses limit + %.0f%% prob | "
-        "halt session if loss>$%.2f day>$%.2f",
+        "Inventory cap: YES≤%d contracts ×%s/leg | paper YES %.0f%%/poll NO %.0f%%/poll | "
+        "YES off for session if YES_lim+NO_bid>%d | NO halted when no-yes>=%d | "
+        "halt session>$%.2f day>$%.2f",
         MAX_YES_INVENTORY,
         ORDER_COUNT,
-        PAPER_FILL_PROBABILITY * 100,
+        PAPER_YES_FILL_PROBABILITY_PER_POLL * 100,
+        PAPER_NO_FILL_PROBABILITY_PER_POLL * 100,
+        YES_LIMIT_PLUS_NO_BID_MAX,
+        MAX_UNPAIRED_NO_BACKLOG,
         SESSION_HALT_MIN_LOSS_USD,
         DAILY_LOSS_LIMIT_USD,
     )
-    tg = f"chat_id={_TG_CHAT_ID}" if _TG_TOKEN else "disabled"
-    log.info("Telegram: %s", tg)
-    log.info("=" * 62)
-
-    _tg_alert("MM bot started — PAPER quotes on KX*15M | inv cap %d YES" % MAX_YES_INVENTORY)
-
     client = _SimpleClient()
     tasks = [asyncio.create_task(run_series_mm(client, s)) for s in SERIES]
     try:
@@ -830,7 +993,6 @@ async def main() -> None:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await client.close()
-        _tg_alert(f"MM stopped — day P&L ${_get_today_pnl():+.2f}")
 
 
 if __name__ == "__main__":
