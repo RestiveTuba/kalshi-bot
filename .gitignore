@@ -17,3 +17,6 @@ backtest_trades.jsonl
 *.pem
 *.jsonl
 *.log
+*.log.*
+momentum.log*
+market_maker.log*
