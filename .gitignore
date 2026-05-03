@@ -13,3 +13,7 @@ momentum.log.1
 
 # Generated backtest output
 backtest_trades.jsonl
+.env
+*.pem
+*.jsonl
+*.log
