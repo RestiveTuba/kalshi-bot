@@ -26,3 +26,4 @@ coinbase.log
 polymarket.log
 coinbase_trades.jsonl
 momentum_trades.jsonl
+static/*.mp3
