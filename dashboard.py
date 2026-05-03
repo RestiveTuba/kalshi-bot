@@ -6,6 +6,7 @@ Run:  python3 dashboard.py
 URL:  http://localhost:5000
 """
 import functools
+import asyncio
 import json
 import os
 import re
@@ -15,7 +16,7 @@ import time
 import urllib.request as _urlreq
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from flask import Flask, jsonify, request, Response, session, redirect
 
@@ -37,6 +38,178 @@ _term_cache: dict = {"data": None, "ts": 0.0}
 _btc_cache:  dict = {"data": None, "ts": 0.0}
 TERM_TTL = 0.4
 BTC_TTL  = 14.0
+
+# ── Kalshi REST (reuse market_maker._SimpleClient) ──────────────────────────
+
+
+def _ensure_kalshi_credentials_path() -> None:
+    """Default key path to repo root when env not set."""
+    kp = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip()
+    if kp and Path(kp).is_file():
+        return
+    for name in ("kalshi_private_key.pem",):
+        cand = BASE / name
+        if cand.is_file():
+            os.environ["KALSHI_PRIVATE_KEY_PATH"] = str(cand)
+            break
+
+
+async def _mm_fetch_balance() -> tuple[Optional[float], Optional[int], Optional[str]]:
+    """(usd, cents, error) via GET portfolio/balance."""
+    try:
+        from market_maker import _SimpleClient, _coerce_balance_cent_int
+
+        cli = _SimpleClient()
+        try:
+            if not cli._private_key:
+                return None, None, "Kalshi API key / private key not configured"
+            r = await cli.get("portfolio/balance")
+            cents = _coerce_balance_cent_int(r.get("balance"))
+            if cents is None:
+                return None, None, "balance field missing"
+            usd = round(cents / 100.0, 6)
+            return usd, int(cents), None
+        finally:
+            await cli.close()
+    except Exception as exc:
+        log.warning("Kalshi portfolio/balance: %s", exc)
+        return None, None, str(exc)
+
+
+def _kalshi_unpack_order(blob: dict) -> dict:
+    od = blob.get("order") if isinstance(blob.get("order"), dict) else blob
+    return od if isinstance(od, dict) else {}
+
+
+def _extract_kalshi_order_id(blob: dict) -> Optional[str]:
+    if not isinstance(blob, dict):
+        return None
+    od = _kalshi_unpack_order(blob)
+    for k in ("order_id", "id"):
+        v = od.get(k) if isinstance(od, dict) else None
+        if v is None:
+            v = blob.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+async def _mm_fetch_resting_orders() -> tuple[list[dict[str, Any]], Optional[str]]:
+    """GET portfolio/orders?status=resting."""
+    try:
+        from market_maker import _SimpleClient
+
+        cli = _SimpleClient()
+        try:
+            if not cli._private_key:
+                return [], "Kalshi API key / private key not configured"
+            r = await cli.get(
+                "portfolio/orders",
+                params={"status": "resting", "limit": 200},
+            )
+            raw_list = r.get("orders") or []
+            out: list[dict[str, Any]] = []
+            if not isinstance(raw_list, list):
+                return [], "unexpected orders shape"
+            for raw in raw_list:
+                od = _kalshi_unpack_order(raw if isinstance(raw, dict) else {})
+                if not od:
+                    continue
+                ticker = str(od.get("ticker") or "")
+                side = str(od.get("side") or "").upper()
+                cnt = od.get("remaining_count")
+                if cnt is None:
+                    cnt = od.get("remaining_count_fp")
+                if cnt is None:
+                    cnt = od.get("open_count")
+                if cnt is None:
+                    cnt = od.get("count")
+                cnt_i: Optional[int]
+                try:
+                    cnt_i = int(float(str(cnt))) if cnt is not None else None
+                except (TypeError, ValueError):
+                    cnt_i = None
+                yp = od.get("yes_price")
+                price_disp = ""
+                if yp is not None:
+                    try:
+                        price_disp = f"{int(float(str(yp)))}¢"
+                    except (TypeError, ValueError):
+                        price_disp = str(yp)
+                else:
+                    yd = od.get("yes_price_dollars")
+                    if yd is not None:
+                        try:
+                            price_disp = f"${float(str(yd)):.4f}".rstrip("0").rstrip(".")
+                        except (TypeError, ValueError):
+                            price_disp = str(yd)
+                if not price_disp:
+                    price_disp = "—"
+                action = str(od.get("action") or "").lower()
+                typ = str(od.get("type") or "").lower()
+                out.append(
+                    {
+                        "ticker": ticker,
+                        "side": side,
+                        "action": action,
+                        "order_type": typ,
+                        "price_display": price_disp,
+                        "count": cnt_i if cnt_i is not None else 0,
+                    }
+                )
+            out.sort(key=lambda x: x.get("ticker") or "")
+            return out, None
+        finally:
+            await cli.close()
+    except Exception as exc:
+        log.warning("Kalshi portfolio/orders resting: %s", exc)
+        return [], str(exc)
+
+
+async def _mm_cancel_all_resting_orders() -> tuple[bool, int, list[str]]:
+    """
+    GET resting orders then DELETE portfolio/orders/{id} each.
+    Returns (ok_summary, cancelled_count, per-order error strings).
+    """
+    errs: list[str] = []
+    cancelled = 0
+    try:
+        from market_maker import _SimpleClient
+
+        cli = _SimpleClient()
+        try:
+            if not cli._private_key:
+                return False, 0, ["Kalshi API key / private key not configured"]
+            r = await cli.get(
+                "portfolio/orders",
+                params={"status": "resting", "limit": 200},
+            )
+            raw_list = r.get("orders") or []
+            if not isinstance(raw_list, list):
+                return False, 0, ["unexpected orders response"]
+            ids: list[str] = []
+            for raw in raw_list:
+                if not isinstance(raw, dict):
+                    continue
+                oid = _extract_kalshi_order_id(raw)
+                if oid:
+                    ids.append(oid)
+            for oid in ids:
+                try:
+                    await cli.delete(f"portfolio/orders/{oid}")
+                    cancelled += 1
+                    log.info("cancel-all DELETE %s", oid)
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc).strip() or repr(exc)
+                    errs.append(f"{oid}: {msg}")
+                    log.warning("cancel-all DELETE failed %s: %s", oid, msg)
+            return True, cancelled, errs
+        finally:
+            await cli.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Kalshi cancel-all: %s", exc)
+        return False, cancelled, errs + [str(exc)]
+
 
 # ── Momentum log → order book (live YES/NO bids) ───────────────────────────
 _MOM_YES_NO_BID_LINE = re.compile(
@@ -1137,6 +1310,78 @@ def api_btc_candles():
         return jsonify(_btc_cache["data"] or [])
 
 
+@app.route("/api/balance")
+@auth_required
+def api_balance():
+    """Live Kalshi GET portfolio/balance → dollars."""
+    _ensure_kalshi_credentials_path()
+    try:
+        usd, cents, err = asyncio.run(_mm_fetch_balance())
+    except Exception as e:
+        log.exception("api/balance")
+        return jsonify(
+            {"ok": False, "balance_usd": None, "balance_cents": None, "error": str(e)},
+        )
+    if err:
+        return jsonify(
+            {
+                "ok": False,
+                "balance_usd": None if usd is None else float(usd),
+                "balance_cents": cents,
+                "error": err,
+            },
+        )
+    return jsonify(
+        {
+            "ok": True,
+            "balance_usd": float(usd) if usd is not None else None,
+            "balance_cents": int(cents) if cents is not None else None,
+        },
+    )
+
+
+@app.route("/api/positions")
+@auth_required
+def api_positions():
+    """Kalshi resting limit orders."""
+    _ensure_kalshi_credentials_path()
+    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    try:
+        orders, err = asyncio.run(_mm_fetch_resting_orders())
+    except Exception as e:
+        log.exception("api/positions")
+        return jsonify({"ok": False, "orders": [], "updated": stamp, "error": str(e)})
+    resp: dict[str, Any] = {
+        "ok": err is None,
+        "orders": orders,
+        "updated": stamp,
+    }
+    if err:
+        resp["error"] = err
+    return jsonify(resp)
+
+
+@app.route("/api/cancel-all", methods=["POST"])
+@auth_required
+def api_cancel_all():
+    """Emergency: cancel every resting Kalshi order (up to 200)."""
+    _ensure_kalshi_credentials_path()
+    try:
+        ok_run, n, errs = asyncio.run(_mm_cancel_all_resting_orders())
+    except Exception as e:  # noqa: BLE001
+        log.exception("api/cancel-all")
+        return jsonify({"ok": False, "cancelled": 0, "errors": [str(e)]})
+    _term_cache["data"] = None
+    _term_cache["ts"] = 0.0
+    return jsonify(
+        {
+            "ok": bool(ok_run and len(errs) == 0),
+            "cancelled": int(n),
+            "errors": errs,
+        },
+    )
+
+
 @app.route("/api/restart/<bot>", methods=["POST"])
 @auth_required
 def api_restart(bot: str):
@@ -1233,6 +1478,8 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .tb-sep{color:#00ff4122;padding:0 7px;font-size:13px}
 .tb-lbl{color:#00ff4155;font-size:8px;text-transform:uppercase;letter-spacing:1.5px;margin-right:3px}
 .tb-val{color:#00ff41;font-size:12px;font-weight:500}
+.tb-val.tb-bal{color:#00ff41;text-shadow:0 0 8px rgba(0,255,65,0.35)}
+.tb-val.tb-orders{color:#00ff41;font-size:11px}
 .tb-spacer{flex:1;min-width:8px}
 #tb-api-error{display:none;color:#ff3131;font-size:8px;font-weight:600;letter-spacing:0.5px;
   margin:0 8px 0 4px;max-width:38vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
@@ -1289,8 +1536,32 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .ph-meta{font-size:7px;letter-spacing:1px;color:#00ff4144}
 .ph-val{font-size:9px;font-weight:500}
 
-/* ── LEFT: Live Fills ── */
-#LF{}
+/* ── LEFT: Live Fills + resting orders ── */
+#LF{min-height:0}
+#lf-feed-block{
+  flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;
+  border-bottom:1px solid #00ff4118;
+}
+#lf-orders-pane{
+  flex:0 1 42%;max-height:42%;min-height:96px;display:flex;
+  flex-direction:column;overflow:hidden;background:#030603;
+}
+.pos-list{
+  flex:1;min-height:0;overflow-y:auto;padding:2px 0;
+  font-size:8px;line-height:1.36;color:#00ff4188;
+}
+.pos-row{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) 24px 34px 20px;
+  gap:3px;font-size:8px;padding:2px 6px;
+  border-bottom:1px solid #00ff410c;align-items:baseline;font-family:inherit;
+}
+.pos-t{color:#00ff41aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pos-side{font-size:7px;color:#ffb020;text-align:center;text-transform:uppercase}
+.pos-pr{color:#00ff41;text-align:right;font-weight:500;font-size:8px}
+.pos-n{text-align:right;font-size:7px;color:#00ff4177}
+.pos-err{padding:6px 8px;font-size:8px;color:#ff6b6b}
+
 #feed-list{flex:1;overflow-y:auto;overflow-x:hidden}
 .frow{
   display:grid;
@@ -1397,13 +1668,13 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 }
 .bc-hdr{
   flex-shrink:0;display:flex;align-items:center;gap:6px;padding:3px 6px;
-  border-bottom:1px solid #00ff4118;
+  border-bottom:1px solid #00ff4118;flex-wrap:wrap;
 }
 .bc-title{font-size:8px;font-weight:600;letter-spacing:1.6px;color:#00ff4199;text-transform:uppercase;flex:1}
 .bc-led{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .bc-led.on{background:#00ff41;box-shadow:0 0 6px #00ff41}
 .bc-led.off{background:#ff3131;box-shadow:0 0 4px #ff313166}
-.bc-btns{display:flex;gap:4px}
+.bc-btns{display:flex;gap:4px;flex-wrap:wrap}
 .bc-btn{
   font-family:inherit;font-size:7px;font-weight:600;letter-spacing:0.5px;
   text-transform:uppercase;padding:3px 8px;cursor:pointer;border-radius:0;
@@ -1412,6 +1683,11 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .bc-btn:hover{background:#00ff410d;border-color:#00ff4177}
 .bc-btn:disabled{opacity:.4;cursor:not-allowed}
 .bc-btn-danger{border-color:#ff313144;color:#ff6b6b}
+.bc-btn-cancel-all{
+  border-color:#cc2222!important;color:#ff3838!important;font-weight:700;
+  text-shadow:0 0 8px rgba(255,56,56,0.25);
+}
+.bc-btn-cancel-all:hover{background:#44000033!important;border-color:#ff5555!important;color:#ff8a8a!important}
 .bc-log{
   flex:1;min-height:0;overflow:auto;margin:0;padding:4px 6px;
   font-size:8px;line-height:1.45;color:#00ff4199;white-space:pre-wrap;word-break:break-all;
@@ -1438,6 +1714,10 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <span class="tb-sep">│</span>
     <span class="tb-lbl">UTC</span><span id="clock" class="tb-val">--:--:--</span>
     <span class="tb-sep">│</span>
+    <span class="tb-lbl">BAL</span><span id="tb-bal" class="tb-val tb-bal" title="Live Kalshi portfolio balance">—</span>
+    <span class="tb-sep">│</span>
+    <span id="tb-open-orders" class="tb-val tb-orders" title="Kalshi resting orders">OPEN ORDERS: —</span>
+    <span class="tb-sep">│</span>
     <span class="tb-lbl">P&amp;L</span><span id="tb-pnl" class="tb-val">—</span>
     <span class="tb-sep">│</span>
     <span class="tb-lbl">WIN</span><span id="tb-wr" class="tb-val">—</span>
@@ -1458,14 +1738,23 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
   <!-- ══ MAIN AREA ══ -->
   <div id="MA">
 
-    <!-- LEFT: Trade Feed -->
+    <!-- LEFT: Trade Feed + resting orders -->
     <div class="pane" id="LF">
-      <div class="ph">
-        <span class="ph-title">Live Fills</span>
-        <span class="ph-meta g-faint" id="feed-mm-mode-meta">PAPER</span>
-        <span class="ph-meta" id="feed-count">0 TRADES</span>
+      <div id="lf-feed-block">
+        <div class="ph">
+          <span class="ph-title">Live Fills</span>
+          <span class="ph-meta g-faint" id="feed-mm-mode-meta">PAPER</span>
+          <span class="ph-meta" id="feed-count">0 TRADES</span>
+        </div>
+        <div id="feed-list"></div>
       </div>
-      <div id="feed-list"></div>
+      <div id="lf-orders-pane">
+        <div class="ph">
+          <span class="ph-title">Resting Orders</span>
+          <span class="ph-meta g-faint" id="pos-ts">Kalshi · —</span>
+        </div>
+        <div id="pos-list" class="pos-list"></div>
+      </div>
     </div>
 
     <!-- CENTER -->
@@ -1536,6 +1825,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
           <span class="bc-btns">
             <button type="button" class="bc-btn" id="bc-start-mm">Start</button>
             <button type="button" class="bc-btn bc-btn-danger" id="bc-stop-mm">Stop</button>
+            <button type="button" class="bc-btn bc-btn-cancel-all" id="bc-cancel-all" title="Cancel all resting Kalshi orders">CANCEL ALL ORDERS</button>
           </span>
         </div>
         <pre class="bc-log" id="bc-log-mm"></pre>
@@ -1612,6 +1902,93 @@ function esc(s) {
 
 const FETCH_CRED = { credentials: 'include' };
 const BOT_CTRL_POLL_MS = 2800;
+const BAL_POLL_MS = 30000;
+const POS_POLL_MS = 10000;
+
+async function pollKalshiBalance() {
+  const balEl = document.getElementById('tb-bal');
+  try {
+    const res = await fetch('/api/balance', FETCH_CRED);
+    const d = res.ok ? await res.json() : {};
+    if (balEl) {
+      if (d.ok && d.balance_usd != null && Number.isFinite(Number(d.balance_usd)))
+        balEl.textContent = '$' + Number(d.balance_usd).toFixed(2);
+      else balEl.textContent = '—';
+    }
+  } catch (_ex) {
+    if (balEl) balEl.textContent = '—';
+  }
+}
+
+function renderRestingOrders(payload) {
+  var ordTop = document.getElementById('tb-open-orders');
+  if (ordTop) {
+    var nShow = null;
+    if (payload && payload.ok === true && Array.isArray(payload.orders))
+      nShow = payload.orders.length;
+    ordTop.textContent = nShow !== null ? 'OPEN ORDERS: ' + nShow : 'OPEN ORDERS: —';
+  }
+  const box = document.getElementById('pos-list');
+  const ts = document.getElementById('pos-ts');
+  if (ts && payload && payload.updated) ts.textContent = 'Kalshi · ' + payload.updated;
+  if (!box) return;
+  if (!payload) {
+    box.innerHTML = '<div class="pos-err">NO DATA</div>';
+    return;
+  }
+  if (!payload.ok && payload.error && !(payload.orders && payload.orders.length)) {
+    box.innerHTML = '<div class="pos-err">' + esc(String(payload.error)) + '</div>';
+    return;
+  }
+  var rows = Array.isArray(payload.orders) ? payload.orders : [];
+  if (!rows.length) {
+    box.innerHTML =
+      '<div class="empty-msg" style="padding:8px 6px;font-size:8px">NO RESTING ORDERS</div>';
+    return;
+  }
+  box.innerHTML = rows
+    .map(function (o) {
+      return (
+        '<div class="pos-row">' +
+        '<span class="pos-t">' +
+        esc(o.ticker || '') +
+        '</span>' +
+        '<span class="pos-side">' +
+        esc(String(o.side || '').slice(0, 6)) +
+        '</span>' +
+        '<span class="pos-pr">' +
+        esc(o.price_display || '—') +
+        '</span>' +
+        '<span class="pos-n">' +
+        esc(o.count != null ? String(o.count) : '') +
+        '</span></div>'
+      );
+    })
+    .join('');
+}
+
+async function pollKalshiPositions() {
+  try {
+    const res = await fetch('/api/positions', FETCH_CRED);
+    if (!res.ok) {
+      renderRestingOrders({
+        ok: false,
+        orders: [],
+        error: 'HTTP ' + res.status,
+        updated: '—',
+      });
+      return;
+    }
+    renderRestingOrders(await res.json());
+  } catch (e) {
+    renderRestingOrders({
+      ok: false,
+      orders: [],
+      error: e.message || String(e),
+      updated: '—',
+    });
+  }
+}
 
 async function refreshBotControls() {
   try {
@@ -1670,6 +2047,47 @@ function attachBotControlsHandlers() {
   if (xm) xm.addEventListener('click', function () { act('stop', 'momentum'); });
   if (sr) sr.addEventListener('click', function () { act('start', 'market_maker'); });
   if (xr) xr.addEventListener('click', function () { act('stop', 'market_maker'); });
+
+  var ca = document.getElementById('bc-cancel-all');
+  if (ca) {
+    ca.addEventListener('click', async function () {
+      var n = 0;
+      try {
+        var pr = await fetch('/api/positions', FETCH_CRED);
+        if (pr.ok) {
+          var pj = await pr.json();
+          if (pj && Array.isArray(pj.orders)) n = pj.orders.length;
+        }
+      } catch (_e) {}
+      if (!confirm('Cancel all ' + n + ' resting orders?')) return;
+      ca.disabled = true;
+      try {
+        var res = await fetch('/api/cancel-all', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        var j = await res.json().catch(function () { return {}; });
+        if (j.ok) {
+          alert('Cancelled ' + Number(j.cancelled || 0) + ' orders');
+        } else if (Number(j.cancelled || 0) > 0) {
+          alert(
+            'Cancelled ' +
+              Number(j.cancelled || 0) +
+              ' orders (some failed):\n' +
+              (j.errors || []).join('\n'),
+          );
+        } else {
+          alert((j.errors && j.errors.join('\n')) || 'Cancel-all failed');
+        }
+        await pollKalshiPositions();
+      } catch (e) {
+        alert(String(e.message || e));
+      }
+      ca.disabled = false;
+    });
+  }
 
   var sv = document.getElementById('bc-save-params');
   if (sv) {
@@ -2510,8 +2928,12 @@ requestAnimationFrame(() => {
   attachBotControlsHandlers();
   pollTerminal();
   refreshBotControls();
+  pollKalshiBalance();
+  pollKalshiPositions();
 });
 setInterval(refreshBotControls, BOT_CTRL_POLL_MS);
+setInterval(pollKalshiBalance, BAL_POLL_MS);
+setInterval(pollKalshiPositions, POS_POLL_MS);
 requestAnimationFrame(() => {
   requestAnimationFrame(() => {
     pollBtcCandles();
