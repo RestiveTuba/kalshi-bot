@@ -20,3 +20,9 @@ backtest_trades.jsonl
 *.log.*
 momentum.log*
 market_maker.log*
+*.log
+arb.log
+coinbase.log
+polymarket.log
+coinbase_trades.jsonl
+momentum_trades.jsonl
