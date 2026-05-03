@@ -257,9 +257,30 @@ class _SimpleClient:
         for attempt in range(_MAX_RETRIES):
             try:
                 headers = self._auth_headers(method, sign_path, body_str)
-                async with session.request(
-                    method, path, headers=headers, json=json_body
-                ) as resp:
+                if attempt == 0 and method == "POST" and body_str:
+                    h_disp = dict(headers)
+                    sig = h_disp.get("KALSHI-ACCESS-SIGNATURE", "")
+                    if sig:
+                        h_disp["KALSHI-ACCESS-SIGNATURE"] = (
+                            sig[:24] + f"...(+{len(sig) - 24} b64 chars)"
+                        )
+                    log.info(
+                        "Kalshi POST request (RSA = sign_path + body): "
+                        "METHOD=POST url=%s%s sign_path=%r headers=%s "
+                        "+ session Content-Type: application/json | body=%s",
+                        self._base_url,
+                        path,
+                        sign_path,
+                        h_disp,
+                        body_str,
+                    )
+                kw: dict[str, Any] = {"headers": headers}
+                # Send the exact UTF-8 we signed — aiohttp's json= may reorder keys / spacing.
+                if json_body is not None and body_str:
+                    kw["data"] = body_str.encode("utf-8")
+                elif json_body is not None:
+                    kw["json"] = json_body
+                async with session.request(method, path, **kw) as resp:
                     if resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", backoff))
                         log.warning(f"Rate-limited; waiting {retry_after:.1f}s")

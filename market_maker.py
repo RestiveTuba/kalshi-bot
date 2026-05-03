@@ -37,15 +37,17 @@ import ssl
 # ---------------------------------------------------------------------------
 SERIES                     = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 ACTIVATE_MINS_BEFORE_CLOSE = 8
-HARD_CLOSE_SECS             = 30
-PAPER_MODE                  = False  # must stay True unless you change code + accept live risk
+HARD_CLOSE_SECS             = 120
+PAPER_MODE                  = True  # must stay True unless you change code + accept live risk
 
-POLL_INTERVAL_SEC           = 2.0     # fast enough to hit hard-close window
-REQUOTE_CHECK_INTERVAL_SEC  = 30.0    # mid-drift / live order check cadence
+POLL_INTERVAL_SEC           = 2.0     # live: poll portfolio/orders every ~2s for fills
+REQUOTE_CHECK_INTERVAL_SEC  = 30.0    # mid-drift / repost cadence
 MID_MOVE_REQUOTE_CENTS    = 3.0
 MAX_LIMIT_CENTS           = 90
 ORDER_COUNT               = 1       # contracts per quote leg
-MAX_YES_INVENTORY         = 10      # pause YES quotes while above this net YES contracts
+MAX_YES_INVENTORY_PAPER   = 10      # paper: max net YES contracts from simulated fills
+MAX_YES_INVENTORY_LIVE    = 2       # live: max YES inventory; also hard-block new YES at >=2
+LIVE_UNPAIRED_YES_HEDGE_SEC = 30.0  # live: if Y > N for this long, market-sell unpaired YES count
 
 # Paper: each poll in the activation window, open YES/NO orders fill independently
 # at this probability (no bid-cross check — P&L test harness).
@@ -161,7 +163,7 @@ def _load_settings() -> dict[str, str]:
 
 
 class _SimpleClient:
-    """Async Kalshi REST client with RSA-PSS auth — copy of momentum_bot."""
+    """Stripped-down async Kalshi REST client with RSA-PSS auth."""
 
     def __init__(self) -> None:
         env = _load_settings()
@@ -177,24 +179,20 @@ class _SimpleClient:
         self._private_key = None
         if key_path.exists() and self._key_id:
             from cryptography.hazmat.primitives import serialization
-
             self._private_key = serialization.load_pem_private_key(
                 key_path.read_bytes(), password=None
             )
         else:
-            log.warning(
-                "No API key / private key found — read-only markets; paper quotes only simulated"
-            )
+            log.warning("No API key / private key found — running read-only (public endpoints only)")
 
         self._session: Optional[aiohttp.ClientSession] = None
 
-    def _sign(self, method: str, path: str, body: str = ""):
+    def _sign(self, method: str, path: str):
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-
         ts = str(int(time.time() * 1000))
-        msg = ts + method.upper() + path + body
-        assert self._private_key is not None
+        # Kalshi: sign timestamp + METHOD + path only (never the HTTP body).
+        msg = ts + method.upper() + path
         sig = self._private_key.sign(
             msg.encode(),
             asym_padding.PSS(
@@ -205,10 +203,10 @@ class _SimpleClient:
         )
         return base64.b64encode(sig).decode(), ts
 
-    def _auth_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
+    def _auth_headers(self, method: str, path: str) -> dict:
         if not self._private_key:
             return {}
-        sig, ts = self._sign(method, path, body)
+        sig, ts = self._sign(method, path)
         return {
             "KALSHI-ACCESS-KEY": self._key_id,
             "KALSHI-ACCESS-SIGNATURE": sig,
@@ -230,46 +228,42 @@ class _SimpleClient:
         path = path.lstrip("/")
         qs = "?" + urlencode(params) if params else ""
         full_path = path + qs
-        sign_path = "/trade-api/v2/" + path
-        return await self._request("GET", full_path, sign_path=sign_path)
+        return await self._request("GET", full_path)
 
     async def post(self, path: str, body: dict) -> dict[str, Any]:
         import json as _json
-
         path = path.lstrip("/")
         body_str = _json.dumps(body)
-        sign_path = "/trade-api/v2/" + path
-        return await self._request(
-            "POST", path, sign_path=sign_path, body_str=body_str, json_body=body
-        )
+        return await self._request("POST", path,
+                                   body_str=body_str, json_body=body)
 
     async def delete(self, path: str) -> dict[str, Any]:
         path = path.lstrip("/")
-        sign_path = "/trade-api/v2/" + path
-        return await self._request("DELETE", path, sign_path=sign_path)
+        return await self._request("DELETE", path)
 
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        sign_path: str,
-        body_str: str = "",
-        json_body: Optional[dict] = None,
-    ) -> dict[str, Any]:
+    async def _request(self, method: str, path: str, *,
+                       body_str: str = "", json_body: Optional[dict] = None) -> dict[str, Any]:
         session = await self._get_session()
         backoff = _BASE_BACKOFF
         last_exc: Exception = RuntimeError("no attempts")
 
         for attempt in range(_MAX_RETRIES):
             try:
-                headers = self._auth_headers(method, sign_path, body_str)
-                async with session.request(
-                    method, path, headers=headers, json=json_body
-                ) as resp:
+                # RSA path must never include "?query=..." — only the resource path segment.
+                url_path = path.lstrip("/")
+                path_for_sig = url_path.split("?")[0]
+                sign_path_use = "/trade-api/v2/" + path_for_sig
+                headers = self._auth_headers(method, sign_path_use)
+                kw: dict[str, Any] = {"headers": headers}
+                # HTTP body is not part of the signature; use stable JSON bytes for POST.
+                if json_body is not None and body_str:
+                    kw["data"] = body_str.encode("utf-8")
+                elif json_body is not None:
+                    kw["json"] = json_body
+                async with session.request(method, url_path, **kw) as resp:
                     if resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", backoff))
-                        log.warning("Rate-limited; waiting %.1fs", retry_after)
+                        log.warning(f"Rate-limited; waiting {retry_after:.1f}s")
                         await asyncio.sleep(retry_after)
                         backoff *= 2
                         continue
@@ -277,7 +271,7 @@ class _SimpleClient:
                     return await resp.json()
             except aiohttp.ClientError as exc:
                 last_exc = exc
-                log.warning("Request error (attempt %d): %s", attempt + 1, exc)
+                log.warning(f"Request error (attempt {attempt+1}): {exc}")
                 await asyncio.sleep(backoff)
                 backoff *= 2
 
@@ -325,7 +319,23 @@ def seconds_until_close(raw: dict) -> Optional[float]:
 async def fetch_active_market(client: _SimpleClient, series: str) -> Optional[dict]:
     try:
         data = await client.get("markets", params={"series_ticker": series, "limit": 100})
-        markets = data.get("markets", [])
+        markets = data.get("markets") or []
+        n = len(markets)
+        log.info("[%s] fetch_active_market: Kalshi returned %d market(s)", series, n)
+        detail_cap = 40
+        for i, m in enumerate(markets):
+            if i >= detail_cap:
+                log.info("[%s] fetch_active_market: ... %d more not listed", series, n - detail_cap)
+                break
+            log.info(
+                "[%s]   [%s] ticker=%s status=%s open_time=%s close_time=%s",
+                series,
+                i,
+                m.get("ticker"),
+                m.get("status"),
+                m.get("open_time"),
+                m.get("close_time"),
+            )
         if not markets:
             return None
         now = datetime.now(timezone.utc)
@@ -347,6 +357,7 @@ async def fetch_active_market(client: _SimpleClient, series: str) -> Optional[di
             and parse_dt(m.get("close_time")) > now
         ]
         if not active:
+            log.info("[%s] fetch_active_market: 0 markets in open window (now=%s UTC)", series, now.isoformat())
             return None
         active.sort(key=lambda m: m.get("close_time", ""))
         return active[0]
@@ -383,9 +394,28 @@ class MMState:
     # HARD_CLOSE flattens once per session; avoid repeating every poll
     hard_close_sent: bool = False
     skip_yes_tight_spread: bool = False  # latched YES off for session once spread too thin
+    # Live: portfolio/balance (¢) at session start — compared at SESSION_ROTATION/HARD_CLOSE
+    session_live_balance_start_cents: Optional[int] = None
+    # Live: cumulative contracts already applied from GET portfolio/orders (partial fills)
+    live_y_fill_tracked: int = 0
+    live_n_fill_tracked: int = 0
+    # Live: YES inventory > NO inventory continuously since this monotonic timestamp (seconds)
+    live_unpaired_yes_since_monotonic: Optional[float] = None
+    # Live: guard duplicate POSTs while a yes-inventory exit is in flight / pending re-sync
+    live_yes_inventory_exit_armed: bool = True
 
 
+# Cumulative realized P&L per UTC calendar day (USD); updated in _flatten_all via _record_realized_pnl
 _daily_pnl: dict[str, float] = {}
+
+
+def _max_yes_inventory() -> int:
+    return MAX_YES_INVENTORY_PAPER if PAPER_MODE else MAX_YES_INVENTORY_LIVE
+
+
+def _live_yes_orders_absolutely_blocked(st: MMState) -> bool:
+    """Live only: never post another YES if we already hold >= 2 YES contracts."""
+    return (not PAPER_MODE) and len(st.yes_prices) >= MAX_YES_INVENTORY_LIVE
 
 
 def _get_today_pnl() -> float:
@@ -416,6 +446,11 @@ def _reset_session_state(st: MMState) -> None:
     st.telegram_close_sent = False
     st.hard_close_sent = False
     st.skip_yes_tight_spread = False
+    st.session_live_balance_start_cents = None
+    st.live_y_fill_tracked = 0
+    st.live_n_fill_tracked = 0
+    st.live_unpaired_yes_since_monotonic = None
+    st.live_yes_inventory_exit_armed = True
 
 
 def _eligible_to_post_no(st: MMState) -> bool:
@@ -435,6 +470,213 @@ def _target_yes_limit(yes_bid: float) -> float:
 
 def _target_no_limit(no_bid: float) -> float:
     return min(no_bid + 1.0, float(MAX_LIMIT_CENTS))
+
+
+def _order_filled_contracts(o: dict[str, Any]) -> int:
+    """Best-effort filled count from Kalshi order object (handles _fp aliases)."""
+    for k in (
+        "filled_count",
+        "fill_count",
+        "filled_count_fp",
+        "fill_count_fp",
+        "contracts_filled",
+    ):
+        v = o.get(k)
+        if v is None:
+            continue
+        try:
+            return max(0, int(float(str(v))))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _order_terminal(status: str) -> bool:
+    s = status.lower().strip()
+    return s in ("executed", "canceled", "cancelled")
+
+
+def _order_remaining_contracts(o: dict[str, Any]) -> Optional[int]:
+    for k in (
+        "remaining_count",
+        "remaining_count_fp",
+        "remaining_quantity",
+        "open_count",
+    ):
+        v = o.get(k)
+        if v is None:
+            continue
+        try:
+            return max(0, int(float(str(v))))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _order_done(o: dict[str, Any], status: str, filled: int) -> bool:
+    if _order_terminal(status):
+        return True
+    rem = _order_remaining_contracts(o)
+    if rem == 0 and filled > 0:
+        return True
+    tgt = ORDER_COUNT
+    for k in ("count", "initial_count", "contracts_count", "order_count"):
+        v = o.get(k)
+        if v is not None:
+            try:
+                tgt = max(1, int(float(str(v))))
+            except (TypeError, ValueError):
+                pass
+            break
+    # Some responses omit remaining_*; treat filled >= order size as complete.
+    return rem is None and filled >= tgt and tgt > 0
+
+
+def _sync_unpaired_yes_timer(st: MMState) -> None:
+    """Start/stop 30s unpaired-YES hedge clock (live semantics)."""
+    y, n = len(st.yes_prices), len(st.no_prices)
+    if y <= n:
+        st.live_unpaired_yes_since_monotonic = None
+        st.live_yes_inventory_exit_armed = True
+    elif st.live_unpaired_yes_since_monotonic is None:
+        st.live_unpaired_yes_since_monotonic = time.monotonic()
+
+
+async def _live_poll_resting_orders(
+    client: _SimpleClient, st: MMState, ts: str, series: str,
+) -> None:
+    """
+    Poll GET portfolio/orders/{id} (~every POLL_INTERVAL_SEC) for resting YES/NO buys.
+    Apply new fills to deques at posted limits; drop ids when executed/canceled.
+    """
+    if PAPER_MODE or not client._private_key:
+        return
+
+    async def _one(side_yes: bool) -> None:
+        oid = st.yes_order_id if side_yes else st.no_order_id
+        posted = st.posted_yes_limit if side_yes else st.posted_no_limit
+        dq = st.yes_prices if side_yes else st.no_prices
+        tracked_attr = "live_y_fill_tracked" if side_yes else "live_n_fill_tracked"
+        tracked = getattr(st, tracked_attr, 0)
+        if not oid or oid.startswith("MM_"):
+            setattr(st, tracked_attr, 0)
+            return
+        try:
+            r = await client.get(f"portfolio/orders/{oid}")
+        except Exception as exc:
+            log.warning("[%s] %s live order poll failed %s: %s", series, ts, oid, exc)
+            return
+        o = r.get("order") if isinstance(r.get("order"), dict) else r
+        if not isinstance(o, dict):
+            log.warning("[%s] %s live order poll bad shape for %s: %r", series, ts, oid, r)
+            return
+        status = str(o.get("status", "") or "")
+        filled = _order_filled_contracts(o)
+        delta = max(0, filled - tracked)
+        cap = _max_yes_inventory() if side_yes else 10**9
+        if side_yes and delta and len(st.yes_prices) + delta > cap:
+            log.warning(
+                "[%s] %s live YES fill would exceed cap; truncating delta %d→%d",
+                series, ts, delta, max(0, cap - len(st.yes_prices)),
+            )
+            delta = max(0, cap - len(st.yes_prices))
+        lim = posted
+        if lim <= 0:
+            lim = float(o.get("yes_price") or o.get("no_price") or 0.0)
+        for _ in range(delta):
+            dq.append(lim)
+        setattr(st, tracked_attr, tracked + delta)
+        if delta:
+            log.info(
+                "[%s] %s LIVE FILL %s +%d @ %.1f¢ (inv y=%d n=%d) status=%s",
+                series,
+                ts,
+                "YES" if side_yes else "NO",
+                delta,
+                lim,
+                len(st.yes_prices),
+                len(st.no_prices),
+                status,
+            )
+        if _order_done(o, status, filled):
+            if side_yes:
+                st.yes_order_id = ""
+                st.posted_yes_limit = 0.0
+            else:
+                st.no_order_id = ""
+                st.posted_no_limit = 0.0
+            setattr(st, tracked_attr, 0)
+
+    await _one(True)
+    await _one(False)
+    _sync_unpaired_yes_timer(st)
+
+
+async def _live_market_sell_yes_inventory_if_stale(
+    client: _SimpleClient, st: MMState, ticker: str, ts: str, series: str,
+) -> None:
+    """
+    Live only: if YES inventory exceeds NO for LIVE_UNPAIRED_YES_HEDGE_SEC, market-sell all YES contracts.
+    count = len(yes_prices) (yes_inventory) per hedge spec.
+    """
+    if (
+        PAPER_MODE
+        or not client._private_key
+        or not ticker
+        or not st.live_yes_inventory_exit_armed
+    ):
+        return
+    y, n = len(st.yes_prices), len(st.no_prices)
+    if y <= n or st.live_unpaired_yes_since_monotonic is None:
+        return
+    elapsed = time.monotonic() - st.live_unpaired_yes_since_monotonic
+    if elapsed < LIVE_UNPAIRED_YES_HEDGE_SEC:
+        return
+    qty = len(st.yes_prices)
+    if qty <= 0:
+        return
+
+    await _cancel_both_quotes(client, st, ts, poll_live_orders=False)
+    body = {
+        "ticker": ticker,
+        "client_order_id": _uuid_mod.uuid4().hex,
+        "side": "yes",
+        "action": "sell",
+        "type": "market",
+        "count": qty,
+        "reduce_only": True,
+    }
+    log.warning(
+        "[%s] %s LIVE unpaired YES ≥%.0fs → market SELL YES ×%d (no=%d)",
+        series, ts, LIVE_UNPAIRED_YES_HEDGE_SEC, qty, n,
+    )
+    st.live_yes_inventory_exit_armed = False
+
+    async def _post_sell(b: dict[str, Any]) -> None:
+        await client.post("portfolio/orders", b)
+
+    try:
+        try:
+            await _post_sell(body)
+        except Exception as exc1:
+            body_plain = dict(body)
+            if "reduce_only" not in body_plain:
+                raise
+            body_plain.pop("reduce_only", None)
+            log.warning("[%s] %s market sell retry without reduce_only (first err: %s)", series, ts, exc1)
+            await _post_sell(body_plain)
+    except Exception as exc:
+        log.error("[%s] %s LIVE market sell YES failed: %s — will retry after re-arm", series, ts, exc)
+        st.live_yes_inventory_exit_armed = True
+        return
+    for _ in range(qty):
+        if st.yes_prices:
+            st.yes_prices.popleft()
+    _sync_unpaired_yes_timer(st)
+    log.info(
+        "[%s] %s LIVE market sell YES done (yes_inv now %d no=%d)",
+        series, ts, len(st.yes_prices), len(st.no_prices),
+    )
 
 
 async def _cancel_order(client: _SimpleClient, order_id: str, ts: str, series: str) -> None:
@@ -501,9 +743,12 @@ async def _cancel_resting_no_if_ineligible(client: _SimpleClient, st: MMState, t
     """Cancel resting NO when inventory rules disallow new NO quoting."""
     if not st.no_order_id or _eligible_to_post_no(st):
         return
+    if not PAPER_MODE and client._private_key:
+        await _live_poll_resting_orders(client, st, ts, st.series)
     await _cancel_order(client, st.no_order_id, ts, st.series)
     st.no_order_id = ""
     st.posted_no_limit = 0.0
+    st.live_n_fill_tracked = 0
     log.info(
         "[%s] %s cancelled resting NO (yes_inv=%d no_inv=%d)",
         st.series,
@@ -512,24 +757,6 @@ async def _cancel_resting_no_if_ineligible(client: _SimpleClient, st: MMState, t
         len(st.no_prices),
     )
 
-
-async def _order_is_live(
-    client: _SimpleClient, order_id: str, series: str, ts: str
-) -> bool:
-    """False if filled/cancelled/unknown."""
-    if not order_id:
-        return False
-    if PAPER_MODE or order_id.startswith("MM_"):
-        return True
-    try:
-        r = await client.get(f"portfolio/orders/{order_id}")
-        st = str(r.get("order", {}).get("status", "")).lower()
-        return st in ("resting", "pending")
-    except Exception as exc:
-        log.warning("[%s] %s order status check failed: %s", series, ts, exc)
-        return True
-
-
 def _maybe_fill_yes(st: MMState, ts: str) -> None:
     """Paper: open YES order may fill each poll (activation window) with fixed probability."""
     if not PAPER_MODE or not st.yes_order_id or st.posted_yes_limit <= 0:
@@ -537,7 +764,7 @@ def _maybe_fill_yes(st: MMState, ts: str) -> None:
     lim = st.posted_yes_limit
     if random.random() >= PAPER_YES_FILL_PROBABILITY_PER_POLL:
         return
-    if len(st.yes_prices) + ORDER_COUNT > MAX_YES_INVENTORY:
+    if len(st.yes_prices) + ORDER_COUNT > _max_yes_inventory():
         return
     for _ in range(ORDER_COUNT):
         st.yes_prices.append(lim)
@@ -576,6 +803,89 @@ def _pair_pnl_usd(yes_cents: float, no_cents: float) -> float:
 MM_TRADES_JSONL = Path(__file__).resolve().parent / "market_maker_trades.jsonl"
 
 
+def _coerce_balance_cent_int(raw: Any) -> Optional[int]:
+    """Kalshi REST returns cents as integers for portfolio/balance."""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return None
+
+
+def _format_live_positions_hint(market_positions: list[dict], limit: int = 12) -> tuple[int, str]:
+    hints: list[str] = []
+    n_nonzero = 0
+    for p in market_positions:
+        ticker = str(p.get("ticker") or "")
+        pf = p.get("position_fp")
+        q = None
+        if pf is not None:
+            try:
+                q = float(str(pf).strip())
+            except ValueError:
+                q = None
+        if q is None or abs(q) < 1e-9:
+            continue
+        n_nonzero += 1
+        if len(hints) < limit:
+            hints.append(f"{ticker}:{pf}")
+    return n_nonzero, ", ".join(hints) if hints else "(flat)"
+
+
+async def _fetch_live_session_pnl(client: _SimpleClient) -> dict[str, Any]:
+    """
+    GET portfolio/balance + portfolio/positions for live session P&L context.
+    Returns balance/portfolio_value in cents and normalized market_positions list.
+    """
+    if not client._private_key:
+        raise RuntimeError("Kalshi client has no signing key")
+
+    balance_resp = await client.get("portfolio/balance")
+    positions_resp = await client.get("portfolio/positions", params={"limit": 100})
+
+    bal_cents = _coerce_balance_cent_int(balance_resp.get("balance"))
+    pv_cents = _coerce_balance_cent_int(balance_resp.get("portfolio_value"))
+
+    mps_raw = positions_resp.get("market_positions")
+    market_positions = mps_raw if isinstance(mps_raw, list) else []
+    n_pos, tick_hint = _format_live_positions_hint(market_positions)
+
+    return {
+        "balance_cents": bal_cents,
+        "portfolio_value_cents": pv_cents,
+        "market_positions": market_positions,
+        "positions_nonzero": n_pos,
+        "positions_hint": tick_hint,
+    }
+
+
+async def _capture_live_session_balance_start(client: _SimpleClient, st: MMState) -> None:
+    """After a new ticker is assigned in live mode, snapshot available balance (¢) for ΔP&L."""
+    if PAPER_MODE:
+        return
+    if not client._private_key:
+        return
+    try:
+        snap = await _fetch_live_session_pnl(client)
+        bc = snap.get("balance_cents")
+        if bc is not None:
+            st.session_live_balance_start_cents = int(bc)
+            log.info(
+                "[%s] live session balance_start=%dc (positions_nonzero=%s)",
+                st.series,
+                st.session_live_balance_start_cents,
+                snap.get("positions_nonzero"),
+            )
+        else:
+            log.warning("[%s] live session: balance response missing `balance`", st.series)
+    except Exception as exc:
+        log.warning("[%s] live session: could not snapshot start balance: %s", st.series, exc)
+
+
 def _append_mm_trades_hard_close(
     series: str, qualifying_pairs: list[tuple[float, float]], entry_time: str,
 ) -> None:
@@ -592,22 +902,62 @@ def _append_mm_trades_hard_close(
                     "yes_price_cents": round(float(yc), 4),
                     "no_price_cents": round(float(nc), 4),
                     "pnl_dollars": round(pnl_u, 4),
-                    "paper": bool(PAPER_MODE),
+                    "paper": PAPER_MODE,
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as exc:
         log.warning("[%s] market_maker_trades.jsonl append failed: %s", series, exc)
 
 
-def _flatten_all(
-    st: MMState, _yes_bid: float, _no_bid: float, reason: str, ts: str,
+def _append_mm_trades_balance_close(
+    series: str,
+    ticker: str,
+    qualifying_pairs: list[tuple[float, float]],
+    close_iso: str,
+    reason: str,
+    live_pnl_usd: float,
+    bal_start_cents: Optional[int],
+    bal_end_cents: Optional[int],
+    pv_end_cents: Optional[int],
+) -> None:
+    """Single JSON line for live session realized P&L from Kalshi balance delta."""
+    row: dict[str, Any] = {
+        "entry_time": close_iso,
+        "series": series,
+        "ticker": ticker,
+        "close_reason": reason,
+        "pnl_dollars": round(float(live_pnl_usd), 4),
+        "paper": False,
+        "pnl_source": "kalshi_balance_delta",
+        "balance_start_cents": bal_start_cents,
+        "balance_end_cents": bal_end_cents,
+        "portfolio_value_end_cents": pv_end_cents,
+        # Pair inventory for bookkeeping (paired model); not authoritative in live mode
+        "qualifying_pairs": len(qualifying_pairs),
+        "yes_price_cents": 0.0,
+        "no_price_cents": 0.0,
+    }
+    try:
+        with open(MM_TRADES_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log.warning("[%s] market_maker balance-close jsonl append failed: %s", series, exc)
+
+
+async def _flatten_all(
+    client: Optional[_SimpleClient],
+    st: MMState,
+    _yes_bid: float,
+    _no_bid: float,
+    reason: str,
+    ts: str,
 ) -> None:
     """
-    Session close: FIFO-match YES/NO contracts; **P&L only** on pairs with
-    MIN_PAIRED_YES_NO_COST_CENTS <= YES_price + NO_price <= MAX_PAIRED_YES_NO_COST_CENTS
-    (profitable boxed payout — excludes impossible sim arbs and overpaid pairs).
-    Non-qualifying FIFO pairs discard at $0. Unpaired legs discard at $0.
-    At most **one Telegram** per ticker per session via `telegram_close_sent`.
+    Session close: FIFO-match YES/NO contracts (inventory model).
+
+    **Paper:** P&L from qualifying YES+NO pairs.
+    **Live:** After portfolio GETs, prefer **Kalshi balance Δ** (session start → now)
+    for realized P&L, logging, Telegram, daily ledger, and JSONL.
     """
     paired_qualifying: list[tuple[float, float]] = []
     discarded_arb_pairs = 0
@@ -635,17 +985,94 @@ def _flatten_all(
         st.no_prices.popleft()
         orphan_n += 1
 
-    close_iso = ""
+    live_snap: Optional[dict[str, Any]] = None
+    live_balance_end: Optional[int] = None
+    live_pv_end: Optional[int] = None
+    live_pnl_usd: Optional[float] = None
+
+    if (
+        not PAPER_MODE
+        and client is not None
+        and client._private_key
+        and reason in ("HARD_CLOSE", "SESSION_ROTATION")
+    ):
+        try:
+            live_snap = await _fetch_live_session_pnl(client)
+            live_balance_end = live_snap.get("balance_cents")
+            live_pv_end = live_snap.get("portfolio_value_cents")
+            if (
+                live_balance_end is not None
+                and st.session_live_balance_start_cents is not None
+            ):
+                live_pnl_usd = (live_balance_end - st.session_live_balance_start_cents) / 100.0
+                log.info(
+                    "[%s] %s kalshi_balance Δ¢ %s→%s realized=$%+.4f | nonzero_pos=%s | %s",
+                    st.series,
+                    reason,
+                    st.session_live_balance_start_cents,
+                    live_balance_end,
+                    live_pnl_usd,
+                    live_snap.get("positions_nonzero"),
+                    str(live_snap.get("positions_hint"))[:200],
+                )
+            elif live_snap:
+                log.warning(
+                    "[%s] %s live balance Δ unavailable (start=%r end=%r) — pair P&L fallback",
+                    st.series,
+                    reason,
+                    st.session_live_balance_start_cents,
+                    live_balance_end,
+                )
+        except Exception as exc:
+            log.warning(
+                "[%s] %s portfolio/balance fetch failed: %s — pair P&L fallback",
+                st.series,
+                reason,
+                exc,
+            )
+
+    realized_usd = pnl_pairs
+    if not PAPER_MODE and live_pnl_usd is not None:
+        realized_usd = live_pnl_usd
+
+    close_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if reason == "HARD_CLOSE":
-        close_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
+        if PAPER_MODE:
+            _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
+        elif live_pnl_usd is not None:
+            _append_mm_trades_balance_close(
+                st.series,
+                st.ticker,
+                paired_qualifying,
+                close_iso,
+                reason,
+                live_pnl_usd,
+                st.session_live_balance_start_cents,
+                live_balance_end,
+                live_pv_end,
+            )
+        else:
+            _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
+    elif reason == "SESSION_ROTATION" and not PAPER_MODE and live_pnl_usd is not None:
+        _append_mm_trades_balance_close(
+            st.series,
+            st.ticker,
+            paired_qualifying,
+            close_iso,
+            reason,
+            live_pnl_usd,
+            st.session_live_balance_start_cents,
+            live_balance_end,
+            live_pv_end,
+        )
 
     total_move = (
         paired_qualifying or discarded_arb_pairs or orphan_y or orphan_n
+        or live_pnl_usd is not None
     )
     log.info(
         "[%s] %s %s | qualifying_pairs=%d discarded_arb_pairs=%d "
-        "orphan_YES=%d orphan_NO=%d | pair_P&L=$%+.4f",
+        "orphan_YES=%d orphan_NO=%d | pair_model=$%+.4f | realized=$%+.4f%s",
         st.series,
         ts,
         reason,
@@ -654,54 +1081,106 @@ def _flatten_all(
         orphan_y,
         orphan_n,
         pnl_pairs,
+        realized_usd,
+        (" (kalshi_balance)" if (not PAPER_MODE and live_pnl_usd is not None) else ""),
+    )
+
+    lines = []
+    for i, (yc, nc) in enumerate(paired_qualifying, 1):
+        pu = _pair_pnl_usd(yc, nc)
+        lines.append(f"  {i}) YES@{yc:.0f}¢ + NO@{nc:.0f}¢ (${pu:+.4f})")
+    discard_line = (
+        (
+            f"discarded paired (YES+NO not in {MIN_PAIRED_YES_NO_COST_CENTS}–"
+            f"{MAX_PAIRED_YES_NO_COST_CENTS}¢): "
+            f"{discarded_arb_pairs} ($0 P&L)\n"
+        )
+        if discarded_arb_pairs
+        else ""
+    )
+    kalshi_blk = ""
+    if (
+        not PAPER_MODE
+        and live_snap
+        and (
+            live_balance_end is not None
+            or live_snap.get("portfolio_value_cents") is not None
+        )
+    ):
+        ks = live_snap.get("balance_cents")
+        kalshi_blk = (
+            f"Kalshi portfolio/balance snapshot\n"
+            f"balance: {st.session_live_balance_start_cents}¢ → {ks}¢\n"
+            f"portfolio_value: {live_snap.get('portfolio_value_cents')}¢\n"
+        )
+        if live_pnl_usd is not None:
+            kalshi_blk += f"Realized Δ (balance): ${live_pnl_usd:+.4f}\n"
+        else:
+            kalshi_blk += "Realized Δ: n/a (no session balance_start snapshot)\n"
+        kalshi_blk += (
+            f"market_positions (non-zero): "
+            f"{live_snap.get('positions_nonzero', 0)}\n"
+            f"{live_snap.get('positions_hint', '')[:900]}\n"
+        )
+
+    if not PAPER_MODE and live_pnl_usd is not None:
+        pnl_footer = (
+            "internal deque pair-model (not authoritative for live): "
+            f"${pnl_pairs:+.4f}\n"
+        )
+    else:
+        pnl_footer = f"pair-model P&L: ${pnl_pairs:+.4f}\n"
+
+    cum_after = st.session_pnl + realized_usd
+
+    body = (
+        f"MM [{st.series}] {reason}\n"
+        + (kalshi_blk if kalshi_blk else "")
+        + f"ticker {st.ticker}\n"
+        + f"realized credited: ${realized_usd:+.4f}\n"
+        + f"pairs {MIN_PAIRED_YES_NO_COST_CENTS}≤YES+NO≤{MAX_PAIRED_YES_NO_COST_CENTS}¢: "
+        + f"{len(paired_qualifying)}\n"
+        + ("\n".join(lines) if lines else "  (none — paired fills outside cost band)\n")
+        + discard_line
+        + pnl_footer
+        + f"discarded unpaired: YES×{orphan_y} NO×{orphan_n} (not in P&L)\n"
+        + f"cumulative sess (after this close): ${cum_after:+.4f}"
     )
 
     if total_move:
-        lines = []
-        for i, (yc, nc) in enumerate(paired_qualifying, 1):
-            pu = _pair_pnl_usd(yc, nc)
-            lines.append(f"  {i}) YES@{yc:.0f}¢ + NO@{nc:.0f}¢ (${pu:+.4f})")
-        discard_line = (
-            (
-                f"discarded paired (YES+NO not in {MIN_PAIRED_YES_NO_COST_CENTS}–"
-                f"{MAX_PAIRED_YES_NO_COST_CENTS}¢): "
-                f"{discarded_arb_pairs} ($0 P&L)\n"
-            )
-            if discarded_arb_pairs
-            else ""
-        )
-        body = (
-            f"MM [{st.series}] {reason}\n"
-            f"ticker {st.ticker}\n"
-            f"pairs {MIN_PAIRED_YES_NO_COST_CENTS}≤YES+NO≤{MAX_PAIRED_YES_NO_COST_CENTS}¢: "
-            f"{len(paired_qualifying)}\n"
-            + ("\n".join(lines) if lines else "  (none — paired fills outside cost band)\n")
-            + discard_line
-            + f"pair P&L: ${pnl_pairs:+.4f}\n"
-            f"discarded unpaired: YES×{orphan_y} NO×{orphan_n} (not in P&L)\n"
-            f"cumulative sess: ${st.session_pnl + pnl_pairs:+.4f}"
-        )
         log.info("[%s] session close detail:\n%s", st.series, body.replace("\n", " | "))
-        if not st.telegram_close_sent:
-            _tg_alert(body[:3900])
-            st.telegram_close_sent = True
 
-    if pnl_pairs:
-        st.session_pnl += pnl_pairs
-        _record_realized_pnl(pnl_pairs)
-        if pnl_pairs <= -SESSION_HALT_MIN_LOSS_USD:
+    tg_close_reasons = ("HARD_CLOSE", "SESSION_ROTATION")
+    if reason in tg_close_reasons and not st.telegram_close_sent:
+        mode_tag = "📄 PAPER" if PAPER_MODE else "🟢 LIVE"
+        _tg_alert(f"{mode_tag}\n{body}"[:3900])
+        st.telegram_close_sent = True
+
+    if realized_usd:
+        st.session_pnl += realized_usd
+        _record_realized_pnl(realized_usd)
+        if realized_usd <= -SESSION_HALT_MIN_LOSS_USD:
             st.session_halted = True
 
 
 async def _cancel_both_quotes(
-    client: _SimpleClient, st: MMState, ts: str,
+    client: _SimpleClient, st: MMState, ts: str, *, poll_live_orders: bool = True,
 ) -> None:
+    if (
+        poll_live_orders
+        and not PAPER_MODE
+        and client._private_key
+        and (st.yes_order_id or st.no_order_id)
+    ):
+        await _live_poll_resting_orders(client, st, ts, st.series)
     await _cancel_order(client, st.yes_order_id, ts, st.series)
     await _cancel_order(client, st.no_order_id, ts, st.series)
     st.yes_order_id = ""
     st.no_order_id = ""
     st.posted_yes_limit = 0.0
     st.posted_no_limit = 0.0
+    st.live_y_fill_tracked = 0
+    st.live_n_fill_tracked = 0
 
 
 async def _post_both_sides(
@@ -725,7 +1204,8 @@ async def _post_both_sides(
     )
     post_yes = (
         not blocked
-        and len(st.yes_prices) + ORDER_COUNT <= MAX_YES_INVENTORY
+        and not _live_yes_orders_absolutely_blocked(st)
+        and len(st.yes_prices) + ORDER_COUNT <= _max_yes_inventory()
         and not st.skip_yes_tight_spread
     )
     if post_yes and y_lim + no_bid > float(YES_LIMIT_PLUS_NO_BID_MAX):
@@ -746,7 +1226,16 @@ async def _post_both_sides(
             client, ticker, "YES", y_lim, ts, st.series
         )
         st.posted_yes_limit = y_lim if st.yes_order_id else 0.0
-    elif len(st.yes_prices) >= MAX_YES_INVENTORY:
+        if st.yes_order_id and not PAPER_MODE and not st.yes_order_id.startswith("MM_"):
+            st.live_y_fill_tracked = 0
+    elif _live_yes_orders_absolutely_blocked(st):
+        log.info(
+            "[%s] %s SKIP YES quote — LIVE hard stop (yes_inv>=%d)",
+            st.series, ts, MAX_YES_INVENTORY_LIVE,
+        )
+        st.yes_order_id = ""
+        st.posted_yes_limit = 0.0
+    elif len(st.yes_prices) >= _max_yes_inventory():
         log.info(
             "[%s] %s SKIP YES quote — at YES cap (%d contracts)",
             st.series, ts, len(st.yes_prices),
@@ -759,6 +1248,8 @@ async def _post_both_sides(
             client, ticker, "NO", n_lim, ts, st.series
         )
         st.posted_no_limit = n_lim if st.no_order_id else 0.0
+        if st.no_order_id and not PAPER_MODE and not st.no_order_id.startswith("MM_"):
+            st.live_n_fill_tracked = 0
     else:
         if not blocked and (
             len(st.yes_prices) < 1
@@ -810,13 +1301,14 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 await _cancel_both_quotes(client, st, ts0)
                 pyb = st.prev_yes_bid or yes_bid
                 pnb = st.prev_no_bid or no_bid
-                _flatten_all(st, pyb, pnb, "SESSION_ROTATION", ts0)
+                await _flatten_all(client, st, pyb, pnb, "SESSION_ROTATION", ts0)
                 log.info("[%s] Session rotation %s → %s", series, st.ticker, ticker)
 
             if ticker != st.ticker:
                 _reset_session_state(st)
                 st.ticker = ticker
                 log.info("[%s] New session ticker=%s", series, ticker)
+                await _capture_live_session_balance_start(client, st)
 
             in_window = (
                 secs_left is not None and 0 < secs_left <= ACTIVATE_MINS_BEFORE_CLOSE * 60
@@ -858,9 +1350,12 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                     YES_LIMIT_PLUS_NO_BID_MAX,
                 )
                 if st.yes_order_id:
+                    if not PAPER_MODE and client._private_key:
+                        await _live_poll_resting_orders(client, st, ts, series)
                     await _cancel_order(client, st.yes_order_id, ts, series)
                     st.yes_order_id = ""
                     st.posted_yes_limit = 0.0
+                    st.live_y_fill_tracked = 0
 
             # Risk: daily circuit
             if _get_today_pnl() <= -DAILY_LOSS_LIMIT_USD:
@@ -874,7 +1369,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             if secs_left is not None and secs_left <= HARD_CLOSE_SECS:
                 if not st.hard_close_sent:
                     await _cancel_both_quotes(client, st, ts)
-                    _flatten_all(st, yes_bid, no_bid, "HARD_CLOSE", ts)
+                    await _flatten_all(client, st, yes_bid, no_bid, "HARD_CLOSE", ts)
                     st.hard_close_sent = True
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -883,15 +1378,19 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             if PAPER_MODE:
                 _maybe_fill_yes(st, ts)
                 _maybe_fill_no(st, ts)
+            else:
+                await _live_poll_resting_orders(client, st, ts, series)
+                await _live_market_sell_yes_inventory_if_stale(client, st, ticker, ts, series)
 
             await _cancel_resting_no_if_ineligible(client, st, ts)
 
-            # 30s check: live order status + mid drift
+            # 30s check: live order resting + mid drift (fills come from polled GET each loop)
             now = time.time()
             want_yes = (
                 _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
-                and len(st.yes_prices) + ORDER_COUNT <= MAX_YES_INVENTORY
+                and not _live_yes_orders_absolutely_blocked(st)
+                and len(st.yes_prices) + ORDER_COUNT <= _max_yes_inventory()
                 and not st.skip_yes_tight_spread
             )
             want_no = (
@@ -900,14 +1399,6 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 and _eligible_to_post_no(st)
             )
             if now - st.last_requote_check >= REQUOTE_CHECK_INTERVAL_SEC:
-                if not PAPER_MODE:
-                    y_live = await _order_is_live(client, st.yes_order_id, series, ts)
-                    n_live = await _order_is_live(client, st.no_order_id, series, ts)
-                    if st.yes_order_id and not y_live:
-                        st.yes_order_id = ""
-                    if st.no_order_id and not n_live:
-                        st.no_order_id = ""
-
                 mid_drift = (
                     st.mid_at_post > 0
                     and abs(mid - st.mid_at_post) >= MID_MOVE_REQUOTE_CENTS
@@ -957,7 +1448,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
 
 async def main() -> None:
-    assert PAPER_MODE, "Paper mode enforced for safety"
+    # assert PAPER_MODE, "Paper mode enforced for safety"  # disabled: intentional live trading
     log.info("=" * 62)
     log.info("Kalshi MARKET MAKER — PAPER MODE (quotes simulated / no live Orders unless PAPER_MODE changed)")
     log.info("Series: %s | window: last %d min | HARD_CLOSE=%ds before expiry",
@@ -970,10 +1461,13 @@ async def main() -> None:
         MID_MOVE_REQUOTE_CENTS,
     )
     log.info(
-        "Inventory cap: YES≤%d contracts ×%s/leg | paper YES %.0f%%/poll NO %.0f%%/poll | "
+        "Inventory cap: paper YES≤%d live YES≤%d (live hard-block new YES when yes_inv≥%d) ×%s/leg | "
+        "paper YES %.0f%%/poll NO %.0f%%/poll | "
         "YES off for session if YES_lim+NO_bid>%d | NO halted when no-yes>=%d | "
         "halt session>$%.2f day>$%.2f",
-        MAX_YES_INVENTORY,
+        MAX_YES_INVENTORY_PAPER,
+        MAX_YES_INVENTORY_LIVE,
+        MAX_YES_INVENTORY_LIVE,
         ORDER_COUNT,
         PAPER_YES_FILL_PROBABILITY_PER_POLL * 100,
         PAPER_NO_FILL_PROBABILITY_PER_POLL * 100,

@@ -42,6 +42,10 @@ BTC_TTL  = 14.0
 _MOM_YES_NO_BID_LINE = re.compile(
     r"YES bid=(\d+(?:\.\d+)?)c?\s+NO bid=(\d+(?:\.\d+)?)c?"
 )
+# "*** ACTIVATION WINDOW OPEN *** … | YES bid=10c ask=15c" (no separate NO bid in line)
+_MOM_YES_BID_ASK_LINE = re.compile(
+    r"YES bid=(\d+(?:\.\d+)?)c?\s+ask=(\d+(?:\.\d+)?)c?"
+)
 _MOM_SERIES_TAG = re.compile(r"\[(\w+)\]")
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -150,10 +154,235 @@ def _load_jsonl(path: Path) -> list[dict]:
     return records
 
 
+# ── market_maker.PAPER_MODE (shared with /api/mode) ─────────────────────────────
+_MM_PAPER_MODE_ASSIGN = re.compile(
+    r"^PAPER_MODE\s*=\s*(True|False)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _read_market_maker_paper_mode() -> Optional[bool]:
+    """Parse PAPER_MODE from market_maker.py; None if ambiguous or unreadable."""
+    path = BASE / "market_maker.py"
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    m = _MM_PAPER_MODE_ASSIGN.search(text)
+    if not m:
+        return None
+    return m.group(1).lower() == "true"
+
+
+def _toggle_market_maker_paper_mode_in_file() -> tuple[Optional[bool], Optional[str]]:
+    """
+    Flip PAPER_MODE True↔False in market_maker.py (first assignment line match).
+    Returns (new_is_paper, error_message_or_None).
+    """
+    path = BASE / "market_maker.py"
+    if not path.is_file():
+        return None, "market_maker.py not found"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return None, str(e)
+    m = _MM_PAPER_MODE_ASSIGN.search(text)
+    if not m:
+        return None, "PAPER_MODE assignment not found"
+    cur_paper = m.group(1).lower() == "true"
+    new_lit = "False" if cur_paper else "True"
+    new_text = text[: m.start(1)] + new_lit + text[m.end(1) :]
+    try:
+        path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return None, str(e)
+    return (not cur_paper), None
+
+
+def _restart_market_maker_subprocess() -> None:
+    """pkill existing market_maker.py, then detach a new python3 process."""
+    script = "market_maker.py"
+    try:
+        subprocess.run(["pkill", "-f", script], capture_output=True, text=True, timeout=15)
+    except Exception:
+        log.warning("market_maker pkill", exc_info=True)
+    time.sleep(0.8)
+    proc = subprocess.Popen(
+        ["python3", script],
+        cwd=str(BASE),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    log.info("market_maker restarted pid=%s", proc.pid)
+
+
+_BOT_SCRIPT_META = {
+    "momentum": {"script": "momentum_bot.py", "log": MOMENTUM_LOG},
+    "market_maker": {"script": "market_maker.py", "log": MM_LOG},
+}
+_MM_ADJUSTABLE_KEYS = (
+    "MAX_YES_INVENTORY_LIVE",
+    "DAILY_LOSS_LIMIT_USD",
+    "SESSION_HALT_MIN_LOSS_USD",
+)
+
+
+def _tail_raw_log(path: Path, n: int = 50) -> str:
+    """Last n lines including blank lines."""
+    if not path.exists():
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max(8192, n * 240)))
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = chunk.splitlines()
+        return "\n".join(lines[-n:]) if lines else ""
+    except Exception:
+        return ""
+
+
+def _read_mm_file_text() -> tuple[str, Optional[str]]:
+    p = BASE / "market_maker.py"
+    if not p.is_file():
+        return "", "market_maker.py not found"
+    try:
+        return p.read_text(encoding="utf-8", errors="replace"), None
+    except OSError as e:
+        return "", str(e)
+
+
+def _read_mm_adjustable_params() -> dict[str, Optional[float]]:
+    text, err = _read_mm_file_text()
+    if err:
+        return {k: None for k in _MM_ADJUSTABLE_KEYS}
+    out: dict[str, Optional[float]] = {}
+    for name in _MM_ADJUSTABLE_KEYS:
+        m = re.search(rf"^{re.escape(name)}\s*=\s*(\S+)", text, re.MULTILINE)
+        if not m:
+            out[name] = None
+            continue
+        tok = m.group(1).strip().rstrip(",")
+        try:
+            if name == "MAX_YES_INVENTORY_LIVE":
+                out[name] = int(float(tok))
+            else:
+                out[name] = float(tok)
+        except (ValueError, TypeError):
+            out[name] = None
+    return out
+
+
+def _patch_mm_assign_token(text: str, name: str, new_token: str) -> tuple[str, Optional[str]]:
+    rx = re.compile(rf"^({re.escape(name)}\s*=\s*)(\S+)(\s*.*)$", re.MULTILINE)
+    m = rx.search(text)
+    if not m:
+        return text, f"{name} assignment not found"
+    return text[: m.start(2)] + new_token + text[m.end(2) :], None
+
+
+def _save_mm_adjustable_params(updates: dict) -> Optional[str]:
+    """
+    Persist numeric constants to market_maker.py (first occurrence per name).
+    Returns error string or None.
+    """
+    text, err = _read_mm_file_text()
+    if err:
+        return err
+    ints = {"MAX_YES_INVENTORY_LIVE"}
+    for key in _MM_ADJUSTABLE_KEYS:
+        if key not in updates or updates[key] is None:
+            continue
+        raw = updates[key]
+        if key in ints:
+            try:
+                v = int(raw)
+                if not (1 <= v <= 9999):
+                    return f"{key} must be integer 1–9999"
+                token = str(v)
+            except (ValueError, TypeError):
+                return f"{key} must be integer"
+        else:
+            try:
+                v = float(raw)
+                if v <= 0 or v > 1e9:
+                    return f"{key} must be a positive float"
+                token = repr(v)
+                if token.endswith(".0") and "." in token:
+                    token = str(v)
+            except (ValueError, TypeError):
+                return f"{key} must be a number"
+        text, perr = _patch_mm_assign_token(text, key, token)
+        if perr:
+            return perr
+    try:
+        (BASE / "market_maker.py").write_text(text, encoding="utf-8")
+    except OSError as e:
+        return str(e)
+    return None
+
+
+def _pkill_by_script_substring(pat: str) -> None:
+    try:
+        subprocess.run(["pkill", "-f", pat], capture_output=True, text=True, timeout=20)
+    except Exception:
+        log.warning("pkill -f %s", pat, exc_info=True)
+
+
+def _start_bot_logged(script_fname: str, log_file: Path) -> int:
+    """Kill existing matching processes, spawn python3 detached with stdout/stderr to log."""
+    _pkill_by_script_substring(script_fname)
+    time.sleep(0.5)
+    script_path = BASE / script_fname
+    lf = open(log_file, "a", encoding="utf-8")
+    proc = subprocess.Popen(
+        ["python3", str(script_path)],
+        cwd=str(BASE),
+        stdin=subprocess.DEVNULL,
+        stdout=lf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        lf.close()
+    except OSError:
+        pass
+    log.info("started %s pid=%s → %s", script_fname, proc.pid, log_file)
+    return proc.pid
+
+
+def _bot_controls_snapshot() -> dict:
+    mom = _BOT_SCRIPT_META["momentum"]["script"]
+    mm = _BOT_SCRIPT_META["market_maker"]["script"]
+    mr, mp = _is_running(mom)
+    rr, rp = _is_running(mm)
+    params = _read_mm_adjustable_params()
+    return {
+        "bots": {
+            "momentum": {"running": bool(mr), "pid": int(mp)},
+            "market_maker": {"running": bool(rr), "pid": int(rp)},
+        },
+        "market_maker_params": params,
+        "logs": {
+            "momentum": _tail_raw_log(MOMENTUM_LOG, 50),
+            "market_maker": _tail_raw_log(MM_LOG, 50),
+        },
+    }
+
+
 def _parse_latest_momentum_book() -> Optional[dict]:
     """
     Scan momentum.log (tail) for the last line containing 'YES bid='.
-    Parse YES bid and NO bid (¢). Implied YES ask = 100 − NO_bid; mid = average of bid and ask.
+
+    Handles:
+    - WATCHING:  ``YES bid=Xc NO bid=Yc``
+    - ACTIVATION: ``YES bid=Xc ask=Yc`` — NO bid derived as ``100 − YES ask``.
+    Implied YES ask for the first format is 100 − NO_bid.
     """
     try:
         if not MOMENTUM_LOG.exists():
@@ -167,17 +396,26 @@ def _parse_latest_momentum_book() -> Optional[dict]:
         for line in reversed(chunk.splitlines()):
             if "YES bid=" not in line:
                 continue
-            m = _MOM_YES_NO_BID_LINE.search(line)
-            if not m:
+            m_bn = _MOM_YES_NO_BID_LINE.search(line)
+            m_ba = _MOM_YES_BID_ASK_LINE.search(line)
+            if m_bn:
+                yb = float(m_bn.group(1))
+                nb = float(m_bn.group(2))
+                yes_ask = max(0.0, min(100.0, 100.0 - nb))
+            elif m_ba:
+                yb = float(m_ba.group(1))
+                yes_ask = max(0.0, min(100.0, float(m_ba.group(2))))
+                nb = max(0.0, min(100.0, 100.0 - yes_ask))
+            else:
                 continue
-            yb = float(m.group(1))
-            nb = float(m.group(2))
             sm = _MOM_SERIES_TAG.search(line)
             series = sm.group(1) if sm else "—"
-            yes_ask = max(0.0, min(100.0, 100.0 - nb))
             yb = max(0.0, min(100.0, yb))
+            yes_ask = max(0.0, min(100.0, yes_ask))
             if yes_ask < yb:
                 yes_ask = min(100.0, yb + 0.5)
+            if m_ba:
+                nb = max(0.0, min(100.0, 100.0 - yes_ask))
             mid = (yb + yes_ask) / 2.0
 
             def _qty(price: float, base: int, step: int) -> int:
@@ -462,6 +700,10 @@ def _terminal_safe_default() -> dict:
             "pnl":      0.0,
         },
         "updated": now_hms,
+        "dashboard_mm": {
+            "paper": True,
+            "equity_pnl_title": "PAPER P&L",
+        },
     }
 
 
@@ -562,18 +804,28 @@ def _ensure_terminal_shape(d: Optional[dict]) -> dict:
     if d.get("updated"):
         z["updated"] = str(d["updated"])
 
+    dm = d.get("dashboard_mm")
+    if isinstance(dm, dict):
+        z["dashboard_mm"] = {
+            "paper": bool(dm.get("paper", True)),
+            "equity_pnl_title": str(
+                dm.get("equity_pnl_title")
+                or ("PAPER P&L" if dm.get("paper", True) else "LIVE P&L")
+            ),
+        }
+
     return z
 
 
-def _compute_mm_stats() -> dict:
+def _compute_mm_stats(mm_trades: Optional[list] = None) -> dict:
     running, pid = _is_running("market_maker.py")
-    mm_all   = _load_jsonl(MM_TRADES)
-    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    mm_today = [t for t in mm_all if (t.get("entry_time") or t.get("time") or "").startswith(today)]
-    wins     = sum(1 for t in mm_today if (t.get("pnl_dollars") or t.get("pnl") or 0) > 0)
-    total    = len(mm_today)
-    pnl      = sum((t.get("pnl_dollars") or t.get("pnl") or 0) for t in mm_today)
-    last     = _last_log_line(MM_LOG)
+    src = mm_trades if mm_trades is not None else _load_jsonl(MM_TRADES)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    mm_today = [t for t in src if (t.get("entry_time") or t.get("time") or "").startswith(today)]
+    wins = sum(1 for t in mm_today if (t.get("pnl_dollars") or t.get("pnl") or 0) > 0)
+    total = len(mm_today)
+    pnl = sum((t.get("pnl_dollars") or t.get("pnl") or 0) for t in mm_today)
+    last = _last_log_line(MM_LOG)
     return {
         "running":  running,
         "pid":      pid,
@@ -594,9 +846,16 @@ def _compute_terminal_data() -> dict:
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         mm_all = _load_jsonl(MM_TRADES)
+        mm_live = [t for t in mm_all if not t.get("paper", True)]
+        mm_paper = [t for t in mm_all if t.get("paper", True)]
+        paper_mm = _read_market_maker_paper_mode()
+        if paper_mm is None:
+            paper_mm = True
+        mm_mode = mm_paper if paper_mm else mm_live
+
         mm_day = [
             t
-            for t in mm_all
+            for t in mm_mode
             if str(t.get("entry_time") or t.get("time") or "").startswith(today)
         ]
         mt = len(mm_day)
@@ -627,13 +886,17 @@ def _compute_terminal_data() -> dict:
                 "win_rate": round(mw / mt * 100, 1) if mt else 0,
                 "avg_spread": avg_combo,
             },
-            "equity":    _compute_equity(mm_all),
+            "equity":    _compute_equity(mm_mode),
             "feed":      _compute_trade_feed(mm_day, []),
             "orderbook": _compute_orderbook(),
             "series":    _compute_series_stats(mm_day),
-            "freq":      _compute_freq(mm_all + cb_all),
+            "freq":      _compute_freq(mm_mode + cb_all),
             "console":   _last_n_lines(MOMENTUM_LOG, 18),
-            "mm":        _compute_mm_stats(),
+            "mm":        _compute_mm_stats(mm_mode),
+            "dashboard_mm": {
+                "paper": bool(paper_mm),
+                "equity_pnl_title": "PAPER P&L" if paper_mm else "LIVE P&L",
+            },
             "updated":   datetime.now(timezone.utc).strftime("%H:%M:%S"),
         }
     except Exception:
@@ -739,6 +1002,92 @@ def logout():
 @auth_required
 def api_status():
     return jsonify(_get_status())
+
+
+@app.route("/api/mode")
+@auth_required
+def api_mode():
+    paper = _read_market_maker_paper_mode()
+    if paper is None:
+        return jsonify({"mode": "PAPER"})
+    return jsonify({"mode": "PAPER" if paper else "LIVE"})
+
+
+@app.route("/api/toggle-mode", methods=["POST"])
+@auth_required
+def api_toggle_mode():
+    """
+    Flip PAPER_MODE in market_maker.py, restart market_maker.py detached.
+    """
+    new_paper, err = _toggle_market_maker_paper_mode_in_file()
+    if err:
+        log.warning("toggle-mode: %s", err)
+        return jsonify({"ok": False, "error": err}), 400
+
+    _term_cache["data"] = None
+    _term_cache["ts"] = 0.0
+    try:
+        _restart_market_maker_subprocess()
+    except OSError as e:
+        log.exception("toggle-mode restart")
+        return jsonify({"ok": False, "error": f"restart failed: {e}"}), 500
+
+    mode = "PAPER" if new_paper else "LIVE"
+    log.info("toggle-mode → %s (paper=%s)", mode, new_paper)
+    return jsonify({"ok": True, "mode": mode, "paper": bool(new_paper)})
+
+
+@app.route("/api/bot-controls", methods=["GET", "POST"])
+@auth_required
+def api_bot_controls():
+    if request.method == "GET":
+        return jsonify(_bot_controls_snapshot())
+
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        body = {}
+
+    action = body.get("action")
+    bot = body.get("bot")
+
+    if action in ("start", "stop"):
+        if bot not in _BOT_SCRIPT_META:
+            return jsonify({"ok": False, "error": "unknown bot"}), 400
+        meta = _BOT_SCRIPT_META[str(bot)]
+        script = meta["script"]
+        log_path = meta["log"]
+        if action == "stop":
+            _pkill_by_script_substring(script)
+        else:
+            _start_bot_logged(script, log_path)
+        _term_cache["data"] = None
+        _term_cache["ts"] = 0.0
+        out = _bot_controls_snapshot()
+        out["ok"] = True
+        return jsonify(out)
+
+    if action == "save_params":
+        if isinstance(body.get("params"), dict):
+            src: dict = body["params"]
+        else:
+            src = body
+        picks: dict[str, object] = {}
+        for key in _MM_ADJUSTABLE_KEYS:
+            if key in src and src[key] is not None and src[key] != "":
+                picks[key] = src[key]
+        if not picks:
+            return jsonify({"ok": False, "error": "no recognizable params"}), 400
+        err = _save_mm_adjustable_params(picks)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        _term_cache["data"] = None
+        _term_cache["ts"] = 0.0
+        out = _bot_controls_snapshot()
+        out["ok"] = True
+        out["restart_hint"] = "Restart market_maker.py to load new constants."
+        return jsonify(out)
+
+    return jsonify({"ok": False, "error": 'use action "start", "stop", or "save_params"'}), 400
 
 
 @app.route("/api/terminal")
@@ -865,7 +1214,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 
 /* ── Terminal grid ── */
 #T{display:grid;height:100vh;
-   grid-template-rows:40px 1fr 130px;
+   grid-template-rows:40px minmax(0,1fr) minmax(118px,21vh) 130px;
    background:#000;overflow:hidden}
 
 /* ═══════════════════════════════════════════
@@ -898,10 +1247,27 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .bdot{width:6px;height:6px;border-radius:50%;flex-shrink:0;transition:background .3s}
 .don{background:#00ff41;box-shadow:0 0 5px #00ff41}
 .doff{background:#ff3131}
-.mode-badge{
-  margin-left:10px;padding:2px 8px;border:1px solid #ffaa0055;
-  color:#ffaa00;font-size:8px;font-weight:600;letter-spacing:2px;
+.mode-badge{margin-left:10px;padding:2px 8px;font-size:8px;font-weight:600;letter-spacing:2px}
+.mode-badge.mode-paper{border:1px solid #ffffff55;color:#fff}
+.mode-badge.mode-live{
+  border:1px solid #ffaa0099;color:#ffb020;
+  text-shadow:0 0 10px rgba(255,178,32,0.45);
 }
+.mm-mode-toggle{
+  margin-left:6px;font-family:inherit;font-size:7px;font-weight:600;
+  letter-spacing:1px;text-transform:uppercase;padding:4px 10px;
+  cursor:pointer;background:transparent;transition:opacity .18s,color .12s;border-radius:0;
+  vertical-align:middle;line-height:1.2;
+}
+.mm-mode-toggle:disabled{opacity:.5;cursor:wait}
+.mm-mode-toggle-live{
+  border:1px solid #ffaa0099;color:#ffffff;
+}
+.mm-mode-toggle-paper{
+  border:1px solid #ffffff55;color:#ffb020;
+  text-shadow:0 0 8px rgba(255,178,32,0.35);
+}
+.mm-mode-toggle.switching{border-color:#00ff4166;color:#00ff4188;text-shadow:none}
 
 /* ═══════════════════════════════════════════
    MAIN AREA  (3 columns)
@@ -1013,6 +1379,54 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 #btc-wrap{min-height:88px}
 #freq-chart{width:100%!important;height:100%!important}
 #btc-canvas{display:block;width:100%;height:100%}
+
+/* ═══════════════════════════════════════════
+   BOT CONTROLS STRIP
+═══════════════════════════════════════════ */
+#BOT-CTRL{
+  border-top:1px solid #00ff4118;
+  border-bottom:1px solid #00ff4133;
+  background:#000811;
+  overflow:hidden;
+  padding:4px 8px 5px;
+}
+#bc-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 200px;gap:8px;align-items:stretch;height:100%}
+.bc-card{
+  border:1px solid #00ff4122;display:flex;flex-direction:column;
+  min-height:0;overflow:hidden;background:#000;
+}
+.bc-hdr{
+  flex-shrink:0;display:flex;align-items:center;gap:6px;padding:3px 6px;
+  border-bottom:1px solid #00ff4118;
+}
+.bc-title{font-size:8px;font-weight:600;letter-spacing:1.6px;color:#00ff4199;text-transform:uppercase;flex:1}
+.bc-led{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.bc-led.on{background:#00ff41;box-shadow:0 0 6px #00ff41}
+.bc-led.off{background:#ff3131;box-shadow:0 0 4px #ff313166}
+.bc-btns{display:flex;gap:4px}
+.bc-btn{
+  font-family:inherit;font-size:7px;font-weight:600;letter-spacing:0.5px;
+  text-transform:uppercase;padding:3px 8px;cursor:pointer;border-radius:0;
+  background:transparent;border:1px solid #00ff4144;color:#00ff41;
+}
+.bc-btn:hover{background:#00ff410d;border-color:#00ff4177}
+.bc-btn:disabled{opacity:.4;cursor:not-allowed}
+.bc-btn-danger{border-color:#ff313144;color:#ff6b6b}
+.bc-log{
+  flex:1;min-height:0;overflow:auto;margin:0;padding:4px 6px;
+  font-size:8px;line-height:1.45;color:#00ff4199;white-space:pre-wrap;word-break:break-all;
+  font-family:'IBM Plex Mono',monospace;background:#000402;
+}
+.bc-params{border:1px solid #00ff4122;display:flex;flex-direction:column;min-height:0;padding:4px 6px;gap:5px;background:#000}
+.bc-plbl{font-size:7px;letter-spacing:1px;color:#00ff4155;text-transform:uppercase}
+.bc-pin{
+  width:100%;background:#000;border:1px solid #00ff4133;color:#00ff41;
+  font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 5px;
+  outline:none;box-sizing:border-box;
+}
+.bc-pin:focus{border-color:#00ff41}
+.bc-save{margin-top:auto;flex-shrink:0}
+.bc-hint{font-size:6px;color:#ffaa0099;line-height:1.3;margin:0;padding:2px 0}
 </style>
 </head>
 <body>
@@ -1037,7 +1451,8 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <div class="bot-tag"><span class="bdot" id="dot-kalshi"></span>KALSHI</div>
     <div class="bot-tag"><span class="bdot" id="dot-coinbase"></span>COINBASE</div>
     <div class="bot-tag"><span class="bdot" id="dot-polymarket"></span>POLY</div>
-    <span class="mode-badge">PAPER</span>
+    <span id="tb-mm-mode" class="mode-badge mode-paper">PAPER</span>
+    <button type="button" id="btn-toggle-mm-mode" class="mm-mode-toggle mm-mode-toggle-paper" title="Restart market maker in the other mode">SWITCH TO LIVE</button>
   </div>
 
   <!-- ══ MAIN AREA ══ -->
@@ -1047,6 +1462,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <div class="pane" id="LF">
       <div class="ph">
         <span class="ph-title">Live Fills</span>
+        <span class="ph-meta g-faint" id="feed-mm-mode-meta">PAPER</span>
         <span class="ph-meta" id="feed-count">0 TRADES</span>
       </div>
       <div id="feed-list"></div>
@@ -1058,7 +1474,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
       <!-- P&L Equity Curve -->
       <div id="eq-pane">
         <div class="ph">
-          <span class="ph-title">P&amp;L Equity Curve</span>
+          <span class="ph-title" id="eq-pnl-title">PAPER P&amp;L</span>
           <span class="ph-meta g" id="eq-current">+$0.0000</span>
         </div>
         <div id="eq-wrap">
@@ -1083,7 +1499,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
       <div id="sp-pane">
         <div class="ph">
           <span class="ph-title">Series Performance</span>
-          <span class="ph-meta">MM · TODAY UTC</span>
+          <span class="ph-meta" id="sp-mm-mode-meta">MM · PAPER · TODAY UTC</span>
         </div>
         <div id="sp-body"></div>
       </div>
@@ -1096,6 +1512,44 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
         <div id="con-body"></div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- ══ BOT CONTROLS ══ -->
+  <div id="BOT-CTRL">
+    <div id="bc-grid">
+      <div class="bc-card">
+        <div class="bc-hdr">
+          <span class="bc-led off" id="bc-led-mom" title="Process status"></span>
+          <span class="bc-title">momentum_bot.py</span>
+          <span class="bc-btns">
+            <button type="button" class="bc-btn" id="bc-start-mom">Start</button>
+            <button type="button" class="bc-btn bc-btn-danger" id="bc-stop-mom">Stop</button>
+          </span>
+        </div>
+        <pre class="bc-log" id="bc-log-mom"></pre>
+      </div>
+      <div class="bc-card">
+        <div class="bc-hdr">
+          <span class="bc-led off" id="bc-led-mm"></span>
+          <span class="bc-title">market_maker.py</span>
+          <span class="bc-btns">
+            <button type="button" class="bc-btn" id="bc-start-mm">Start</button>
+            <button type="button" class="bc-btn bc-btn-danger" id="bc-stop-mm">Stop</button>
+          </span>
+        </div>
+        <pre class="bc-log" id="bc-log-mm"></pre>
+      </div>
+      <div class="bc-params">
+        <span class="bc-plbl">MAX_YES_INVENTORY_LIVE</span>
+        <input class="bc-pin" id="bc-par-yesliv" autocomplete="off" />
+        <span class="bc-plbl">DAILY_LOSS_LIMIT_USD</span>
+        <input class="bc-pin" id="bc-par-daily" autocomplete="off" />
+        <span class="bc-plbl">SESSION_HALT_MIN_LOSS_USD</span>
+        <input class="bc-pin" id="bc-par-sesshalt" autocomplete="off" />
+        <p class="bc-hint" id="bc-param-hint">Values written to market_maker.py · restart MM to apply</p>
+        <button type="button" class="bc-btn bc-save" id="bc-save-params">Save params</button>
+      </div>
     </div>
   </div>
 
@@ -1157,6 +1611,100 @@ function esc(s) {
 }
 
 const FETCH_CRED = { credentials: 'include' };
+const BOT_CTRL_POLL_MS = 2800;
+
+async function refreshBotControls() {
+  try {
+    const res = await fetch('/api/bot-controls', FETCH_CRED);
+    if (!res.ok) return;
+    const d = await res.json();
+    const mom = d.bots && d.bots.momentum;
+    const mm = d.bots && d.bots.market_maker;
+    var ledM = document.getElementById('bc-led-mom');
+    var ledR = document.getElementById('bc-led-mm');
+    if (ledM) ledM.className = 'bc-led ' + (mom && mom.running ? 'on' : 'off');
+    if (ledR) ledR.className = 'bc-led ' + (mm && mm.running ? 'on' : 'off');
+    var lm = document.getElementById('bc-log-mom');
+    var lr = document.getElementById('bc-log-mm');
+    if (lm && d.logs && d.logs.momentum != null) lm.textContent = d.logs.momentum || '(empty)';
+    if (lr && d.logs && d.logs.market_maker != null) lr.textContent = d.logs.market_maker || '(empty)';
+    var p = d.market_maker_params || {};
+    var pairs = [
+      ['bc-par-yesliv', 'MAX_YES_INVENTORY_LIVE'],
+      ['bc-par-daily', 'DAILY_LOSS_LIMIT_USD'],
+      ['bc-par-sesshalt', 'SESSION_HALT_MIN_LOSS_USD'],
+    ];
+    for (var i = 0; i < pairs.length; i++) {
+      var el = document.getElementById(pairs[i][0]);
+      var key = pairs[i][1];
+      if (!el || el === document.activeElement) continue;
+      if (p[key] != null && p[key] !== '') el.value = String(p[key]);
+    }
+  } catch (_e) {}
+}
+
+function attachBotControlsHandlers() {
+  async function act(action, bot) {
+    try {
+      var res = await fetch('/api/bot-controls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ action: action, bot: bot }),
+      });
+      var j = await res.json().catch(function () { return {}; });
+      if (!res.ok || !j.ok) {
+        alert((j && j.error) || ('HTTP ' + res.status));
+        return;
+      }
+      await refreshBotControls();
+    } catch (e) {
+      alert(String(e.message || e));
+    }
+  }
+  var sm = document.getElementById('bc-start-mom');
+  var xm = document.getElementById('bc-stop-mom');
+  var sr = document.getElementById('bc-start-mm');
+  var xr = document.getElementById('bc-stop-mm');
+  if (sm) sm.addEventListener('click', function () { act('start', 'momentum'); });
+  if (xm) xm.addEventListener('click', function () { act('stop', 'momentum'); });
+  if (sr) sr.addEventListener('click', function () { act('start', 'market_maker'); });
+  if (xr) xr.addEventListener('click', function () { act('stop', 'market_maker'); });
+
+  var sv = document.getElementById('bc-save-params');
+  if (sv) {
+    sv.addEventListener('click', async function () {
+      sv.disabled = true;
+      try {
+        var body = {
+          action: 'save_params',
+          params: {
+            MAX_YES_INVENTORY_LIVE: document.getElementById('bc-par-yesliv').value,
+            DAILY_LOSS_LIMIT_USD: document.getElementById('bc-par-daily').value,
+            SESSION_HALT_MIN_LOSS_USD: document.getElementById('bc-par-sesshalt').value,
+          },
+        };
+        var res = await fetch('/api/bot-controls', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify(body),
+        });
+        var j = await res.json().catch(function () { return {}; });
+        if (!res.ok || !j.ok) {
+          alert((j && j.error) || ('HTTP ' + res.status));
+          return;
+        }
+        var h = document.getElementById('bc-param-hint');
+        if (h && j.restart_hint) h.textContent = j.restart_hint;
+        await refreshBotControls();
+      } catch (e) {
+        alert(String(e.message || e));
+      }
+      sv.disabled = false;
+    });
+  }
+}
 
 function setTerminalApiError(msg) {
   const el = document.getElementById('tb-api-error');
@@ -1216,6 +1764,7 @@ function normalizeTerminalPayload(d) {
     console: [],
     freq: Array.from({ length: 24 }, () => 0),
     updated: '—',
+    dashboard_mm: { paper: true, equity_pnl_title: 'PAPER P&L' },
   };
 
   if (!d || typeof d !== 'object') return z;
@@ -1315,6 +1864,16 @@ function normalizeTerminalPayload(d) {
   }
 
   if (d.updated != null && d.updated !== '') z.updated = String(d.updated);
+
+  if (d.dashboard_mm && typeof d.dashboard_mm === 'object') {
+    z.dashboard_mm.paper = d.dashboard_mm.paper === true;
+    const et =
+      typeof d.dashboard_mm.equity_pnl_title === 'string'
+        ? d.dashboard_mm.equity_pnl_title
+        : '';
+    if (et) z.dashboard_mm.equity_pnl_title = et;
+    else z.dashboard_mm.equity_pnl_title = z.dashboard_mm.paper ? 'PAPER P&L' : 'LIVE P&L';
+  }
 
   return z;
 }
@@ -1792,6 +2351,85 @@ function renderBtcCandles(rawCandles) {
       : '1M CANDLES';
 }
 
+// ── MM display: badge / labels match market_maker PAPER_MODE ─────────────
+function updateMmModeToggleButton(paper) {
+  const btn = document.getElementById('btn-toggle-mm-mode');
+  if (!btn || btn.disabled) return;
+  if (paper) {
+    btn.textContent = 'SWITCH TO LIVE';
+    btn.className = 'mm-mode-toggle mm-mode-toggle-paper';
+    btn.dataset.currentMode = 'paper';
+  } else {
+    btn.textContent = 'SWITCH TO PAPER';
+    btn.className = 'mm-mode-toggle mm-mode-toggle-live';
+    btn.dataset.currentMode = 'live';
+  }
+}
+
+function attachMmModeToggleHandler() {
+  const btn = document.getElementById('btn-toggle-mm-mode');
+  if (!btn || btn.dataset.bound === '1') return;
+  btn.dataset.bound = '1';
+  btn.addEventListener('click', async function () {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Switching...';
+    btn.className = 'mm-mode-toggle switching';
+    try {
+      const res = await fetch('/api/toggle-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: '{}',
+      });
+      const txt = await res.text();
+      if (!res.ok) {
+        let err = txt || ('HTTP ' + res.status);
+        try {
+          var j = JSON.parse(txt);
+          if (j && j.error) err = j.error;
+        } catch (_e) {}
+        console.warn('[toggle-mode]', err);
+        alert('Toggle failed: ' + err);
+        btn.disabled = false;
+        var bdFail = document.getElementById('tb-mm-mode');
+        updateMmModeToggleButton(!!(bdFail && bdFail.textContent === 'PAPER'));
+        return;
+      }
+    } catch (e) {
+      console.error('[toggle-mode]', e);
+      alert(String(e.message || e));
+      btn.disabled = false;
+      var bdErr = document.getElementById('tb-mm-mode');
+      updateMmModeToggleButton(!!(bdErr && bdErr.textContent === 'PAPER'));
+      pollTerminal();
+      return;
+    }
+    await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+    window.location.reload();
+  });
+}
+
+function applyMmDashboardDisplay(dm) {
+  const paper = !!(dm && dm.paper === true);
+  const el = document.getElementById('tb-mm-mode');
+  if (el) {
+    el.textContent = paper ? 'PAPER' : 'LIVE';
+    el.className = 'mode-badge ' + (paper ? 'mode-paper' : 'mode-live');
+  }
+  updateMmModeToggleButton(paper);
+  const eqEl = document.getElementById('eq-pnl-title');
+  const title =
+    dm && typeof dm.equity_pnl_title === 'string' && dm.equity_pnl_title
+      ? dm.equity_pnl_title
+      : (paper ? 'PAPER P&L' : 'LIVE P&L');
+  if (eqEl) eqEl.textContent = title;
+  const fm = document.getElementById('feed-mm-mode-meta');
+  if (fm) fm.textContent = paper ? 'PAPER' : 'LIVE';
+  const sp = document.getElementById('sp-mm-mode-meta');
+  if (sp) sp.textContent = paper ? 'MM · PAPER · TODAY UTC' : 'MM · LIVE · TODAY UTC';
+}
+
 // ── Main poll ────────────────────────────────────────────
 let __terminalProbeLogged = false;
 
@@ -1824,6 +2462,7 @@ async function pollTerminal() {
 
     data = normalizeTerminalPayload(data);
     setTerminalApiError('');
+    applyMmDashboardDisplay(data.dashboard_mm || {});
 
     renderTopBar(data);
     renderFeed(data.feed);
@@ -1867,8 +2506,12 @@ async function pollBtcCandles() {
 // ── Boot ─────────────────────────────────────────────────
 requestAnimationFrame(() => {
   initCharts();
+  attachMmModeToggleHandler();
+  attachBotControlsHandlers();
   pollTerminal();
+  refreshBotControls();
 });
+setInterval(refreshBotControls, BOT_CTRL_POLL_MS);
 requestAnimationFrame(() => {
   requestAnimationFrame(() => {
     pollBtcCandles();
