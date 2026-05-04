@@ -18,16 +18,18 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Any
 
-from flask import Flask, jsonify, request, Response, session, redirect
+from flask import Flask, jsonify, request, Response, session, redirect, send_from_directory
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 app.config["JSON_SORT_KEYS"] = False
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
 log = app.logger
 
 BASE              = Path(__file__).parent
+STATIC_DIR        = BASE / "static"
 MOMENTUM_LOG      = BASE / "momentum.log"
 POLYMARKET_LOG    = BASE / "polymarket.log"
+POLYMARKET_TRADES = BASE / "polymarket_trades.jsonl"
 COINBASE_LOG      = BASE / "coinbase.log"
 MM_LOG            = BASE / "market_maker.log"
 COINBASE_TRADES   = BASE / "coinbase_trades.jsonl"
@@ -37,7 +39,12 @@ MM_TRADES         = BASE / "market_maker_trades.jsonl"
 _term_cache: dict = {"data": None, "ts": 0.0}
 _btc_cache:  dict = {"data": None, "ts": 0.0}
 TERM_TTL = 0.4
-BTC_TTL  = 14.0
+BTC_TTL  = 9.0
+
+ENV_FILE          = BASE / ".env"
+
+# ── Cached market-hours probe (avoid recomputing on every terminal poll) ─────
+_MARKET_SESSION_CACHE: dict[str, Any] = {"open": False, "ts": 0.0}
 
 # ── Kalshi REST (reuse market_maker._SimpleClient) ──────────────────────────
 
@@ -94,78 +101,6 @@ def _extract_kalshi_order_id(blob: dict) -> Optional[str]:
     return None
 
 
-async def _mm_fetch_resting_orders() -> tuple[list[dict[str, Any]], Optional[str]]:
-    """GET portfolio/orders?status=resting."""
-    try:
-        from market_maker import _SimpleClient
-
-        cli = _SimpleClient()
-        try:
-            if not cli._private_key:
-                return [], "Kalshi API key / private key not configured"
-            r = await cli.get(
-                "portfolio/orders",
-                params={"status": "resting", "limit": 200},
-            )
-            raw_list = r.get("orders") or []
-            out: list[dict[str, Any]] = []
-            if not isinstance(raw_list, list):
-                return [], "unexpected orders shape"
-            for raw in raw_list:
-                od = _kalshi_unpack_order(raw if isinstance(raw, dict) else {})
-                if not od:
-                    continue
-                ticker = str(od.get("ticker") or "")
-                side = str(od.get("side") or "").upper()
-                cnt = od.get("remaining_count")
-                if cnt is None:
-                    cnt = od.get("remaining_count_fp")
-                if cnt is None:
-                    cnt = od.get("open_count")
-                if cnt is None:
-                    cnt = od.get("count")
-                cnt_i: Optional[int]
-                try:
-                    cnt_i = int(float(str(cnt))) if cnt is not None else None
-                except (TypeError, ValueError):
-                    cnt_i = None
-                yp = od.get("yes_price")
-                price_disp = ""
-                if yp is not None:
-                    try:
-                        price_disp = f"{int(float(str(yp)))}¢"
-                    except (TypeError, ValueError):
-                        price_disp = str(yp)
-                else:
-                    yd = od.get("yes_price_dollars")
-                    if yd is not None:
-                        try:
-                            price_disp = f"${float(str(yd)):.4f}".rstrip("0").rstrip(".")
-                        except (TypeError, ValueError):
-                            price_disp = str(yd)
-                if not price_disp:
-                    price_disp = "—"
-                action = str(od.get("action") or "").lower()
-                typ = str(od.get("type") or "").lower()
-                out.append(
-                    {
-                        "ticker": ticker,
-                        "side": side,
-                        "action": action,
-                        "order_type": typ,
-                        "price_display": price_disp,
-                        "count": cnt_i if cnt_i is not None else 0,
-                    }
-                )
-            out.sort(key=lambda x: x.get("ticker") or "")
-            return out, None
-        finally:
-            await cli.close()
-    except Exception as exc:
-        log.warning("Kalshi portfolio/orders resting: %s", exc)
-        return [], str(exc)
-
-
 async def _mm_cancel_all_resting_orders() -> tuple[bool, int, list[str]]:
     """
     GET resting orders then DELETE portfolio/orders/{id} each.
@@ -213,11 +148,13 @@ async def _mm_cancel_all_resting_orders() -> tuple[bool, int, list[str]]:
 
 # ── Momentum log → order book (live YES/NO bids) ───────────────────────────
 _MOM_YES_NO_BID_LINE = re.compile(
-    r"YES bid=(\d+(?:\.\d+)?)c?\s+NO bid=(\d+(?:\.\d+)?)c?"
+    r"YES\s+bid\s*=\s*(\d+(?:\.\d+)?)c?\s+NO\s+bid\s*=\s*(\d+(?:\.\d+)?)c?",
+    re.IGNORECASE,
 )
 # "*** ACTIVATION WINDOW OPEN *** … | YES bid=10c ask=15c" (no separate NO bid in line)
 _MOM_YES_BID_ASK_LINE = re.compile(
-    r"YES bid=(\d+(?:\.\d+)?)c?\s+ask=(\d+(?:\.\d+)?)c?"
+    r"YES\s+bid\s*=\s*(\d+(?:\.\d+)?)c?\s+ask\s*=\s*(\d+(?:\.\d+)?)c?",
+    re.IGNORECASE,
 )
 _MOM_SERIES_TAG = re.compile(r"\[(\w+)\]")
 
@@ -397,11 +334,6 @@ _BOT_SCRIPT_META = {
     "momentum": {"script": "momentum_bot.py", "log": MOMENTUM_LOG},
     "market_maker": {"script": "market_maker.py", "log": MM_LOG},
 }
-_MM_ADJUSTABLE_KEYS = (
-    "MAX_YES_INVENTORY_LIVE",
-    "DAILY_LOSS_LIMIT_USD",
-    "SESSION_HALT_MIN_LOSS_USD",
-)
 
 
 def _tail_raw_log(path: Path, n: int = 50) -> str:
@@ -418,86 +350,6 @@ def _tail_raw_log(path: Path, n: int = 50) -> str:
         return "\n".join(lines[-n:]) if lines else ""
     except Exception:
         return ""
-
-
-def _read_mm_file_text() -> tuple[str, Optional[str]]:
-    p = BASE / "market_maker.py"
-    if not p.is_file():
-        return "", "market_maker.py not found"
-    try:
-        return p.read_text(encoding="utf-8", errors="replace"), None
-    except OSError as e:
-        return "", str(e)
-
-
-def _read_mm_adjustable_params() -> dict[str, Optional[float]]:
-    text, err = _read_mm_file_text()
-    if err:
-        return {k: None for k in _MM_ADJUSTABLE_KEYS}
-    out: dict[str, Optional[float]] = {}
-    for name in _MM_ADJUSTABLE_KEYS:
-        m = re.search(rf"^{re.escape(name)}\s*=\s*(\S+)", text, re.MULTILINE)
-        if not m:
-            out[name] = None
-            continue
-        tok = m.group(1).strip().rstrip(",")
-        try:
-            if name == "MAX_YES_INVENTORY_LIVE":
-                out[name] = int(float(tok))
-            else:
-                out[name] = float(tok)
-        except (ValueError, TypeError):
-            out[name] = None
-    return out
-
-
-def _patch_mm_assign_token(text: str, name: str, new_token: str) -> tuple[str, Optional[str]]:
-    rx = re.compile(rf"^({re.escape(name)}\s*=\s*)(\S+)(\s*.*)$", re.MULTILINE)
-    m = rx.search(text)
-    if not m:
-        return text, f"{name} assignment not found"
-    return text[: m.start(2)] + new_token + text[m.end(2) :], None
-
-
-def _save_mm_adjustable_params(updates: dict) -> Optional[str]:
-    """
-    Persist numeric constants to market_maker.py (first occurrence per name).
-    Returns error string or None.
-    """
-    text, err = _read_mm_file_text()
-    if err:
-        return err
-    ints = {"MAX_YES_INVENTORY_LIVE"}
-    for key in _MM_ADJUSTABLE_KEYS:
-        if key not in updates or updates[key] is None:
-            continue
-        raw = updates[key]
-        if key in ints:
-            try:
-                v = int(raw)
-                if not (1 <= v <= 9999):
-                    return f"{key} must be integer 1–9999"
-                token = str(v)
-            except (ValueError, TypeError):
-                return f"{key} must be integer"
-        else:
-            try:
-                v = float(raw)
-                if v <= 0 or v > 1e9:
-                    return f"{key} must be a positive float"
-                token = repr(v)
-                if token.endswith(".0") and "." in token:
-                    token = str(v)
-            except (ValueError, TypeError):
-                return f"{key} must be a number"
-        text, perr = _patch_mm_assign_token(text, key, token)
-        if perr:
-            return perr
-    try:
-        (BASE / "market_maker.py").write_text(text, encoding="utf-8")
-    except OSError as e:
-        return str(e)
-    return None
 
 
 def _pkill_by_script_substring(pat: str) -> None:
@@ -534,13 +386,11 @@ def _bot_controls_snapshot() -> dict:
     mm = _BOT_SCRIPT_META["market_maker"]["script"]
     mr, mp = _is_running(mom)
     rr, rp = _is_running(mm)
-    params = _read_mm_adjustable_params()
     return {
         "bots": {
             "momentum": {"running": bool(mr), "pid": int(mp)},
             "market_maker": {"running": bool(rr), "pid": int(rp)},
         },
-        "market_maker_params": params,
         "logs": {
             "momentum": _tail_raw_log(MOMENTUM_LOG, 50),
             "market_maker": _tail_raw_log(MM_LOG, 50),
@@ -633,6 +483,243 @@ def _parse_trade_dt_utc(t: dict):
         return None
 
 
+_MOM_ISO_TS_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _parse_momentum_wall_time(line: str) -> Optional[datetime]:
+    m = _MOM_ISO_TS_PREFIX.match(line.strip())
+    if not m:
+        return None
+    try:
+        dt = datetime.fromisoformat(m.group(1))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _yes_bid_volatility_by_series(window_min: int = 15) -> dict[str, float]:
+    """Absolute YES bid change %% over recent window derived from momentum.log."""
+    keys = ("KXBTC15M", "KXETH15M", "KXSOL15M")
+    buckets: dict[str, list[tuple[datetime, float]]] = {s: [] for s in keys}
+    if not MOMENTUM_LOG.exists():
+        return dict.fromkeys(keys, 0.0)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_min)
+    try:
+        with open(MOMENTUM_LOG, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 1_600_000))
+            chunk = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return dict.fromkeys(keys, 0.0)
+
+    for line in chunk.splitlines():
+        if "YES bid=" not in line:
+            continue
+        wall = _parse_momentum_wall_time(line)
+        if wall is None or wall < cutoff:
+            continue
+        sm = _MOM_SERIES_TAG.search(line)
+        ser = sm.group(1) if sm else ""
+        if ser not in buckets:
+            continue
+        m_bn = _MOM_YES_NO_BID_LINE.search(line)
+        m_ba = _MOM_YES_BID_ASK_LINE.search(line)
+        if m_bn:
+            yb = float(m_bn.group(1))
+        elif m_ba:
+            yb = float(m_ba.group(1))
+        else:
+            continue
+        buckets[ser].append((wall, max(0.0, min(100.0, yb))))
+
+    out: dict[str, float] = {}
+    for ser in keys:
+        pts = sorted(buckets[ser], key=lambda x: x[0])
+        if len(pts) < 2:
+            out[ser] = 0.0
+            continue
+        first = pts[0][1]
+        last = pts[-1][1]
+        base = abs(first) if abs(first) > 1e-6 else 1.0
+        out[ser] = round(abs(last - first) / base * 100.0, 3)
+    return out
+
+
+def _compute_weekly_pnl(mm_filtered: list[dict]) -> list[dict]:
+    """Last 7 calendar days UTC aggregated P&L and trade counts."""
+    today = datetime.now(timezone.utc).date()
+    day_list = [(today - timedelta(days=k)).isoformat() for k in range(6, -1, -1)]
+    acc = {ds: {"date": ds, "pnl": 0.0, "trades": 0} for ds in day_list}
+    for t in mm_filtered:
+        dt = _parse_trade_dt_utc(t)
+        if dt is None:
+            continue
+        ds = dt.date().isoformat()
+        if ds not in acc:
+            continue
+        acc[ds]["pnl"] += float(t.get("pnl_dollars") or t.get("pnl") or 0)
+        acc[ds]["trades"] += 1
+    return [{"date": d, "pnl": round(acc[d]["pnl"], 4), "trades": int(acc[d]["trades"])} for d in day_list]
+
+
+def _compute_streak_mm(mm_filtered: list[dict]) -> dict[str, Any]:
+    distant = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    ordered = sorted(
+        mm_filtered,
+        key=lambda tr: (_parse_trade_dt_utc(tr) or distant),
+        reverse=True,
+    )
+    streak = 0
+    streak_kind = ""
+    for t in ordered:
+        pnl_v = float(t.get("pnl_dollars") or t.get("pnl") or 0)
+        if pnl_v > 0:
+            k = "win"
+        elif pnl_v < 0:
+            k = "loss"
+        else:
+            break
+        if not streak_kind:
+            streak_kind = k
+        elif k != streak_kind:
+            break
+        streak += 1
+    if streak_kind == "win" and streak > 0:
+        return {"kind": streak_kind, "n": streak, "label": f"↑{streak}W", "tone": "pos"}
+    if streak_kind == "loss" and streak > 0:
+        return {"kind": streak_kind, "n": streak, "label": f"↓{streak}L", "tone": "neg"}
+    return {"kind": "flat", "n": 0, "label": "", "tone": ""}
+
+
+def _sessions_recent_via_momentum(max_age_min: float = 90.0) -> bool:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_min)
+    if not MOMENTUM_LOG.exists():
+        return False
+    try:
+        with open(MOMENTUM_LOG, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 800_000))
+            chunk = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in reversed(chunk.splitlines()):
+        if "New session:" not in line:
+            continue
+        dt = _parse_momentum_wall_time(line)
+        if dt is not None and dt >= cutoff:
+            return True
+    return False
+
+
+def _probe_market_open_cached() -> bool:
+    """Momentum log recent 'New session' (30 s server TTL)."""
+    global _MARKET_SESSION_CACHE  # noqa: PLW0603
+    nowt = time.time()
+    if nowt - float(_MARKET_SESSION_CACHE["ts"]) < 30.0:
+        return bool(_MARKET_SESSION_CACHE["open"])
+    opened = _sessions_recent_via_momentum(90.0)
+    _MARKET_SESSION_CACHE["open"] = opened
+    _MARKET_SESSION_CACHE["ts"] = nowt
+    return opened
+
+
+def _read_dotenv_values() -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not ENV_FILE.is_file():
+        return out
+    try:
+        for raw in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def _upsert_env_file(updates: dict[str, str]) -> Optional[str]:
+    lines: list[str] = []
+    try:
+        if ENV_FILE.is_file():
+            lines = ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        return str(e)
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for line in lines:
+        st = line.strip()
+        if st and not st.startswith("#") and "=" in st:
+            k = st.split("=", 1)[0].strip()
+            if k in updates:
+                out_lines.append(f"{k}={updates[k]}")
+                seen.add(k)
+                continue
+        out_lines.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            out_lines.append(f"{k}={v}")
+    try:
+        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ENV_FILE.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+    except OSError as e:
+        return str(e)
+    return None
+
+
+async def _mm_ping_balance_ms() -> tuple[Optional[int], Optional[str]]:
+    t0 = time.perf_counter()
+    try:
+        from market_maker import _SimpleClient
+
+        cli = _SimpleClient()
+        try:
+            if not cli._private_key:
+                return None, "Kalshi API key / private key not configured"
+            await cli.get("portfolio/balance")
+            return int((time.perf_counter() - t0) * 1000), None
+        finally:
+            await cli.close()
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _fetch_coinbase_spot_prices() -> dict[str, Any]:
+    now = time.time()
+    cached = _btc_cache.get("spot")
+    if isinstance(cached, dict) and now - float(cached.get("ts", 0.0)) < 3.0:
+        return dict(cached["data"])
+    out: dict[str, Any] = {"ok": True, "pairs": {}, "ts": time.time()}
+    for sym, label in (("BTC-USD", "BTC"), ("ETH-USD", "ETH"), ("SOL-USD", "SOL")):
+        try:
+            url = f"https://api.exchange.coinbase.com/products/{sym}/ticker"
+            req = _urlreq.Request(
+                url,
+                headers={"User-Agent": "kalshi-trade-desk/1", "Accept": "application/json"},
+            )
+            with _urlreq.urlopen(req, timeout=8) as r:
+                raw_body = r.read().decode("utf-8", errors="replace")
+            log.info("coinbase spot raw %s: %s", sym, raw_body[:500])
+            jd = json.loads(raw_body)
+            px = float(jd.get("price") or 0)
+            rnd = 2 if label == "SOL" else (0 if label == "BTC" else 2)
+            out["pairs"][label] = round(px, rnd)
+            out[label] = {"price": round(px, rnd)}
+        except Exception as exc:
+            out["ok"] = False
+            out["pairs"][label] = None
+            out[label] = None
+            out["err"] = str(exc)
+    _btc_cache["spot"] = {"data": out, "ts": now}
+    return out
+
+
 def _compute_equity(trades: list[dict]) -> list[dict]:
     """Cumulative P&L (market-maker rows: entry_time + pnl_dollars) with hourly zero-fill anchor."""
     now = datetime.now(timezone.utc)
@@ -709,6 +796,7 @@ def _compute_equity(trades: list[dict]) -> list[dict]:
 
 
 def _compute_series_stats(trades: list[dict]) -> dict:
+    vol = _yes_bid_volatility_by_series(15)
     stats = {}
     for s in ("KXBTC15M", "KXETH15M", "KXSOL15M"):
         sl = [t for t in trades if t.get("series") == s]
@@ -730,6 +818,7 @@ def _compute_series_stats(trades: list[dict]) -> dict:
             "win_rate": round(wins / total * 100, 1) if total else 0,
             "pnl":      round(pnl, 4),
             "last_price": last_p,
+            "volatility_pct": float(vol.get(s) or 0.0),
         }
     return stats
 
@@ -776,41 +865,23 @@ def _compute_trade_feed(market_maker_day: list[dict], coinbase_day: list[dict]) 
             f["ts"] = ts[:5]
     return feed[:40]
 
-def _compute_freq(trades: list[dict]) -> list[int]:
-    """Trade count per hour for last 24h, index 0=oldest, 23=most recent."""
-    buckets = [0] * 24
-    now = datetime.now(timezone.utc)
-    for t in trades:
-        raw = (t.get("entry_time") or t.get("time") or "")[:19]
-        if not raw:
-            continue
-        try:
-            dt = datetime.fromisoformat(raw.replace(" ", "T"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            diff_h = (now - dt).total_seconds() / 3600
-            if 0 <= diff_h < 24:
-                idx = 23 - int(diff_h)
-                buckets[idx] += 1
-        except Exception:
-            pass
-    return buckets
-
 
 def _compute_orderbook() -> dict:
     """Depth ladder from latest momentum.log YES/NO bids (500ms-polled via terminal API)."""
     parsed = _parse_latest_momentum_book()
     if parsed:
         return parsed
+    bids = [{"p": 49.0 - i, "q": max(4, 48 - i * 5)} for i in range(0, 6)]
+    asks = [{"p": 51.0 + i, "q": max(4, 44 - i * 5)} for i in range(0, 6)]
     return {
         "series": "—",
-        "mid": None,
-        "yes_bid": None,
-        "yes_ask": None,
-        "no_bid": None,
-        "bids": [],
-        "asks": [],
-        "depth_source": None,
+        "mid": 50.0,
+        "yes_bid": 49.0,
+        "yes_ask": 51.0,
+        "no_bid": 49.0,
+        "bids": bids,
+        "asks": asks,
+        "depth_source": "synthetic",
         "log_ts": "",
     }
 
@@ -820,6 +891,11 @@ def _terminal_safe_default() -> dict:
     now_hms = datetime.now(timezone.utc).strftime("%H:%M:%S")
     now_pts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     day_anchor = datetime.now(timezone.utc).strftime("%Y-%m-%d") + " 00:00"
+    wd = datetime.now(timezone.utc).date()
+    week0 = [
+        {"date": (wd - timedelta(days=k)).isoformat(), "pnl": 0.0, "trades": 0}
+        for k in range(6, -1, -1)
+    ]
     series_blank = {}
     for s in ("KXBTC15M", "KXETH15M", "KXSOL15M"):
         series_blank[s] = {
@@ -829,6 +905,7 @@ def _terminal_safe_default() -> dict:
             "win_rate": 0.0,
             "pnl": 0.0,
             "last_price": 0,
+            "volatility_pct": 0.0,
         }
     empty_ob = {
         "series": "—",
@@ -860,12 +937,13 @@ def _terminal_safe_default() -> dict:
         "feed":      [],
         "orderbook": empty_ob,
         "series":    series_blank,
-        "freq":      [0] * 24,
+        "weekly_pnl": list(week0),
         "console":   [],
         "mm": {
             "running":  False,
             "pid":      0,
             "last_log": "—",
+            "total":    0,
             "trades":   0,
             "wins":     0,
             "losses":   0,
@@ -877,6 +955,8 @@ def _terminal_safe_default() -> dict:
             "paper": True,
             "equity_pnl_title": "PAPER P&L",
         },
+        "streak": {"kind": "flat", "n": 0, "label": "", "tone": ""},
+        "market_open": False,
     }
 
 
@@ -947,6 +1027,7 @@ def _ensure_terminal_shape(d: Optional[dict]) -> dict:
                     "win_rate": float(row.get("win_rate") or 0),
                     "pnl": float(row.get("pnl") or 0),
                     "last_price": row.get("last_price", 0) or 0,
+                    "volatility_pct": float(row.get("volatility_pct") or 0),
                 }
 
     mm = d.get("mm")
@@ -957,6 +1038,7 @@ def _ensure_terminal_shape(d: Optional[dict]) -> dict:
             "running": bool(mm.get("running", False)),
             "pid": int(mm.get("pid") or 0),
             "last_log": str(mm.get("last_log") or "—")[:80],
+            "total": int(mm.get("total") if mm.get("total") is not None else tot),
             "trades": tot,
             "wins": wins,
             "losses": int(mm.get("losses") if mm.get("losses") is not None else (tot - wins)),
@@ -967,12 +1049,34 @@ def _ensure_terminal_shape(d: Optional[dict]) -> dict:
     if isinstance(d.get("console"), list):
         z["console"] = [str(line) for line in d["console"]]
 
-    fr = d.get("freq")
-    if isinstance(fr, list) and fr:
-        buckets = [int(x) for x in fr[:24]]
-        while len(buckets) < 24:
-            buckets.append(0)
-        z["freq"] = buckets[:24]
+    wp = d.get("weekly_pnl")
+    if isinstance(wp, list) and wp:
+        clean_wp: list[dict] = []
+        for p in wp[:14]:
+            if isinstance(p, dict):
+                clean_wp.append(
+                    {
+                        "date": str(p.get("date") or ""),
+                        "pnl": float(p.get("pnl") or 0),
+                        "trades": int(p.get("trades") or 0),
+                    }
+                )
+        if len(clean_wp) >= 7:
+            z["weekly_pnl"] = clean_wp[-7:]
+        elif clean_wp:
+            z["weekly_pnl"] = clean_wp
+
+    stk = d.get("streak")
+    if isinstance(stk, dict):
+        z["streak"] = {
+            "kind": str(stk.get("kind") or "flat"),
+            "n": int(stk.get("n") or 0),
+            "label": str(stk.get("label") or ""),
+            "tone": str(stk.get("tone") or ""),
+        }
+
+    if "market_open" in d:
+        z["market_open"] = bool(d.get("market_open"))
 
     if d.get("updated"):
         z["updated"] = str(d["updated"])
@@ -1003,6 +1107,7 @@ def _compute_mm_stats(mm_trades: Optional[list] = None) -> dict:
         "running":  running,
         "pid":      pid,
         "last_log": last[:80] if last and last != "(log not found)" else "—",
+        "total":    total,
         "trades":   total,
         "wins":     wins,
         "losses":   total - wins,
@@ -1045,8 +1150,6 @@ def _compute_terminal_data() -> dict:
                 combo_edges.append(100.0 - yc - nc)
         avg_combo = round(sum(combo_edges) / len(combo_edges), 2) if combo_edges else 0.0
 
-        cb_all = _load_jsonl(COINBASE_TRADES)
-
         return {
             "bots": {
                 "kalshi":     {"running": m_run, "pid": m_pid},
@@ -1063,13 +1166,15 @@ def _compute_terminal_data() -> dict:
             "feed":      _compute_trade_feed(mm_day, []),
             "orderbook": _compute_orderbook(),
             "series":    _compute_series_stats(mm_day),
-            "freq":      _compute_freq(mm_mode + cb_all),
+            "weekly_pnl": _compute_weekly_pnl(mm_mode),
             "console":   _last_n_lines(MOMENTUM_LOG, 18),
             "mm":        _compute_mm_stats(mm_mode),
             "dashboard_mm": {
                 "paper": bool(paper_mm),
                 "equity_pnl_title": "PAPER P&L" if paper_mm else "LIVE P&L",
             },
+            "streak":    _compute_streak_mm(mm_mode),
+            "market_open": _probe_market_open_cached(),
             "updated":   datetime.now(timezone.utc).strftime("%H:%M:%S"),
         }
     except Exception:
@@ -1239,28 +1344,7 @@ def api_bot_controls():
         out["ok"] = True
         return jsonify(out)
 
-    if action == "save_params":
-        if isinstance(body.get("params"), dict):
-            src: dict = body["params"]
-        else:
-            src = body
-        picks: dict[str, object] = {}
-        for key in _MM_ADJUSTABLE_KEYS:
-            if key in src and src[key] is not None and src[key] != "":
-                picks[key] = src[key]
-        if not picks:
-            return jsonify({"ok": False, "error": "no recognizable params"}), 400
-        err = _save_mm_adjustable_params(picks)
-        if err:
-            return jsonify({"ok": False, "error": err}), 400
-        _term_cache["data"] = None
-        _term_cache["ts"] = 0.0
-        out = _bot_controls_snapshot()
-        out["ok"] = True
-        out["restart_hint"] = "Restart market_maker.py to load new constants."
-        return jsonify(out)
-
-    return jsonify({"ok": False, "error": 'use action "start", "stop", or "save_params"'}), 400
+    return jsonify({"ok": False, "error": 'use action "start" or "stop"'}), 400
 
 
 @app.route("/api/terminal")
@@ -1340,27 +1424,6 @@ def api_balance():
     )
 
 
-@app.route("/api/positions")
-@auth_required
-def api_positions():
-    """Kalshi resting limit orders."""
-    _ensure_kalshi_credentials_path()
-    stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    try:
-        orders, err = asyncio.run(_mm_fetch_resting_orders())
-    except Exception as e:
-        log.exception("api/positions")
-        return jsonify({"ok": False, "orders": [], "updated": stamp, "error": str(e)})
-    resp: dict[str, Any] = {
-        "ok": err is None,
-        "orders": orders,
-        "updated": stamp,
-    }
-    if err:
-        resp["error"] = err
-    return jsonify(resp)
-
-
 @app.route("/api/cancel-all", methods=["POST"])
 @auth_required
 def api_cancel_all():
@@ -1420,6 +1483,32 @@ def api_logs_momentum():
     return Response(_last_n_full_lines(MOMENTUM_LOG, 100), mimetype="text/plain")
 
 
+@app.route("/api/coinbase-spot")
+@auth_required
+def api_coinbase_spot():
+    """Spot prices for ticker strip (BTC, ETH, SOL)."""
+    return jsonify(_fetch_coinbase_spot_prices())
+
+
+@app.route("/static/<path:filename>")
+@auth_required
+def static_files(filename: str):
+    return send_from_directory(STATIC_DIR, filename)
+
+
+@app.route("/api/kalshi-latency")
+@auth_required
+def api_kalshi_latency():
+    """GET portfolio/balance round-trip latency (ms)."""
+    _ensure_kalshi_credentials_path()
+    try:
+        ms, err = asyncio.run(_mm_ping_balance_ms())
+    except Exception as exc:
+        log.exception("api/kalshi-latency")
+        return jsonify({"ok": False, "ms": None, "error": str(exc)})
+    return jsonify({"ok": err is None and ms is not None, "ms": ms, "error": err})
+
+
 @app.route("/")
 @auth_required
 def index():
@@ -1459,8 +1548,19 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 
 /* ── Terminal grid ── */
 #T{display:grid;height:100vh;
-   grid-template-rows:40px minmax(0,1fr) minmax(118px,21vh) 130px;
+   grid-template-rows:40px minmax(380px,1fr) auto minmax(112px,calc(10vh + 40px));
    background:#000;overflow:hidden}
+
+.tb-streak{font-size:11px;font-weight:600;margin:0 2px}
+.tb-mkt{font-size:11px;font-weight:600}
+.tb-ping{font-size:8px;margin-left:4px;color:#00ff41}
+.tb-ping.amb{color:#ffaa00}
+.tb-ping.slow{color:#ff3131}
+.sound-toggle{
+  margin-left:6px;background:transparent;border:1px solid #00ff4133;color:#00ff41;
+  font-family:inherit;font-size:12px;line-height:1;cursor:pointer;padding:2px 6px;
+}
+.sound-toggle.muted{color:#00ff4144;border-color:#00ff4118}
 
 /* ═══════════════════════════════════════════
    TOP BAR
@@ -1523,6 +1623,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
   display:grid;
   grid-template-columns:230px 1fr 228px;
   overflow:hidden;
+  min-height:0;
 }
 
 /* shared panel chrome */
@@ -1536,31 +1637,11 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .ph-meta{font-size:7px;letter-spacing:1px;color:#00ff4144}
 .ph-val{font-size:9px;font-weight:500}
 
-/* ── LEFT: Live Fills + resting orders ── */
+/* ── LEFT: Live Fills ── */
 #LF{min-height:0}
 #lf-feed-block{
   flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden;
-  border-bottom:1px solid #00ff4118;
 }
-#lf-orders-pane{
-  flex:0 1 42%;max-height:42%;min-height:96px;display:flex;
-  flex-direction:column;overflow:hidden;background:#030603;
-}
-.pos-list{
-  flex:1;min-height:0;overflow-y:auto;padding:2px 0;
-  font-size:8px;line-height:1.36;color:#00ff4188;
-}
-.pos-row{
-  display:grid;
-  grid-template-columns:minmax(0,1fr) 24px 34px 20px;
-  gap:3px;font-size:8px;padding:2px 6px;
-  border-bottom:1px solid #00ff410c;align-items:baseline;font-family:inherit;
-}
-.pos-t{color:#00ff41aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pos-side{font-size:7px;color:#ffb020;text-align:center;text-transform:uppercase}
-.pos-pr{color:#00ff41;text-align:right;font-weight:500;font-size:8px}
-.pos-n{text-align:right;font-size:7px;color:#00ff4177}
-.pos-err{padding:6px 8px;font-size:8px;color:#ff6b6b}
 
 #feed-list{flex:1;overflow-y:auto;overflow-x:hidden}
 .frow{
@@ -1589,30 +1670,35 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 .f-pnl{font-size:9px;font-weight:500;text-align:right}
 .empty-msg{color:#00ff4133;font-size:9px;text-align:center;padding:16px;letter-spacing:1px}
 
-/* ── CENTER (2 rows) ── */
-#CN{display:grid;grid-template-rows:58% 42%;overflow:hidden}
-#eq-pane{display:flex;flex-direction:column;overflow:hidden;border-bottom:1px solid #00ff4118}
-#ob-pane{display:flex;flex-direction:column;overflow:hidden}
+/* ── CENTER (2 rows) — equity above, depth always gets min height ── */
+#CN{
+  display:grid;
+  grid-template-rows:minmax(140px,1fr) 280px;
+  overflow:hidden;
+  min-height:0;
+}
+#eq-pane{display:flex;flex-direction:column;overflow:hidden;border-bottom:1px solid #00ff4118;min-height:0}
+#ob-pane{display:flex;flex-direction:column;overflow:hidden;height:280px;min-height:280px;max-height:280px}
 #eq-wrap{flex:1;position:relative;min-height:0;padding:2px 4px 0 4px}
 #equity-chart{width:100%!important;height:100%!important}
-#ob-body{flex:1;overflow-y:auto;padding:4px 8px}
+#ob-body{flex:1;overflow:hidden;padding:5px 8px;display:flex;flex-direction:column;justify-content:stretch}
 
 /* order book rows */
 .obr{display:grid;grid-template-columns:34px 1fr 30px;gap:4px;
-     align-items:center;padding:1px 0;font-size:9px}
+     align-items:center;flex:1;min-height:0;font-size:9px}
 .obp{text-align:right;color:#00ff4199}
 .obq{color:#00ff4144;text-align:right;font-size:8px}
-.obbar{height:7px;background:#001100;position:relative;overflow:hidden}
+.obbar{height:78%;min-height:9px;background:#001100;position:relative;overflow:hidden}
 .obbid{height:100%;background:#00ff4155;position:absolute;right:0}
 .obask{height:100%;background:#ff313155;position:absolute;left:0}
 .ob-mid{
   text-align:center;color:#ffaa00;font-size:9px;font-weight:600;
-  padding:4px 0;margin:2px 0;
+  padding:5px 0;margin:3px 0;flex:0 0 auto;
   border-top:1px solid #ffaa0033;border-bottom:1px solid #ffaa0033;
 }
 
 /* ── RIGHT ── */
-#RC{border-right:none;display:grid;grid-template-rows:1fr 182px}
+#RC{border-right:none;display:grid;grid-template-rows:1fr 182px;min-height:0}
 #sp-pane{display:flex;flex-direction:column;overflow:hidden;border-bottom:1px solid #00ff4118}
 #con-pane{display:flex;flex-direction:column;overflow:hidden}
 #sp-body{flex:1;overflow-y:auto;padding:8px}
@@ -1644,12 +1730,16 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
   overflow:hidden;
 }
 #fr-pane{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid #00ff4118}
-#btc-pane{display:flex;flex-direction:column;overflow:hidden}
-#fr-wrap,#btc-wrap{flex:1;position:relative;padding:2px 4px}
-#fr-wrap{min-height:0}
-#btc-wrap{min-height:88px}
-#freq-chart{width:100%!important;height:100%!important}
-#btc-canvas{display:block;width:100%;height:100%}
+#btc-pane{display:flex;flex-direction:column;overflow:hidden;min-height:0}
+#fr-wrap,#btc-wrap{flex:1;position:relative;padding:2px 4px;min-height:0}
+#fr-wrap{min-height:88px}
+#pnl-chart{width:100%!important;height:100%!important}
+
+.vol-wrap{display:flex;align-items:center;gap:4px;margin-top:4px}
+.vol-cap{font-size:6px;color:#00ff4188;text-transform:uppercase;letter-spacing:.5px;width:52px}
+.vol-bar-track{flex:1;height:4px;background:#001100;border-radius:0;overflow:hidden}
+.vol-bar{height:100%;background:#558866;min-width:0}
+.vol-bar.vol-hi{background:linear-gradient(90deg,#553300,#ffaa00)}
 
 /* ═══════════════════════════════════════════
    BOT CONTROLS STRIP
@@ -1658,10 +1748,12 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
   border-top:1px solid #00ff4118;
   border-bottom:1px solid #00ff4133;
   background:#000811;
-  overflow:hidden;
-  padding:4px 8px 5px;
+  overflow:auto;
+  padding:0;
+  max-height:192px;
+  flex-shrink:0;
 }
-#bc-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) 200px;gap:8px;align-items:stretch;height:100%}
+#bc-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;align-items:start;padding:4px 8px 6px;height:auto;min-height:0}
 .bc-card{
   border:1px solid #00ff4122;display:flex;flex-direction:column;
   min-height:0;overflow:hidden;background:#000;
@@ -1689,20 +1781,13 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 }
 .bc-btn-cancel-all:hover{background:#44000033!important;border-color:#ff5555!important;color:#ff8a8a!important}
 .bc-log{
-  flex:1;min-height:0;overflow:auto;margin:0;padding:4px 6px;
+  flex:0 0 auto;margin:0;padding:4px 6px;
+  max-height:140px;
+  overflow-x:hidden;
+  overflow-y:scroll;
   font-size:8px;line-height:1.45;color:#00ff4199;white-space:pre-wrap;word-break:break-all;
   font-family:'IBM Plex Mono',monospace;background:#000402;
 }
-.bc-params{border:1px solid #00ff4122;display:flex;flex-direction:column;min-height:0;padding:4px 6px;gap:5px;background:#000}
-.bc-plbl{font-size:7px;letter-spacing:1px;color:#00ff4155;text-transform:uppercase}
-.bc-pin{
-  width:100%;background:#000;border:1px solid #00ff4133;color:#00ff41;
-  font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 5px;
-  outline:none;box-sizing:border-box;
-}
-.bc-pin:focus{border-color:#00ff41}
-.bc-save{margin-top:auto;flex-shrink:0}
-.bc-hint{font-size:6px;color:#ffaa0099;line-height:1.3;margin:0;padding:2px 0}
 </style>
 </head>
 <body>
@@ -1715,11 +1800,11 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <span class="tb-lbl">UTC</span><span id="clock" class="tb-val">--:--:--</span>
     <span class="tb-sep">│</span>
     <span class="tb-lbl">BAL</span><span id="tb-bal" class="tb-val tb-bal" title="Live Kalshi portfolio balance">—</span>
-    <span class="tb-sep">│</span>
-    <span id="tb-open-orders" class="tb-val tb-orders" title="Kalshi resting orders">OPEN ORDERS: —</span>
+    <span id="tb-mkt" class="tb-val tb-mkt" title="Recent Kalshi sessions (momentum.log)">MKT …</span>
     <span class="tb-sep">│</span>
     <span class="tb-lbl">P&amp;L</span><span id="tb-pnl" class="tb-val">—</span>
     <span class="tb-sep">│</span>
+    <span id="tb-streak" class="tb-val tb-streak g-faint" title="Recent closed-trade streak (mode-filtered MM)">—</span>
     <span class="tb-lbl">WIN</span><span id="tb-wr" class="tb-val">—</span>
     <span class="tb-sep">│</span>
     <span class="tb-lbl">FILLS</span><span id="tb-fills" class="tb-val">—</span>
@@ -1728,7 +1813,8 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     <span id="tb-api-error" class="tb-api-err"></span>
     <div class="tb-spacer"></div>
     <span id="tb-updated"></span>
-    <div class="bot-tag"><span class="bdot" id="dot-kalshi"></span>KALSHI</div>
+    <button type="button" id="sound-toggle" class="sound-toggle" title="Toggle fill sound alerts">🔊</button>
+    <div class="bot-tag"><span class="bdot" id="dot-kalshi"></span>KALSHI <span id="tb-kal-ping" class="tb-ping" title="GET portfolio/balance latency">—</span></div>
     <div class="bot-tag"><span class="bdot" id="dot-coinbase"></span>COINBASE</div>
     <div class="bot-tag"><span class="bdot" id="dot-polymarket"></span>POLY</div>
     <span id="tb-mm-mode" class="mode-badge mode-paper">PAPER</span>
@@ -1738,7 +1824,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
   <!-- ══ MAIN AREA ══ -->
   <div id="MA">
 
-    <!-- LEFT: Trade Feed + resting orders -->
+    <!-- LEFT: Trade Feed -->
     <div class="pane" id="LF">
       <div id="lf-feed-block">
         <div class="ph">
@@ -1747,13 +1833,6 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
           <span class="ph-meta" id="feed-count">0 TRADES</span>
         </div>
         <div id="feed-list"></div>
-      </div>
-      <div id="lf-orders-pane">
-        <div class="ph">
-          <span class="ph-title">Resting Orders</span>
-          <span class="ph-meta g-faint" id="pos-ts">Kalshi · —</span>
-        </div>
-        <div id="pos-list" class="pos-list"></div>
       </div>
     </div>
 
@@ -1830,34 +1909,22 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
         </div>
         <pre class="bc-log" id="bc-log-mm"></pre>
       </div>
-      <div class="bc-params">
-        <span class="bc-plbl">MAX_YES_INVENTORY_LIVE</span>
-        <input class="bc-pin" id="bc-par-yesliv" autocomplete="off" />
-        <span class="bc-plbl">DAILY_LOSS_LIMIT_USD</span>
-        <input class="bc-pin" id="bc-par-daily" autocomplete="off" />
-        <span class="bc-plbl">SESSION_HALT_MIN_LOSS_USD</span>
-        <input class="bc-pin" id="bc-par-sesshalt" autocomplete="off" />
-        <p class="bc-hint" id="bc-param-hint">Values written to market_maker.py · restart MM to apply</p>
-        <button type="button" class="bc-btn bc-save" id="bc-save-params">Save params</button>
-      </div>
     </div>
   </div>
 
   <!-- ══ BOTTOM BAR ══ -->
   <div id="BB">
 
-    <!-- Trade Frequency -->
     <div id="fr-pane">
       <div class="ph">
-        <span class="ph-title">Trade Freq</span>
-        <span class="ph-meta">24H</span>
+        <span class="ph-title">Daily P&amp;L</span>
+        <span class="ph-meta">7D UTC · mode-filtered MM</span>
       </div>
       <div id="fr-wrap">
-        <canvas id="freq-chart"></canvas>
+        <canvas id="pnl-week-chart"></canvas>
       </div>
     </div>
 
-    <!-- BTC/USD Candlestick -->
     <div id="btc-pane">
       <div class="ph">
         <span class="ph-title">BTC/USD</span>
@@ -1869,6 +1936,7 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
     </div>
 
   </div>
+
 </div>
 
 <script>
@@ -1876,15 +1944,18 @@ html,body{height:100vh;overflow:hidden;background:#000;color:#00ff41;
 
 // ── Constants ────────────────────────────────────────────
 const POLL_MS      = 500;
-const BTC_POLL_MS  = 15000;
+const BTC_POLL_MS  = 10000;
+const KAL_PING_MS  = 10000;
 
 // ── State ────────────────────────────────────────────────
-let equityChart  = null;
-let freqChart    = null;
-let btcCandles   = [];
-let lastBtcFetch = 0;
-let lastFeedTs   = '';
-let btcLayoutRetries = 0;
+let equityChart       = null;
+let pnlWeekChart      = null;
+let btcCandles        = [];
+let lastBtcFetch      = 0;
+let lastFeedTs        = '';
+let btcLayoutRetries  = 0;
+let lastFillCount     = null;
+let fillSoundMuted    = localStorage.getItem('fillSoundMuted') === '1';
 // ── Clock ────────────────────────────────────────────────
 function updateClock() {
   const d = new Date();
@@ -1903,7 +1974,50 @@ function esc(s) {
 const FETCH_CRED = { credentials: 'include' };
 const BOT_CTRL_POLL_MS = 2800;
 const BAL_POLL_MS = 30000;
-const POS_POLL_MS = 10000;
+
+function updateSoundToggle() {
+  const btn = document.getElementById('sound-toggle');
+  if (!btn) return;
+  btn.textContent = fillSoundMuted ? '🔇' : '🔊';
+  btn.className = 'sound-toggle' + (fillSoundMuted ? ' muted' : '');
+  btn.title = fillSoundMuted ? 'Fill sound alerts muted' : 'Fill sound alerts enabled';
+}
+
+function attachSoundToggle() {
+  const btn = document.getElementById('sound-toggle');
+  if (!btn || btn.dataset.bound === '1') return;
+  btn.dataset.bound = '1';
+  updateSoundToggle();
+  btn.addEventListener('click', function () {
+    fillSoundMuted = !fillSoundMuted;
+    localStorage.setItem('fillSoundMuted', fillSoundMuted ? '1' : '0');
+    updateSoundToggle();
+  });
+}
+
+function currentFillCount(d) {
+  const mmTotal = d && d.mm && d.mm.total;
+  if (mmTotal != null && Number.isFinite(Number(mmTotal))) return Number(mmTotal);
+  return Array.isArray(d && d.feed) ? d.feed.length : 0;
+}
+
+function playFillSoundOnce() {
+  if (fillSoundMuted) return;
+  const audio = new Audio('/static/order_fill.mp3');
+  audio.volume = 0.6;
+  audio.play().catch(() => {});
+}
+
+function maybePlayFillSounds(d) {
+  const count = currentFillCount(d);
+  if (lastFillCount === null) {
+    lastFillCount = count;
+    return;
+  }
+  const delta = Math.max(0, count - lastFillCount);
+  for (let i = 0; i < delta; i++) playFillSoundOnce();
+  lastFillCount = count;
+}
 
 async function pollKalshiBalance() {
   const balEl = document.getElementById('tb-bal');
@@ -1917,76 +2031,6 @@ async function pollKalshiBalance() {
     }
   } catch (_ex) {
     if (balEl) balEl.textContent = '—';
-  }
-}
-
-function renderRestingOrders(payload) {
-  var ordTop = document.getElementById('tb-open-orders');
-  if (ordTop) {
-    var nShow = null;
-    if (payload && payload.ok === true && Array.isArray(payload.orders))
-      nShow = payload.orders.length;
-    ordTop.textContent = nShow !== null ? 'OPEN ORDERS: ' + nShow : 'OPEN ORDERS: —';
-  }
-  const box = document.getElementById('pos-list');
-  const ts = document.getElementById('pos-ts');
-  if (ts && payload && payload.updated) ts.textContent = 'Kalshi · ' + payload.updated;
-  if (!box) return;
-  if (!payload) {
-    box.innerHTML = '<div class="pos-err">NO DATA</div>';
-    return;
-  }
-  if (!payload.ok && payload.error && !(payload.orders && payload.orders.length)) {
-    box.innerHTML = '<div class="pos-err">' + esc(String(payload.error)) + '</div>';
-    return;
-  }
-  var rows = Array.isArray(payload.orders) ? payload.orders : [];
-  if (!rows.length) {
-    box.innerHTML =
-      '<div class="empty-msg" style="padding:8px 6px;font-size:8px">NO RESTING ORDERS</div>';
-    return;
-  }
-  box.innerHTML = rows
-    .map(function (o) {
-      return (
-        '<div class="pos-row">' +
-        '<span class="pos-t">' +
-        esc(o.ticker || '') +
-        '</span>' +
-        '<span class="pos-side">' +
-        esc(String(o.side || '').slice(0, 6)) +
-        '</span>' +
-        '<span class="pos-pr">' +
-        esc(o.price_display || '—') +
-        '</span>' +
-        '<span class="pos-n">' +
-        esc(o.count != null ? String(o.count) : '') +
-        '</span></div>'
-      );
-    })
-    .join('');
-}
-
-async function pollKalshiPositions() {
-  try {
-    const res = await fetch('/api/positions', FETCH_CRED);
-    if (!res.ok) {
-      renderRestingOrders({
-        ok: false,
-        orders: [],
-        error: 'HTTP ' + res.status,
-        updated: '—',
-      });
-      return;
-    }
-    renderRestingOrders(await res.json());
-  } catch (e) {
-    renderRestingOrders({
-      ok: false,
-      orders: [],
-      error: e.message || String(e),
-      updated: '—',
-    });
   }
 }
 
@@ -2005,18 +2049,6 @@ async function refreshBotControls() {
     var lr = document.getElementById('bc-log-mm');
     if (lm && d.logs && d.logs.momentum != null) lm.textContent = d.logs.momentum || '(empty)';
     if (lr && d.logs && d.logs.market_maker != null) lr.textContent = d.logs.market_maker || '(empty)';
-    var p = d.market_maker_params || {};
-    var pairs = [
-      ['bc-par-yesliv', 'MAX_YES_INVENTORY_LIVE'],
-      ['bc-par-daily', 'DAILY_LOSS_LIMIT_USD'],
-      ['bc-par-sesshalt', 'SESSION_HALT_MIN_LOSS_USD'],
-    ];
-    for (var i = 0; i < pairs.length; i++) {
-      var el = document.getElementById(pairs[i][0]);
-      var key = pairs[i][1];
-      if (!el || el === document.activeElement) continue;
-      if (p[key] != null && p[key] !== '') el.value = String(p[key]);
-    }
   } catch (_e) {}
 }
 
@@ -2051,15 +2083,7 @@ function attachBotControlsHandlers() {
   var ca = document.getElementById('bc-cancel-all');
   if (ca) {
     ca.addEventListener('click', async function () {
-      var n = 0;
-      try {
-        var pr = await fetch('/api/positions', FETCH_CRED);
-        if (pr.ok) {
-          var pj = await pr.json();
-          if (pj && Array.isArray(pj.orders)) n = pj.orders.length;
-        }
-      } catch (_e) {}
-      if (!confirm('Cancel all ' + n + ' resting orders?')) return;
+      if (!confirm('Cancel all resting orders?')) return;
       ca.disabled = true;
       try {
         var res = await fetch('/api/cancel-all', {
@@ -2081,7 +2105,6 @@ function attachBotControlsHandlers() {
         } else {
           alert((j.errors && j.errors.join('\n')) || 'Cancel-all failed');
         }
-        await pollKalshiPositions();
       } catch (e) {
         alert(String(e.message || e));
       }
@@ -2089,39 +2112,6 @@ function attachBotControlsHandlers() {
     });
   }
 
-  var sv = document.getElementById('bc-save-params');
-  if (sv) {
-    sv.addEventListener('click', async function () {
-      sv.disabled = true;
-      try {
-        var body = {
-          action: 'save_params',
-          params: {
-            MAX_YES_INVENTORY_LIVE: document.getElementById('bc-par-yesliv').value,
-            DAILY_LOSS_LIMIT_USD: document.getElementById('bc-par-daily').value,
-            SESSION_HALT_MIN_LOSS_USD: document.getElementById('bc-par-sesshalt').value,
-          },
-        };
-        var res = await fetch('/api/bot-controls', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify(body),
-        });
-        var j = await res.json().catch(function () { return {}; });
-        if (!res.ok || !j.ok) {
-          alert((j && j.error) || ('HTTP ' + res.status));
-          return;
-        }
-        var h = document.getElementById('bc-param-hint');
-        if (h && j.restart_hint) h.textContent = j.restart_hint;
-        await refreshBotControls();
-      } catch (e) {
-        alert(String(e.message || e));
-      }
-      sv.disabled = false;
-    });
-  }
 }
 
 function setTerminalApiError(msg) {
@@ -2139,7 +2129,7 @@ function setTerminalApiError(msg) {
 }
 
 function defaultSeriesRow() {
-  return { trades: 0, wins: 0, losses: 0, win_rate: 0, pnl: 0, last_price: 0 };
+  return { trades: 0, wins: 0, losses: 0, win_rate: 0, pnl: 0, last_price: 0, volatility_pct: 0 };
 }
 
 /** Ensures shapes expected by render*(); prevents blank dashboard on partial responses. */
@@ -2180,7 +2170,9 @@ function normalizeTerminalPayload(d) {
       pnl: 0,
     },
     console: [],
-    freq: Array.from({ length: 24 }, () => 0),
+    weekly_pnl: [],
+    streak: { kind: 'flat', n: 0, label: '', tone: '' },
+    market_open: false,
     updated: '—',
     dashboard_mm: { paper: true, equity_pnl_title: 'PAPER P&L' },
   };
@@ -2248,6 +2240,7 @@ function normalizeTerminalPayload(d) {
           win_rate: Number(r.win_rate) || 0,
           pnl: Number(r.pnl) || 0,
           last_price: r.last_price != null ? r.last_price : 0,
+          volatility_pct: Number(r.volatility_pct) || 0,
         };
       }
     });
@@ -2275,11 +2268,31 @@ function normalizeTerminalPayload(d) {
 
   if (Array.isArray(d.console)) z.console = d.console.map(x => String(x));
 
-  if (Array.isArray(d.freq) && d.freq.length) {
-    const fr = d.freq.slice(0, 24).map(x => Number(x) || 0);
-    while (fr.length < 24) fr.push(0);
-    z.freq = fr;
+  if (Array.isArray(d.weekly_pnl)) {
+    const wp = d.weekly_pnl
+      .map(p => {
+        if (!p || typeof p !== 'object') return null;
+        return {
+          date: String(p.date || ''),
+          pnl: Number(p.pnl) || 0,
+          trades: Number(p.trades) || 0,
+        };
+      })
+      .filter(Boolean);
+    if (wp.length) z.weekly_pnl = wp;
   }
+
+  if (d.streak && typeof d.streak === 'object') {
+    z.streak = {
+      kind: String(d.streak.kind || 'flat'),
+      n: Number(d.streak.n) || 0,
+      label: String(d.streak.label || ''),
+      tone: String(d.streak.tone || ''),
+    };
+  }
+
+  if ('market_open' in d && d.market_open !== null && d.market_open !== undefined)
+    z.market_open = !!d.market_open;
 
   if (d.updated != null && d.updated !== '') z.updated = String(d.updated);
 
@@ -2349,33 +2362,66 @@ function initCharts() {
     }
   });
 
-  // Frequency bar chart
-  const fCtx = document.getElementById('freq-chart').getContext('2d');
-  freqChart = new Chart(fCtx, {
+  // 7-day P&L (UTC, mode-filtered on server)
+  const pnlEl = document.getElementById('pnl-week-chart');
+  if (!pnlEl) return;
+  const fCtx = pnlEl.getContext('2d');
+  const today = new Date();
+  const dayLbl = (_, i) => {
+    const d = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6 + i));
+    return (d.getUTCMonth() + 1) + '/' + String(d.getUTCDate()).padStart(2, '0');
+  };
+  pnlWeekChart = new Chart(fCtx, {
     type: 'bar',
     data: {
-      labels: Array.from({length: 24}, (_, i) => {
-        const h = (new Date().getUTCHours() - 23 + i + 24) % 24;
-        return i % 4 === 0 ? h + 'h' : '';
-      }),
+      labels: Array.from({ length: 7 }, dayLbl),
       datasets: [{
-        data: new Array(24).fill(0),
-        backgroundColor: '#00ff4155',
-        borderColor: '#00ff41bb',
+        data: Array(7).fill(0),
+        backgroundColor: Array(7).fill('rgba(0,255,65,0.45)'),
+        borderColor: Array(7).fill('#00ff41aa'),
         borderWidth: 0.5,
         borderRadius: 0,
-      }]
+      }],
     },
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#001100',
+          borderColor: '#00ff4155',
+          borderWidth: 1,
+          titleColor: '#00ff4166',
+          bodyColor: '#00ff41',
+          titleFont: { family: FONT, size: 8 },
+          bodyFont: { family: FONT, size: 9 },
+          callbacks: {
+            afterLabel(ctx) {
+              const w = (ctx.chart.data._wp && ctx.chart.data._wp[ctx.dataIndex]) || {};
+              const t = Number(w.trades) || 0;
+              return 'trades ' + t;
+            },
+          },
+        },
+      },
       scales: {
-        x: { grid: { display: false }, border: { color: '#00ff4122' },
-             ticks: { color: '#00ff4144', font: { family: FONT, size: 7 }, maxRotation: 0 } },
-        y: { min: 0, grid: { color: GRID, drawBorder: false }, border: { color: '#00ff4122' },
-             ticks: { color: '#00ff4144', font: { family: FONT, size: 8 }, maxTicksLimit: 3 } }
-      }
-    }
+        x: {
+          grid: { display: false },
+          border: { color: '#00ff4122' },
+          ticks: { color: '#00ff4144', font: { family: FONT, size: 7 }, maxRotation: 0 },
+        },
+        y: {
+          grid: { color: GRID, drawBorder: false },
+          border: { color: '#00ff4122' },
+          ticks: {
+            color: '#00ff4144',
+            font: { family: FONT, size: 8 },
+            maxTicksLimit: 4,
+            callback: v => (v >= 0 ? '+' : '') + '$' + Number(v).toFixed(2),
+          },
+        },
+      },
+    },
   });
 }
 
@@ -2397,6 +2443,28 @@ function renderTopBar(d) {
   document.getElementById('tb-fills').textContent  = String(nt || '0');
   document.getElementById('tb-spread').textContent = (Number(s.avg_spread) || 0).toFixed(1) + '¢';
   document.getElementById('tb-updated').textContent = (d.updated || '—') + ' UTC';
+
+  const mk = document.getElementById('tb-mkt');
+  if (mk) {
+    const mo = !!d.market_open;
+    mk.textContent = mo ? 'MKT OPEN' : 'MKT CLOSED';
+    mk.className = 'tb-val tb-mkt ' + (mo ? 'pos' : 'neg');
+    mk.title = 'Momentum log Kalshi sessions (recent "New session" lines)';
+  }
+
+  const stEl = document.getElementById('tb-streak');
+  if (stEl) {
+    const sk = d.streak && d.streak.label ? String(d.streak.label) : '';
+    stEl.textContent = sk || '—';
+    const tone =
+      d.streak && d.streak.tone === 'pos'
+        ? 'pos'
+        : d.streak && d.streak.tone === 'neg'
+          ? 'neg'
+          : 'g-faint';
+    stEl.className = 'tb-val tb-streak ' + tone;
+    stEl.title = 'Recent consecutive closes (mode-filtered MM JSONL)';
+  }
 
   const bots = d.bots || {};
   ['kalshi', 'coinbase', 'polymarket'].forEach(b => {
@@ -2554,10 +2622,21 @@ function renderSeries(series, mm) {
   const SHORT  = { KXBTC15M: 'BTC', KXETH15M: 'ETH', KXSOL15M: 'SOL' };
   let html = '';
   NAMES.forEach(s => {
-    const d   = series[s] || { trades:0, wins:0, win_rate:0, pnl:0, last_price:0 };
+    const d =
+      series[s] || {
+        trades: 0,
+        wins: 0,
+        win_rate: 0,
+        pnl: 0,
+        last_price: 0,
+        volatility_pct: 0,
+      };
     const pcl = d.pnl >= 0 ? 'pos' : 'neg';
     const pnlStr = (d.pnl >= 0 ? '+' : '') + '$' + Math.abs(d.pnl).toFixed(4);
     const lastStr = d.last_price ? d.last_price + '¢' : '—';
+    const vpc = Number(d.volatility_pct) || 0;
+    const vw = Math.max(6, Math.min(100, vpc * 6));
+    const vHi = vpc >= 0.75;
     html += `<div class="sb">
       <div class="sb-hdr">
         <span class="sb-name">${SHORT[s]} <span class="sb-sub">${s}</span></span>
@@ -2565,9 +2644,14 @@ function renderSeries(series, mm) {
       </div>
       <div class="wbar-wrap"><div class="wbar-fill" style="width:${d.win_rate}%"></div></div>
       <div class="sb-meta">
-        <span>WIN <span class="${d.win_rate>=50?'pos':'neg'}">${d.win_rate}%</span></span>
+        <span>WIN <span class="${d.win_rate >= 50 ? 'pos' : 'neg'}">${d.win_rate}%</span></span>
         <span>FLS <span class="g">${d.trades}</span></span>
         <span>Y+N <span class="amb">${lastStr}</span></span>
+      </div>
+      <div class="vol-wrap">
+        <span class="vol-cap">VOL 15m</span>
+        <div class="vol-bar-track"><div class="vol-bar ${vHi ? 'vol-hi' : ''}" style="width:${vw}%"></div></div>
+        <span class="g-dim" style="font-size:7px">${vpc.toFixed(2)}%</span>
       </div>
       <hr class="sb-div">
     </div>`;
@@ -2610,13 +2694,28 @@ function renderConsole(lines) {
   el.scrollTop = el.scrollHeight;
 }
 
-// ── Render: frequency chart ──────────────────────────────
-function renderFreq(freq) {
-  if (!freqChart) return;
-  let f = Array.isArray(freq) ? [...freq] : [];
-  while (f.length < 24) f.push(0);
-  freqChart.data.datasets[0].data = f.slice(0, 24);
-  freqChart.update('none');
+// ── 7-day P&L bars ────────────────────────────────────────
+function renderWeeklyPnl(rows) {
+  if (!pnlWeekChart) return;
+  let r = Array.isArray(rows) ? [...rows] : [];
+  if (r.length > 7) r = r.slice(-7);
+  while (r.length < 7) r.unshift({ date: '', pnl: 0, trades: 0 });
+  const labels = r.map(w => {
+    const ds = String((w && w.date) || '');
+    const p = ds.split('-');
+    if (p.length >= 3)
+      return String(Number(p[1])) + '/' + String(Number(p[2]));
+    return '?';
+  });
+  const vals = r.map(w => Number((w && w.pnl) || 0));
+  const colors = vals.map(v => (v >= 0 ? 'rgba(0,255,65,0.52)' : 'rgba(255,49,49,0.52)'));
+  const borders = vals.map(v => (v >= 0 ? '#00ff41cc' : '#ff3131cc'));
+  pnlWeekChart.data.labels = labels;
+  pnlWeekChart.data.datasets[0].data = vals;
+  pnlWeekChart.data.datasets[0].backgroundColor = colors;
+  pnlWeekChart.data.datasets[0].borderColor = borders;
+  pnlWeekChart.data._wp = r;
+  pnlWeekChart.update('none');
 }
 
 
@@ -2687,7 +2786,7 @@ function renderBtcCandles(rawCandles) {
   }
   const rng    = (hi > lo) ? (hi - lo) : 1e-12;
 
-  const PAD_T = 6, PAD_B = 14, PAD_L = 4, PAD_R = 54;
+  const PAD_T = 6, PAD_B = 14, PAD_L = 4, PAD_R = 70;
   const CW = Math.max(W0 - PAD_L - PAD_R, 1);
   const CH = Math.max(H0 - PAD_T - PAD_B, 1);
   const cw = CW / n;
@@ -2848,6 +2947,27 @@ function applyMmDashboardDisplay(dm) {
   if (sp) sp.textContent = paper ? 'MM · PAPER · TODAY UTC' : 'MM · LIVE · TODAY UTC';
 }
 
+async function pollKalshiLatency() {
+  const el = document.getElementById('tb-kal-ping');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/kalshi-latency', FETCH_CRED);
+    const d = res.ok ? await res.json() : {};
+    const ms = d.ms != null ? Number(d.ms) : NaN;
+    if (!Number.isFinite(ms)) {
+      const er = d.error != null ? String(d.error) : '—';
+      el.textContent = er.length > 22 ? er.slice(0, 22) + '…' : er;
+      el.className = 'tb-ping slow';
+      return;
+    }
+    el.textContent = ms + 'ms';
+    el.className = ms < 100 ? 'tb-ping' : ms < 500 ? 'tb-ping amb' : 'tb-ping slow';
+  } catch (_e) {
+    el.textContent = '—';
+    el.className = 'tb-ping slow';
+  }
+}
+
 // ── Main poll ────────────────────────────────────────────
 let __terminalProbeLogged = false;
 
@@ -2879,6 +2999,7 @@ async function pollTerminal() {
     }
 
     data = normalizeTerminalPayload(data);
+    maybePlayFillSounds(data);
     setTerminalApiError('');
     applyMmDashboardDisplay(data.dashboard_mm || {});
 
@@ -2888,14 +3009,14 @@ async function pollTerminal() {
     renderOrderBook(data.orderbook);
     renderSeries(data.series, data.mm);
     renderConsole(data.console);
-    renderFreq(data.freq);
+    renderWeeklyPnl(data.weekly_pnl);
   } catch (e) {
     console.error('[terminal] pollTerminal', e);
     setTerminalApiError(String(e.message || e));
   }
-  // Keep BTC canvas sized after equity/layout updates (wrapped in rAF)
+  // Keep BTC canvas sized after equity/layout updates.
   if (btcCandles.length)
-    requestAnimationFrame(() => renderBtcCandles(btcCandles));
+    renderBtcCandles(btcCandles);
 }
 
 
@@ -2924,21 +3045,18 @@ async function pollBtcCandles() {
 // ── Boot ─────────────────────────────────────────────────
 requestAnimationFrame(() => {
   initCharts();
+  attachSoundToggle();
   attachMmModeToggleHandler();
   attachBotControlsHandlers();
   pollTerminal();
   refreshBotControls();
   pollKalshiBalance();
-  pollKalshiPositions();
+  pollKalshiLatency();
 });
 setInterval(refreshBotControls, BOT_CTRL_POLL_MS);
 setInterval(pollKalshiBalance, BAL_POLL_MS);
-setInterval(pollKalshiPositions, POS_POLL_MS);
-requestAnimationFrame(() => {
-  requestAnimationFrame(() => {
-    pollBtcCandles();
-  });
-});
+setInterval(pollKalshiLatency, KAL_PING_MS);
+pollBtcCandles();
 setInterval(pollTerminal, POLL_MS);
 setInterval(pollBtcCandles, BTC_POLL_MS);
 // Redraw candles on resize

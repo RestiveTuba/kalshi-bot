@@ -49,10 +49,11 @@ MAX_YES_INVENTORY_PAPER   = 10      # paper: max net YES contracts from simulate
 MAX_YES_INVENTORY_LIVE    = 2       # live: max YES inventory; also hard-block new YES at >=2
 LIVE_UNPAIRED_YES_HEDGE_SEC = 30.0  # live: if Y > N for this long, market-sell unpaired YES count
 
-# Paper: each poll in the activation window, open YES/NO orders fill independently
-# at this probability (no bid-cross check — P&L test harness).
-PAPER_YES_FILL_PROBABILITY_PER_POLL = 0.40
-PAPER_NO_FILL_PROBABILITY_PER_POLL = 0.15
+# Paper: each poll in the activation window, competitive open YES/NO orders
+# fill independently at this probability.
+PAPER_FILL_WITHIN_MID_CENTS = 2.0
+PAPER_YES_FILL_PROBABILITY_PER_POLL = 0.25
+PAPER_NO_FILL_PROBABILITY_PER_POLL = 0.25
 
 # Avoid unpaired NO: only quote NO when YES inventory ≥ 1; cancel/post NO blocked when backlog >= threshold
 MAX_UNPAIRED_NO_BACKLOG = 3  # forbid NO quoting when no_inv - yes_inv >= this (max 2 extra NO)
@@ -757,11 +758,13 @@ async def _cancel_resting_no_if_ineligible(client: _SimpleClient, st: MMState, t
         len(st.no_prices),
     )
 
-def _maybe_fill_yes(st: MMState, ts: str) -> None:
-    """Paper: open YES order may fill each poll (activation window) with fixed probability."""
+def _maybe_fill_yes(st: MMState, ts: str, mid: float) -> None:
+    """Paper: open YES order may fill only when competitive with the current YES mid."""
     if not PAPER_MODE or not st.yes_order_id or st.posted_yes_limit <= 0:
         return
     lim = st.posted_yes_limit
+    if abs(lim - mid) > PAPER_FILL_WITHIN_MID_CENTS:
+        return
     if random.random() >= PAPER_YES_FILL_PROBABILITY_PER_POLL:
         return
     if len(st.yes_prices) + ORDER_COUNT > _max_yes_inventory():
@@ -774,11 +777,14 @@ def _maybe_fill_yes(st: MMState, ts: str) -> None:
     st.posted_yes_limit = 0.0
 
 
-def _maybe_fill_no(st: MMState, ts: str) -> None:
-    """Paper: open NO order may fill each poll (activation window) with fixed probability."""
+def _maybe_fill_no(st: MMState, ts: str, mid: float) -> None:
+    """Paper: open NO order may fill only when competitive with the current NO mid."""
     if not PAPER_MODE or not st.no_order_id or st.posted_no_limit <= 0:
         return
     nlim = st.posted_no_limit
+    no_mid = 100.0 - mid
+    if abs(nlim - no_mid) > PAPER_FILL_WITHIN_MID_CENTS:
+        return
     if random.random() >= PAPER_NO_FILL_PROBABILITY_PER_POLL:
         return
     for _ in range(ORDER_COUNT):
@@ -801,6 +807,8 @@ def _pair_pnl_usd(yes_cents: float, no_cents: float) -> float:
 
 
 MM_TRADES_JSONL = Path(__file__).resolve().parent / "market_maker_trades.jsonl"
+LIVE_PNL_SUMMARY_JSONL = Path(__file__).resolve().parent / "live_pnl_summary.jsonl"
+_balance_delta_recorded: set[str] = set()
 
 
 def _coerce_balance_cent_int(raw: Any) -> Optional[int]:
@@ -920,18 +928,41 @@ def _append_mm_trades_balance_close(
     bal_end_cents: Optional[int],
     pv_end_cents: Optional[int],
 ) -> None:
-    """Single JSON line for live session realized P&L from Kalshi balance delta."""
+    """Append live close bookkeeping; account-level balance Δ is summarized separately."""
+    summary_key = close_iso[:10]
+    if summary_key not in _balance_delta_recorded:
+        _balance_delta_recorded.add(summary_key)
+        summary_row: dict[str, Any] = {
+            "date": summary_key,
+            "entry_time": close_iso,
+            "series": series,
+            "ticker": ticker,
+            "close_reason": reason,
+            "pnl_dollars": round(float(live_pnl_usd), 4),
+            "paper": False,
+            "pnl_source": "kalshi_balance_delta",
+            "balance_start_cents": bal_start_cents,
+            "balance_end_cents": bal_end_cents,
+            "portfolio_value_end_cents": pv_end_cents,
+        }
+        try:
+            with open(LIVE_PNL_SUMMARY_JSONL, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary_row, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log.warning("[%s] live_pnl_summary.jsonl append failed: %s", series, exc)
+
     row: dict[str, Any] = {
         "entry_time": close_iso,
         "series": series,
         "ticker": ticker,
         "close_reason": reason,
-        "pnl_dollars": round(float(live_pnl_usd), 4),
+        "pnl_dollars": 0.0,
         "paper": False,
-        "pnl_source": "kalshi_balance_delta",
+        "pnl_source": "live_pnl_summary",
         "balance_start_cents": bal_start_cents,
         "balance_end_cents": bal_end_cents,
         "portfolio_value_end_cents": pv_end_cents,
+        "live_pnl_summary_file": LIVE_PNL_SUMMARY_JSONL.name,
         # Pair inventory for bookkeeping (paired model); not authoritative in live mode
         "qualifying_pairs": len(qualifying_pairs),
         "yes_price_cents": 0.0,
@@ -1031,11 +1062,16 @@ async def _flatten_all(
                 exc,
             )
 
+    close_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    live_balance_delta_already_recorded = (
+        not PAPER_MODE
+        and live_pnl_usd is not None
+        and close_iso[:10] in _balance_delta_recorded
+    )
     realized_usd = pnl_pairs
     if not PAPER_MODE and live_pnl_usd is not None:
-        realized_usd = live_pnl_usd
+        realized_usd = 0.0 if live_balance_delta_already_recorded else live_pnl_usd
 
-    close_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if reason == "HARD_CLOSE":
         if PAPER_MODE:
             _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
@@ -1376,8 +1412,8 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
             # Paper fills: per-poll probability while order is open (activation window only)
             if PAPER_MODE:
-                _maybe_fill_yes(st, ts)
-                _maybe_fill_no(st, ts)
+                _maybe_fill_yes(st, ts, mid)
+                _maybe_fill_no(st, ts, mid)
             else:
                 await _live_poll_resting_orders(client, st, ts, series)
                 await _live_market_sell_yes_inventory_if_stale(client, st, ticker, ts, series)
