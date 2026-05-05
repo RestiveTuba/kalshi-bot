@@ -7,6 +7,7 @@ URL:  http://localhost:5000
 """
 import functools
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -20,11 +21,6 @@ from typing import Optional, Any
 
 from flask import Flask, jsonify, request, Response, session, redirect, send_from_directory
 
-app = Flask(__name__, static_folder=None)
-app.config["JSON_SORT_KEYS"] = False
-app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
-log = app.logger
-
 BASE              = Path(__file__).parent
 STATIC_DIR        = BASE / "static"
 MOMENTUM_LOG      = BASE / "momentum.log"
@@ -34,14 +30,38 @@ COINBASE_LOG      = BASE / "coinbase.log"
 MM_LOG            = BASE / "market_maker.log"
 COINBASE_TRADES   = BASE / "coinbase_trades.jsonl"
 MM_TRADES         = BASE / "market_maker_trades.jsonl"
+ENV_FILE          = BASE / ".env"
+
+
+def _load_dotenv_into_environ() -> None:
+    """Load repo .env before module-level config reads os.environ."""
+    if not ENV_FILE.is_file():
+        return
+    try:
+        for raw in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            key = k.strip()
+            if key and (key not in os.environ or not os.environ[key].strip()):
+                os.environ[key] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+
+
+_load_dotenv_into_environ()
+
+app = Flask(__name__, static_folder=None)
+app.config["JSON_SORT_KEYS"] = False
+app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
+log = app.logger
 
 # ── Caches ───────────────────────────────────────────────────────────────────
 _term_cache: dict = {"data": None, "ts": 0.0}
 _btc_cache:  dict = {"data": None, "ts": 0.0}
 TERM_TTL = 0.4
 BTC_TTL  = 9.0
-
-ENV_FILE          = BASE / ".env"
 
 # ── Cached market-hours probe (avoid recomputing on every terminal poll) ─────
 _MARKET_SESSION_CACHE: dict[str, Any] = {"open": False, "ts": 0.0}
@@ -159,7 +179,12 @@ _MOM_YES_BID_ASK_LINE = re.compile(
 _MOM_SERIES_TAG = re.compile(r"\[(\w+)\]")
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "").strip()
+DASHBOARD_AUTH_MARKER = (
+    hashlib.sha256(DASHBOARD_PASSWORD.encode("utf-8")).hexdigest()
+    if DASHBOARD_PASSWORD
+    else ""
+)
 
 LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><title>TRADE DESK</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -178,7 +203,12 @@ def auth_required(f):
     def decorated(*args, **kwargs):
         if not DASHBOARD_PASSWORD:
             return f(*args, **kwargs)
-        if not session.get("authed"):
+        if (
+            not session.get("authed")
+            or session.get("auth_marker") != DASHBOARD_AUTH_MARKER
+        ):
+            session.pop("authed", None)
+            session.pop("auth_marker", None)
             if request.path.startswith("/api/"):
                 return Response("Unauthorized", 401)
             return redirect("/login")
@@ -1263,9 +1293,12 @@ def login():
     if request.method == "POST":
         if request.form.get("password") == DASHBOARD_PASSWORD:
             session["authed"] = True
+            session["auth_marker"] = DASHBOARD_AUTH_MARKER
             return redirect("/")
         page = LOGIN_HTML.replace("{err_class}", "show").replace("{err_msg}", "Incorrect password")
         return Response(page, 401, mimetype="text/html")
+    session.pop("authed", None)
+    session.pop("auth_marker", None)
     page = LOGIN_HTML.replace("{err_class}", "").replace("{err_msg}", "")
     return Response(page, mimetype="text/html")
 
