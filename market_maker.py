@@ -419,6 +419,13 @@ def _live_yes_orders_absolutely_blocked(st: MMState) -> bool:
     return (not PAPER_MODE) and len(st.yes_prices) >= MAX_YES_INVENTORY_LIVE
 
 
+def _coerce_contract_count(raw: Any) -> int:
+    try:
+        return int(round(float(str(raw).strip())))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _get_today_pnl() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return _daily_pnl.get(today, 0.0)
@@ -543,6 +550,14 @@ def _sync_unpaired_yes_timer(st: MMState) -> None:
         st.live_unpaired_yes_since_monotonic = time.monotonic()
 
 
+def _resize_inventory_deque(dq: deque[float], target: int, mark_cents: float) -> None:
+    target = max(0, target)
+    while len(dq) > target:
+        dq.pop()
+    while len(dq) < target:
+        dq.append(float(mark_cents or 0.0))
+
+
 async def _live_poll_resting_orders(
     client: _SimpleClient, st: MMState, ts: str, series: str,
 ) -> None:
@@ -560,7 +575,6 @@ async def _live_poll_resting_orders(
         tracked_attr = "live_y_fill_tracked" if side_yes else "live_n_fill_tracked"
         tracked = getattr(st, tracked_attr, 0)
         if not oid or oid.startswith("MM_"):
-            setattr(st, tracked_attr, 0)
             return
         try:
             r = await client.get(f"portfolio/orders/{oid}")
@@ -618,7 +632,8 @@ async def _live_market_sell_yes_inventory_if_stale(
 ) -> None:
     """
     Live only: if YES inventory exceeds NO for LIVE_UNPAIRED_YES_HEDGE_SEC, market-sell all YES contracts.
-    count = len(yes_prices) (yes_inventory) per hedge spec.
+    The timer and sell quantity are based on Kalshi portfolio positions, not
+    the local deque, so a restart/stale in-memory state cannot hide exposure.
     """
     if (
         PAPER_MODE
@@ -627,13 +642,34 @@ async def _live_market_sell_yes_inventory_if_stale(
         or not st.live_yes_inventory_exit_armed
     ):
         return
+
+    try:
+        real_y, real_n, _pos = await _fetch_live_market_position(client, ticker)
+    except Exception as exc:
+        log.error("[%s] %s live portfolio position check failed: %s", series, ts, exc)
+        return
+
+    if real_y != len(st.yes_prices) or real_n != len(st.no_prices):
+        log.warning(
+            "[%s] %s LIVE inventory resync from portfolio before hedge: deque y=%d n=%d → real y=%d n=%d",
+            series,
+            ts,
+            len(st.yes_prices),
+            len(st.no_prices),
+            real_y,
+            real_n,
+        )
+        _resize_inventory_deque(st.yes_prices, real_y, st.prev_yes_bid)
+        _resize_inventory_deque(st.no_prices, real_n, st.prev_no_bid)
+
     y, n = len(st.yes_prices), len(st.no_prices)
     if y <= n or st.live_unpaired_yes_since_monotonic is None:
+        _sync_unpaired_yes_timer(st)
         return
     elapsed = time.monotonic() - st.live_unpaired_yes_since_monotonic
     if elapsed < LIVE_UNPAIRED_YES_HEDGE_SEC:
         return
-    qty = len(st.yes_prices)
+    qty = real_y
     if qty <= 0:
         return
 
@@ -869,6 +905,89 @@ async def _fetch_live_session_pnl(client: _SimpleClient) -> dict[str, Any]:
         "positions_nonzero": n_pos,
         "positions_hint": tick_hint,
     }
+
+
+async def _fetch_live_market_position(client: _SimpleClient, ticker: str) -> tuple[int, int, dict[str, Any]]:
+    """
+    Return current open YES/NO contracts for one market.
+
+    Kalshi reports binary market exposure as signed position_fp: positive is
+    YES, negative is NO. Keep a few fallback field names for older/newer
+    response shapes, but fail closed if the response itself cannot be fetched.
+    """
+    if not client._private_key:
+        raise RuntimeError("Kalshi client has no signing key")
+    if not ticker:
+        raise RuntimeError("missing ticker for live market position sync")
+
+    resp = await client.get(
+        "portfolio/positions",
+        params={"ticker": ticker, "count_filter": "position", "limit": 100},
+    )
+    raw_positions = resp.get("market_positions")
+    if not isinstance(raw_positions, list):
+        raise RuntimeError("portfolio/positions response missing market_positions list")
+    market_positions = raw_positions
+    pos = next(
+        (p for p in market_positions if str(p.get("ticker") or "") == ticker),
+        {},
+    )
+    if not pos:
+        return 0, 0, {}
+
+    yes_count = _coerce_contract_count(
+        pos.get("yes_position")
+        or pos.get("yes_position_fp")
+        or pos.get("yes_count")
+    )
+    no_count = _coerce_contract_count(
+        pos.get("no_position")
+        or pos.get("no_position_fp")
+        or pos.get("no_count")
+    )
+    if yes_count or no_count:
+        return max(0, yes_count), max(0, no_count), pos
+
+    signed = pos.get("position_fp")
+    if signed is None:
+        signed = pos.get("position")
+    signed_count = _coerce_contract_count(signed)
+    if signed_count >= 0:
+        return signed_count, 0, pos
+    return 0, abs(signed_count), pos
+
+
+async def _seed_live_inventory_from_portfolio(
+    client: _SimpleClient,
+    st: MMState,
+    ticker: str,
+    yes_mark_cents: float,
+    no_mark_cents: float,
+) -> None:
+    """Fail-closed live startup sync: portfolio holdings become inventory state."""
+    if PAPER_MODE:
+        return
+    yes_count, no_count, pos = await _fetch_live_market_position(client, ticker)
+    st.yes_prices.clear()
+    st.no_prices.clear()
+    yes_seed = float(yes_mark_cents or 0.0)
+    no_seed = float(no_mark_cents or 0.0)
+    st.yes_prices.extend([yes_seed] * yes_count)
+    st.no_prices.extend([no_seed] * no_count)
+    st.live_y_fill_tracked = yes_count
+    st.live_n_fill_tracked = no_count
+    _sync_unpaired_yes_timer(st)
+    log.warning(
+        "[%s] LIVE inventory seeded from Kalshi portfolio ticker=%s YES=%d NO=%d "
+        "(mark yes=%.1f¢ no=%.1f¢ raw_position=%r)",
+        st.series,
+        ticker,
+        yes_count,
+        no_count,
+        yes_seed,
+        no_seed,
+        pos.get("position_fp") if pos else 0,
+    )
 
 
 async def _capture_live_session_balance_start(client: _SimpleClient, st: MMState) -> None:
@@ -1342,9 +1461,28 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
             if ticker != st.ticker:
                 _reset_session_state(st)
-                st.ticker = ticker
                 log.info("[%s] New session ticker=%s", series, ticker)
-                await _capture_live_session_balance_start(client, st)
+                if not PAPER_MODE:
+                    try:
+                        await _seed_live_inventory_from_portfolio(
+                            client, st, ticker, yes_bid, no_bid,
+                        )
+                        await _capture_live_session_balance_start(client, st)
+                    except Exception as exc:
+                        st.session_halted = True
+                        log.error(
+                            "[%s] LIVE session init halted for %s: portfolio position sync failed: %s",
+                            series,
+                            ticker,
+                            exc,
+                        )
+                        _tg_alert(
+                            f"❌ MM LIVE halted [{series}] {ticker}: "
+                            f"portfolio position sync failed: {exc}"
+                        )
+                        await asyncio.sleep(POLL_INTERVAL_SEC)
+                        continue
+                st.ticker = ticker
 
             in_window = (
                 secs_left is not None and 0 < secs_left <= ACTIVATE_MINS_BEFORE_CLOSE * 60
