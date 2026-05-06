@@ -358,10 +358,21 @@ async def fetch_active_market(client: _SimpleClient, series: str) -> Optional[di
             and parse_dt(m.get("close_time")) is not None
             and parse_dt(m.get("close_time")) > now
         ]
+        log.info("[%s] fetch_active_market: %d market(s) in open window", series, len(active))
         if not active:
             log.info("[%s] fetch_active_market: 0 markets in open window (now=%s UTC)", series, now.isoformat())
             return None
         active.sort(key=lambda m: m.get("close_time", ""))
+        chosen = active[0]
+        secs_left = seconds_until_close(chosen)
+        log.info(
+            "[%s] fetch_active_market: selected ticker=%s status=%s close_time=%s secs_left=%s",
+            series,
+            chosen.get("ticker"),
+            chosen.get("status"),
+            chosen.get("close_time"),
+            "n/a" if secs_left is None else f"{secs_left:.1f}",
+        )
         return active[0]
     except Exception as exc:
         log.error("[%s] fetch_active_market failed: %s", series, exc)
@@ -1814,7 +1825,9 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
     while True:
         try:
+            log.info("[%s] LOOP start ticker=%s halted=%s active=%s", series, st.ticker or "—", st.session_halted, st.active)
             await _settle_open_series_lots(client, st)
+            log.info("[%s] LOOP settlement check done open_lots=%d", series, len(_ledger.open_lots_for(series=series)))
             raw = await fetch_active_market(client, series)
             if raw is None:
                 if st.ticker:
@@ -1832,6 +1845,18 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             no_ask = 100.0 - yes_bid
             mid = (yes_bid + yes_ask) / 2.0 if (yes_bid or yes_ask) else yes_bid
             mins_left = (secs_left or 0) / 60.0
+            log.info(
+                "[%s] LOOP market parsed ticker=%s secs_left=%s mins_left=%.2f YES %.1f/%.1f NO %.1f/%.1f mid=%.1f",
+                series,
+                ticker,
+                "n/a" if secs_left is None else f"{secs_left:.1f}",
+                mins_left,
+                yes_bid,
+                yes_ask,
+                no_bid,
+                no_ask,
+                mid,
+            )
 
             # New session — record close intent; open lots remain in the ledger.
             if ticker != st.ticker and st.ticker:
@@ -1868,10 +1893,23 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             in_window = (
                 secs_left is not None and 0 < secs_left <= ACTIVATE_MINS_BEFORE_CLOSE * 60
             )
+            log.info(
+                "[%s] LOOP gate in_window=%s secs_left=%s activate_limit=%ds",
+                series,
+                in_window,
+                "n/a" if secs_left is None else f"{secs_left:.1f}",
+                ACTIVATE_MINS_BEFORE_CLOSE * 60,
+            )
 
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
             if not in_window:
+                log.info(
+                    "[%s] LOOP skip quoting: outside activation window (secs_left=%s, require 0<secs<=%d)",
+                    series,
+                    "n/a" if secs_left is None else f"{secs_left:.1f}",
+                    ACTIVATE_MINS_BEFORE_CLOSE * 60,
+                )
                 if st.active:
                     await _cancel_both_quotes(client, st, ts)
                     st.active = False
@@ -1931,12 +1969,23 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             if _today_risk_pnl() <= -DAILY_LOSS_LIMIT_USD:
                 if st.yes_order_id or st.no_order_id:
                     await _cancel_both_quotes(client, st, ts)
-                log.warning("[%s] Daily loss limit — no quotes", series)
+                log.warning(
+                    "[%s] LOOP skip quoting: daily loss gate risk_pnl=$%+.4f limit=$-%.2f",
+                    series,
+                    _today_risk_pnl(),
+                    DAILY_LOSS_LIMIT_USD,
+                )
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 continue
 
             # Hard close inventory + cancel quotes (once per session)
             if secs_left is not None and secs_left <= HARD_CLOSE_SECS:
+                log.info(
+                    "[%s] LOOP skip quoting: hard-close window secs_left=%.1f hard_close=%ds",
+                    series,
+                    secs_left,
+                    HARD_CLOSE_SECS,
+                )
                 if not st.hard_close_sent:
                     await _cancel_both_quotes(client, st, ts)
                     await _flatten_all(client, st, yes_bid, no_bid, "HARD_CLOSE", ts)
@@ -1971,6 +2020,19 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 and st.series not in _ledger.reconcile_halted_series
                 and _eligible_to_post_no(st)
             )
+            log.info(
+                "[%s] LOOP quote decision want_yes=%s want_no=%s halted=%s reconcile_halted=%s "
+                "skip_yes_tight_spread=%s y=%d n=%d today_risk=$%+.4f",
+                series,
+                want_yes,
+                want_no,
+                st.session_halted,
+                st.series in _ledger.reconcile_halted_series,
+                st.skip_yes_tight_spread,
+                _yes_count(st),
+                _no_count(st),
+                _today_risk_pnl(),
+            )
             if now - st.last_requote_check >= REQUOTE_CHECK_INTERVAL_SEC:
                 mid_drift = (
                     st.mid_at_post > 0
@@ -1979,16 +2041,35 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 need_yes = want_yes and not st.yes_order_id
                 need_no = want_no and not st.no_order_id
                 need_repost = mid_drift or need_yes or need_no
+                log.info(
+                    "[%s] LOOP requote gate elapsed=%.1fs mid_drift=%s need_yes=%s need_no=%s need_repost=%s",
+                    series,
+                    now - st.last_requote_check,
+                    mid_drift,
+                    need_yes,
+                    need_no,
+                    need_repost,
+                )
                 if need_repost and (want_yes or want_no):
+                    log.info("[%s] LOOP posting quotes via _post_both_sides", series)
                     await _post_both_sides(client, st, raw, yes_bid, no_bid, mid, ts)
                 else:
+                    log.info("[%s] LOOP no post: need_repost=%s want_yes=%s want_no=%s", series, need_repost, want_yes, want_no)
                     st.last_requote_check = now
 
             elif (
                 (want_yes and not st.yes_order_id)
                 or (want_no and not st.no_order_id)
             ) and not st.session_halted:
+                log.info("[%s] LOOP posting missing quote(s) before requote interval", series)
                 await _post_both_sides(client, st, raw, yes_bid, no_bid, mid, ts)
+            else:
+                log.info(
+                    "[%s] LOOP no post: waiting for requote interval or existing orders (yes_oid=%s no_oid=%s)",
+                    series,
+                    st.yes_order_id or "—",
+                    st.no_order_id or "—",
+                )
 
             log.info(
                 "[%s] %s MM | mid=%.1f post_mid=%.1f | Ylim=%s Nlim=%s | "
@@ -2014,7 +2095,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             log.info("[%s] cancelled", series)
             raise
         except Exception as exc:
-            log.error("[%s] Unexpected: %s", series, exc)
+            log.exception("[%s] Unexpected in quote loop: %s", series, exc)
             _tg_alert(f"❌ MM Error [{series}]: {exc}")
 
         await asyncio.sleep(POLL_INTERVAL_SEC)
