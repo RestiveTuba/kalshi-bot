@@ -21,8 +21,7 @@ import random
 import sys
 import time
 import uuid as _uuid_mod
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -41,6 +40,7 @@ HARD_CLOSE_SECS             = 120
 PAPER_MODE                  = True  # must stay True unless you change code + accept live risk
 
 POLL_INTERVAL_SEC           = 2.0     # live: poll portfolio/orders every ~2s for fills
+RECONCILE_INTERVAL_SEC      = 8.0     # live: compare ledger lots against Kalshi state
 REQUOTE_CHECK_INTERVAL_SEC  = 30.0    # mid-drift / repost cadence
 MID_MOVE_REQUOTE_CENTS    = 3.0
 MAX_LIMIT_CENTS           = 90
@@ -65,6 +65,7 @@ MAX_PAIRED_YES_NO_COST_CENTS = 99
 
 DAILY_LOSS_LIMIT_USD       = 5.0   # test: halt quotes when cumulative day P&L <= -this
 SESSION_HALT_MIN_LOSS_USD  = 0.50  # test: halt current session after one close this bad
+DEFAULT_CLOSE_INTENT       = os.environ.get("MM_CLOSE_INTENT", "LET_SETTLE").upper()
 
 _MAX_RETRIES  = 3
 _BASE_BACKOFF = 0.5
@@ -372,6 +373,332 @@ async def fetch_active_market(client: _SimpleClient, series: str) -> Optional[di
 # ---------------------------------------------------------------------------
 
 @dataclass
+class PositionLot:
+    lot_id: str
+    ticker: str
+    series: str
+    side: str
+    qty: int
+    entry_price_cents: float
+    entry_order_id: str
+    entry_fill_id: str
+    entry_time: str
+    status: str = "open"
+
+
+@dataclass
+class LedgerEvent:
+    event_type: str
+    ts: str
+    ticker: str = ""
+    series: str = ""
+    lot_ids: list[str] = field(default_factory=list)
+    side: str = ""
+    qty: int = 0
+    price_cents: Optional[float] = None
+    payout_cents: Optional[float] = None
+    pnl_dollars: float = 0.0
+    order_id: str = ""
+    fill_id: str = ""
+    intent: str = ""
+    status: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+MARKET_MAKER_LEDGER_JSONL = Path(__file__).resolve().parent / "market_maker_ledger.jsonl"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class MarketMakerLedger:
+    """Append-only source of truth for market-maker lots and realized P&L."""
+
+    def __init__(self, path: Path = MARKET_MAKER_LEDGER_JSONL) -> None:
+        self.path = path
+        self.open_lots: dict[str, PositionLot] = {}
+        self.closed_lots: dict[str, PositionLot] = {}
+        self.realized_events: list[LedgerEvent] = []
+        self.close_intents: dict[str, str] = {}
+        self.reconcile_halted_series: set[str] = set()
+        self.events_loaded = 0
+        self.load()
+
+    def load(self) -> None:
+        self.open_lots.clear()
+        self.closed_lots.clear()
+        self.realized_events.clear()
+        self.close_intents.clear()
+        self.reconcile_halted_series.clear()
+        self.events_loaded = 0
+        if not self.path.exists():
+            return
+        with self.path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("Skipping corrupt ledger row: %r", line[:240])
+                    continue
+                self.events_loaded += 1
+                self._apply_row(row)
+
+    def append(self, event: LedgerEvent) -> None:
+        row = asdict(event)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        with self.path.open("a", encoding="utf-8") as out, tmp.open("r", encoding="utf-8") as src:
+            out.write(src.read())
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        self._apply_row(row)
+
+    def _apply_row(self, row: dict[str, Any]) -> None:
+        event_type = str(row.get("event_type") or row.get("type") or "")
+        if event_type == "fill":
+            lot = self._lot_from_row(row)
+            self.open_lots[lot.lot_id] = lot
+            self.closed_lots.pop(lot.lot_id, None)
+            return
+        if event_type in ("manual_close", "settlement"):
+            ev = self._event_from_row(row)
+            self.realized_events.append(ev)
+            for lot_id in ev.lot_ids:
+                lot = self.open_lots.pop(lot_id, None)
+                if lot:
+                    lot.status = event_type
+                    self.closed_lots[lot_id] = lot
+            return
+        if event_type == "close_intent":
+            ticker = str(row.get("ticker") or "")
+            if ticker:
+                self.close_intents[ticker] = str(row.get("intent") or "LET_SETTLE")
+            return
+        if event_type in ("reconcile_mismatch", "risk_halt"):
+            ev = self._event_from_row(row)
+            if ev.series:
+                self.reconcile_halted_series.add(ev.series)
+
+    def _lot_from_row(self, row: dict[str, Any]) -> PositionLot:
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        lot_data = raw.get("lot") if isinstance(raw.get("lot"), dict) else {}
+        return PositionLot(
+            lot_id=str(row.get("lot_id") or (row.get("lot_ids") or [""])[0] or lot_data.get("lot_id")),
+            ticker=str(row.get("ticker") or lot_data.get("ticker") or ""),
+            series=str(row.get("series") or lot_data.get("series") or ""),
+            side=str(row.get("side") or lot_data.get("side") or "").upper(),
+            qty=_coerce_contract_count(row.get("qty") or lot_data.get("qty") or 0),
+            entry_price_cents=float(row.get("price_cents") or lot_data.get("entry_price_cents") or 0.0),
+            entry_order_id=str(row.get("order_id") or lot_data.get("entry_order_id") or ""),
+            entry_fill_id=str(row.get("fill_id") or lot_data.get("entry_fill_id") or ""),
+            entry_time=str(row.get("ts") or lot_data.get("entry_time") or ""),
+            status=str(row.get("status") or lot_data.get("status") or "open"),
+        )
+
+    def _event_from_row(self, row: dict[str, Any]) -> LedgerEvent:
+        lot_ids = row.get("lot_ids")
+        if not isinstance(lot_ids, list):
+            lot_ids = []
+        return LedgerEvent(
+            event_type=str(row.get("event_type") or ""),
+            ts=str(row.get("ts") or ""),
+            ticker=str(row.get("ticker") or ""),
+            series=str(row.get("series") or ""),
+            lot_ids=[str(x) for x in lot_ids],
+            side=str(row.get("side") or ""),
+            qty=_coerce_contract_count(row.get("qty") or 0),
+            price_cents=row.get("price_cents"),
+            payout_cents=row.get("payout_cents"),
+            pnl_dollars=float(row.get("pnl_dollars") or 0.0),
+            order_id=str(row.get("order_id") or ""),
+            fill_id=str(row.get("fill_id") or ""),
+            intent=str(row.get("intent") or ""),
+            status=str(row.get("status") or ""),
+            raw=row.get("raw") if isinstance(row.get("raw"), dict) else {},
+        )
+
+    def record_fill(
+        self,
+        *,
+        ticker: str,
+        series: str,
+        side: str,
+        qty: int,
+        price_cents: float,
+        order_id: str,
+        fill_id: str = "",
+        ts: Optional[str] = None,
+    ) -> list[PositionLot]:
+        lots: list[PositionLot] = []
+        for _ in range(max(0, int(qty))):
+            lot = PositionLot(
+                lot_id=_uuid_mod.uuid4().hex,
+                ticker=ticker,
+                series=series,
+                side=side.upper(),
+                qty=1,
+                entry_price_cents=float(price_cents),
+                entry_order_id=order_id,
+                entry_fill_id=fill_id or _uuid_mod.uuid4().hex,
+                entry_time=ts or _utc_now_iso(),
+                status="open",
+            )
+            event = LedgerEvent(
+                event_type="fill",
+                ts=lot.entry_time,
+                ticker=ticker,
+                series=series,
+                lot_ids=[lot.lot_id],
+                side=lot.side,
+                qty=1,
+                price_cents=lot.entry_price_cents,
+                order_id=order_id,
+                fill_id=lot.entry_fill_id,
+                status="open",
+                raw={"lot": asdict(lot)},
+            )
+            self.append(event)
+            lots.append(lot)
+        return lots
+
+    def record_close_intent(self, *, ticker: str, series: str, intent: str, ts: str) -> None:
+        if self.close_intents.get(ticker) == intent:
+            return
+        self.append(LedgerEvent(
+            event_type="close_intent",
+            ts=ts,
+            ticker=ticker,
+            series=series,
+            intent=intent,
+            status="pending",
+            raw={"open_lots": [asdict(l) for l in self.open_lots_for(ticker=ticker)]},
+        ))
+
+    def record_manual_close(
+        self,
+        *,
+        ticker: str,
+        series: str,
+        side: str,
+        qty: int,
+        exit_price_cents: float,
+        order_id: str = "",
+        fill_id: str = "",
+        ts: Optional[str] = None,
+    ) -> float:
+        lots = self.open_lots_for(ticker=ticker, side=side)[:qty]
+        pnl = sum(((exit_price_cents - lot.entry_price_cents) / 100.0) for lot in lots)
+        self.append(LedgerEvent(
+            event_type="manual_close",
+            ts=ts or _utc_now_iso(),
+            ticker=ticker,
+            series=series,
+            lot_ids=[lot.lot_id for lot in lots],
+            side=side.upper(),
+            qty=len(lots),
+            price_cents=float(exit_price_cents),
+            pnl_dollars=pnl,
+            order_id=order_id,
+            fill_id=fill_id,
+            status="realized",
+        ))
+        return pnl
+
+    def record_settlement(
+        self,
+        *,
+        ticker: str,
+        series: str,
+        result: str,
+        ts: Optional[str] = None,
+        raw: Optional[dict[str, Any]] = None,
+    ) -> float:
+        result_u = result.upper()
+        lots = self.open_lots_for(ticker=ticker)
+        pnl = 0.0
+        for lot in lots:
+            payout_cents = 100.0 if lot.side == result_u else 0.0
+            pnl += (payout_cents - lot.entry_price_cents) / 100.0
+        self.append(LedgerEvent(
+            event_type="settlement",
+            ts=ts or _utc_now_iso(),
+            ticker=ticker,
+            series=series,
+            lot_ids=[lot.lot_id for lot in lots],
+            side=result_u,
+            qty=len(lots),
+            payout_cents=100.0,
+            pnl_dollars=pnl,
+            status="realized",
+            raw=raw or {},
+        ))
+        return pnl
+
+    def record_reconcile_mismatch(self, *, ticker: str, series: str, raw: dict[str, Any], ts: str) -> None:
+        self.append(LedgerEvent(
+            event_type="reconcile_mismatch",
+            ts=ts,
+            ticker=ticker,
+            series=series,
+            status="halted",
+            raw=raw,
+        ))
+
+    def open_lots_for(self, *, ticker: Optional[str] = None, series: Optional[str] = None, side: Optional[str] = None) -> list[PositionLot]:
+        lots = list(self.open_lots.values())
+        if ticker is not None:
+            lots = [lot for lot in lots if lot.ticker == ticker]
+        if series is not None:
+            lots = [lot for lot in lots if lot.series == series]
+        if side is not None:
+            lots = [lot for lot in lots if lot.side == side.upper()]
+        lots.sort(key=lambda lot: lot.entry_time)
+        return lots
+
+    def open_qty(self, *, ticker: Optional[str] = None, series: Optional[str] = None, side: Optional[str] = None) -> int:
+        return sum(lot.qty for lot in self.open_lots_for(ticker=ticker, series=series, side=side))
+
+    def realized_pnl(self, *, series: Optional[str] = None, ticker: Optional[str] = None, date: Optional[str] = None) -> float:
+        total = 0.0
+        for ev in self.realized_events:
+            if ev.event_type not in ("manual_close", "settlement"):
+                continue
+            if series is not None and ev.series != series:
+                continue
+            if ticker is not None and ev.ticker != ticker:
+                continue
+            if date is not None and not ev.ts.startswith(date):
+                continue
+            total += ev.pnl_dollars
+        return total
+
+    def open_exposure_usd(self, *, series: Optional[str] = None, ticker: Optional[str] = None) -> float:
+        return sum(lot.entry_price_cents / 100.0 for lot in self.open_lots_for(series=series, ticker=ticker))
+
+    def summary(self, *, series: Optional[str] = None, ticker: Optional[str] = None) -> dict[str, Any]:
+        return {
+            "open_yes": self.open_qty(series=series, ticker=ticker, side="YES"),
+            "open_no": self.open_qty(series=series, ticker=ticker, side="NO"),
+            "open_lots": len(self.open_lots_for(series=series, ticker=ticker)),
+            "realized_pnl": self.realized_pnl(series=series, ticker=ticker),
+            "open_exposure_usd": self.open_exposure_usd(series=series, ticker=ticker),
+            "reconcile_halted": bool(series and series in self.reconcile_halted_series),
+        }
+
+
+@dataclass
 class MMState:
     series: str
     ticker: str = ""
@@ -384,10 +711,6 @@ class MMState:
     posted_no_limit: float = 0.0    # NO cents (conventional)
     mid_at_post: float = 0.0
     last_requote_check: float = 0.0
-    # One deque entry = 1 contract @ limit cents (FIFO)
-    yes_prices: deque[float] = field(default_factory=deque)
-    no_prices: deque[float] = field(default_factory=deque)
-    session_pnl: float = 0.0
     session_halted: bool = False
     active: bool = False
     # Telegram: at most one close summary per ticker (session window)
@@ -404,10 +727,7 @@ class MMState:
     live_unpaired_yes_since_monotonic: Optional[float] = None
     # Live: guard duplicate POSTs while a yes-inventory exit is in flight / pending re-sync
     live_yes_inventory_exit_armed: bool = True
-
-
-# Cumulative realized P&L per UTC calendar day (USD); updated in _flatten_all via _record_realized_pnl
-_daily_pnl: dict[str, float] = {}
+    last_reconcile_check: float = 0.0
 
 
 def _max_yes_inventory() -> int:
@@ -416,7 +736,7 @@ def _max_yes_inventory() -> int:
 
 def _live_yes_orders_absolutely_blocked(st: MMState) -> bool:
     """Live only: never post another YES if we already hold >= 2 YES contracts."""
-    return (not PAPER_MODE) and len(st.yes_prices) >= MAX_YES_INVENTORY_LIVE
+    return (not PAPER_MODE) and _yes_count(st) >= MAX_YES_INVENTORY_LIVE
 
 
 def _coerce_contract_count(raw: Any) -> int:
@@ -426,14 +746,39 @@ def _coerce_contract_count(raw: Any) -> int:
         return 0
 
 
+_ledger = MarketMakerLedger()
+
+
 def _get_today_pnl() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return _daily_pnl.get(today, 0.0)
+    return _ledger.realized_pnl(date=today)
 
 
 def _record_realized_pnl(pnl: float) -> None:
+    # Realized P&L is now replayed from settlement/manual_close ledger events.
+    # This compatibility hook intentionally does not mutate account state.
+    return None
+
+
+def _yes_count(st: MMState, ticker: Optional[str] = None) -> int:
+    return _ledger.open_qty(series=st.series, ticker=ticker, side="YES")
+
+
+def _no_count(st: MMState, ticker: Optional[str] = None) -> int:
+    return _ledger.open_qty(series=st.series, ticker=ticker, side="NO")
+
+
+def _series_realized_pnl(st: MMState) -> float:
+    return _ledger.realized_pnl(series=st.series)
+
+
+def _risk_pnl_with_open_exposure(st: MMState) -> float:
+    return _ledger.realized_pnl(series=st.series) - _ledger.open_exposure_usd(series=st.series)
+
+
+def _today_risk_pnl() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    _daily_pnl[today] = _daily_pnl.get(today, 0.0) + pnl
+    return _ledger.realized_pnl(date=today) - _ledger.open_exposure_usd()
 
 
 def _reset_session_state(st: MMState) -> None:
@@ -446,9 +791,6 @@ def _reset_session_state(st: MMState) -> None:
     st.posted_no_limit = 0.0
     st.mid_at_post = 0.0
     st.last_requote_check = 0.0
-    st.yes_prices.clear()
-    st.no_prices.clear()
-    st.session_pnl = 0.0
     st.session_halted = False
     st.active = False
     st.telegram_close_sent = False
@@ -459,12 +801,13 @@ def _reset_session_state(st: MMState) -> None:
     st.live_n_fill_tracked = 0
     st.live_unpaired_yes_since_monotonic = None
     st.live_yes_inventory_exit_armed = True
+    st.last_reconcile_check = 0.0
 
 
 def _eligible_to_post_no(st: MMState) -> bool:
     """NO quotes only with ≥1 YES filled; stop NO when unpaired backlog hits cap."""
-    y = len(st.yes_prices)
-    n = len(st.no_prices)
+    y = _yes_count(st)
+    n = _no_count(st)
     if y < 1:
         return False
     if n - y >= MAX_UNPAIRED_NO_BACKLOG:
@@ -542,20 +885,12 @@ def _order_done(o: dict[str, Any], status: str, filled: int) -> bool:
 
 def _sync_unpaired_yes_timer(st: MMState) -> None:
     """Start/stop 30s unpaired-YES hedge clock (live semantics)."""
-    y, n = len(st.yes_prices), len(st.no_prices)
+    y, n = _yes_count(st), _no_count(st)
     if y <= n:
         st.live_unpaired_yes_since_monotonic = None
         st.live_yes_inventory_exit_armed = True
     elif st.live_unpaired_yes_since_monotonic is None:
         st.live_unpaired_yes_since_monotonic = time.monotonic()
-
-
-def _resize_inventory_deque(dq: deque[float], target: int, mark_cents: float) -> None:
-    target = max(0, target)
-    while len(dq) > target:
-        dq.pop()
-    while len(dq) < target:
-        dq.append(float(mark_cents or 0.0))
 
 
 async def _live_poll_resting_orders(
@@ -571,7 +906,6 @@ async def _live_poll_resting_orders(
     async def _one(side_yes: bool) -> None:
         oid = st.yes_order_id if side_yes else st.no_order_id
         posted = st.posted_yes_limit if side_yes else st.posted_no_limit
-        dq = st.yes_prices if side_yes else st.no_prices
         tracked_attr = "live_y_fill_tracked" if side_yes else "live_n_fill_tracked"
         tracked = getattr(st, tracked_attr, 0)
         if not oid or oid.startswith("MM_"):
@@ -589,17 +923,26 @@ async def _live_poll_resting_orders(
         filled = _order_filled_contracts(o)
         delta = max(0, filled - tracked)
         cap = _max_yes_inventory() if side_yes else 10**9
-        if side_yes and delta and len(st.yes_prices) + delta > cap:
+        if side_yes and delta and _yes_count(st) + delta > cap:
             log.warning(
                 "[%s] %s live YES fill would exceed cap; truncating delta %d→%d",
-                series, ts, delta, max(0, cap - len(st.yes_prices)),
+                series, ts, delta, max(0, cap - _yes_count(st)),
             )
-            delta = max(0, cap - len(st.yes_prices))
+            delta = max(0, cap - _yes_count(st))
         lim = posted
         if lim <= 0:
             lim = float(o.get("yes_price") or o.get("no_price") or 0.0)
-        for _ in range(delta):
-            dq.append(lim)
+        if delta:
+            _ledger.record_fill(
+                ticker=str(o.get("ticker") or st.ticker),
+                series=series,
+                side="YES" if side_yes else "NO",
+                qty=delta,
+                price_cents=lim,
+                order_id=oid,
+                fill_id=str(o.get("fill_id") or ""),
+                ts=_utc_now_iso(),
+            )
         setattr(st, tracked_attr, tracked + delta)
         if delta:
             log.info(
@@ -609,8 +952,8 @@ async def _live_poll_resting_orders(
                 "YES" if side_yes else "NO",
                 delta,
                 lim,
-                len(st.yes_prices),
-                len(st.no_prices),
+                _yes_count(st),
+                _no_count(st),
                 status,
             )
         if _order_done(o, status, filled):
@@ -649,20 +992,28 @@ async def _live_market_sell_yes_inventory_if_stale(
         log.error("[%s] %s live portfolio position check failed: %s", series, ts, exc)
         return
 
-    if real_y != len(st.yes_prices) or real_n != len(st.no_prices):
+    ledger_y = _ledger.open_qty(ticker=ticker, side="YES")
+    ledger_n = _ledger.open_qty(ticker=ticker, side="NO")
+    if real_y != ledger_y or real_n != ledger_n:
         log.warning(
-            "[%s] %s LIVE inventory resync from portfolio before hedge: deque y=%d n=%d → real y=%d n=%d",
+            "[%s] %s LIVE inventory mismatch before hedge: ledger y=%d n=%d → real y=%d n=%d",
             series,
             ts,
-            len(st.yes_prices),
-            len(st.no_prices),
+            ledger_y,
+            ledger_n,
             real_y,
             real_n,
         )
-        _resize_inventory_deque(st.yes_prices, real_y, st.prev_yes_bid)
-        _resize_inventory_deque(st.no_prices, real_n, st.prev_no_bid)
+        _ledger.record_reconcile_mismatch(
+            ticker=ticker,
+            series=series,
+            ts=_utc_now_iso(),
+            raw={"source": "hedge_check", "ledger_yes": ledger_y, "ledger_no": ledger_n, "kalshi_yes": real_y, "kalshi_no": real_n},
+        )
+        st.session_halted = True
+        return
 
-    y, n = len(st.yes_prices), len(st.no_prices)
+    y, n = ledger_y, ledger_n
     if y <= n or st.live_unpaired_yes_since_monotonic is None:
         _sync_unpaired_yes_timer(st)
         return
@@ -706,13 +1057,10 @@ async def _live_market_sell_yes_inventory_if_stale(
         log.error("[%s] %s LIVE market sell YES failed: %s — will retry after re-arm", series, ts, exc)
         st.live_yes_inventory_exit_armed = True
         return
-    for _ in range(qty):
-        if st.yes_prices:
-            st.yes_prices.popleft()
     _sync_unpaired_yes_timer(st)
     log.info(
         "[%s] %s LIVE market sell YES done (yes_inv now %d no=%d)",
-        series, ts, len(st.yes_prices), len(st.no_prices),
+        series, ts, _ledger.open_qty(ticker=ticker, side="YES"), _ledger.open_qty(ticker=ticker, side="NO"),
     )
 
 
@@ -790,8 +1138,8 @@ async def _cancel_resting_no_if_ineligible(client: _SimpleClient, st: MMState, t
         "[%s] %s cancelled resting NO (yes_inv=%d no_inv=%d)",
         st.series,
         ts,
-        len(st.yes_prices),
-        len(st.no_prices),
+        _yes_count(st),
+        _no_count(st),
     )
 
 def _maybe_fill_yes(st: MMState, ts: str, mid: float) -> None:
@@ -803,11 +1151,18 @@ def _maybe_fill_yes(st: MMState, ts: str, mid: float) -> None:
         return
     if random.random() >= PAPER_YES_FILL_PROBABILITY_PER_POLL:
         return
-    if len(st.yes_prices) + ORDER_COUNT > _max_yes_inventory():
+    if _yes_count(st) + ORDER_COUNT > _max_yes_inventory():
         return
-    for _ in range(ORDER_COUNT):
-        st.yes_prices.append(lim)
-    n_y = len(st.yes_prices)
+    _ledger.record_fill(
+        ticker=st.ticker,
+        series=st.series,
+        side="YES",
+        qty=ORDER_COUNT,
+        price_cents=lim,
+        order_id=st.yes_order_id,
+        ts=_utc_now_iso(),
+    )
+    n_y = _yes_count(st)
     log.info("[%s] %s FILL YES @ %.1fc (yes_inv=%d)", st.series, ts, lim, n_y)
     st.yes_order_id = ""
     st.posted_yes_limit = 0.0
@@ -823,9 +1178,16 @@ def _maybe_fill_no(st: MMState, ts: str, mid: float) -> None:
         return
     if random.random() >= PAPER_NO_FILL_PROBABILITY_PER_POLL:
         return
-    for _ in range(ORDER_COUNT):
-        st.no_prices.append(nlim)
-    n_n = len(st.no_prices)
+    _ledger.record_fill(
+        ticker=st.ticker,
+        series=st.series,
+        side="NO",
+        qty=ORDER_COUNT,
+        price_cents=nlim,
+        order_id=st.no_order_id,
+        ts=_utc_now_iso(),
+    )
+    n_n = _no_count(st)
     log.info("[%s] %s FILL NO @ %.1fc (no_inv=%d)", st.series, ts, nlim, n_n)
     st.no_order_id = ""
     st.posted_no_limit = 0.0
@@ -957,6 +1319,145 @@ async def _fetch_live_market_position(client: _SimpleClient, ticker: str) -> tup
     return 0, abs(signed_count), pos
 
 
+async def _fetch_portfolio_fills(
+    client: _SimpleClient,
+    *,
+    ticker: Optional[str] = None,
+    order_id: Optional[str] = None,
+    min_ts: Optional[int] = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": 100}
+    if ticker:
+        params["ticker"] = ticker
+    if order_id:
+        params["order_id"] = order_id
+    if min_ts is not None:
+        params["min_ts"] = min_ts
+    return await client.get("portfolio/fills", params=params)
+
+
+async def _fetch_portfolio_settlements(
+    client: _SimpleClient,
+    *,
+    ticker: Optional[str] = None,
+    series: Optional[str] = None,
+    min_ts: Optional[int] = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": 100}
+    if ticker:
+        params["ticker"] = ticker
+    if series:
+        params["event_ticker"] = series
+    if min_ts is not None:
+        params["min_ts"] = min_ts
+    return await client.get("portfolio/settlements", params=params)
+
+
+def _extract_settlement_result(row: dict[str, Any]) -> str:
+    for key in ("result", "settlement_value", "side", "outcome"):
+        v = row.get(key)
+        if isinstance(v, str) and v.lower() in ("yes", "no"):
+            return v.upper()
+    yes_paid = row.get("yes_payout") or row.get("yes_payout_dollars")
+    no_paid = row.get("no_payout") or row.get("no_payout_dollars")
+    try:
+        if yes_paid is not None and float(yes_paid) > 0:
+            return "YES"
+        if no_paid is not None and float(no_paid) > 0:
+            return "NO"
+    except (TypeError, ValueError):
+        pass
+    return ""
+
+
+async def _record_settlements_if_available(client: _SimpleClient, st: MMState, ticker: str) -> None:
+    if not ticker or not _ledger.open_lots_for(ticker=ticker):
+        return
+
+    if client._private_key:
+        try:
+            resp = await _fetch_portfolio_settlements(client, ticker=ticker, series=st.series)
+            rows = resp.get("settlements")
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict) or str(row.get("ticker") or "") != ticker:
+                        continue
+                    result = _extract_settlement_result(row)
+                    if result:
+                        pnl = _ledger.record_settlement(
+                            ticker=ticker,
+                            series=st.series,
+                            result=result,
+                            raw={"source": "portfolio/settlements", "settlement": row},
+                        )
+                        log.info("[%s] settlement %s result=%s ledger_pnl=$%+.4f", st.series, ticker, result, pnl)
+                        return
+        except Exception as exc:
+            log.warning("[%s] settlement poll failed for %s: %s", st.series, ticker, exc)
+
+    try:
+        market_resp = await client.get(f"markets/{ticker}")
+        market = market_resp.get("market") if isinstance(market_resp.get("market"), dict) else market_resp
+        if not isinstance(market, dict):
+            return
+        status = str(market.get("status") or "").lower()
+        result = _extract_settlement_result(market)
+        if status in ("settled", "determined", "closed") and result:
+            pnl = _ledger.record_settlement(
+                ticker=ticker,
+                series=st.series,
+                result=result,
+                raw={"source": "markets/{ticker}", "market": market},
+            )
+            log.info("[%s] market settlement %s result=%s ledger_pnl=$%+.4f", st.series, ticker, result, pnl)
+    except Exception as exc:
+        log.debug("[%s] market settlement check unavailable for %s: %s", st.series, ticker, exc)
+
+
+async def _settle_open_series_lots(client: _SimpleClient, st: MMState) -> None:
+    tickers = sorted({lot.ticker for lot in _ledger.open_lots_for(series=st.series)})
+    for lot_ticker in tickers:
+        await _record_settlements_if_available(client, st, lot_ticker)
+
+
+async def _reconcile_ledger_with_kalshi(client: _SimpleClient, st: MMState, ticker: str, ts: str) -> None:
+    if PAPER_MODE or not client._private_key or not ticker:
+        return
+    now = time.time()
+    if now - st.last_reconcile_check < RECONCILE_INTERVAL_SEC:
+        return
+    st.last_reconcile_check = now
+
+    await _record_settlements_if_available(client, st, ticker)
+    ledger_y = _ledger.open_qty(ticker=ticker, side="YES")
+    ledger_n = _ledger.open_qty(ticker=ticker, side="NO")
+    try:
+        kalshi_y, kalshi_n, raw_pos = await _fetch_live_market_position(client, ticker)
+    except Exception as exc:
+        log.warning("[%s] reconciliation position fetch failed for %s: %s", st.series, ticker, exc)
+        return
+    if ledger_y == kalshi_y and ledger_n == kalshi_n:
+        return
+
+    raw = {
+        "source": "periodic_reconcile",
+        "ledger_yes": ledger_y,
+        "ledger_no": ledger_n,
+        "kalshi_yes": kalshi_y,
+        "kalshi_no": kalshi_n,
+        "raw_position": raw_pos,
+    }
+    _ledger.record_reconcile_mismatch(ticker=ticker, series=st.series, ts=_utc_now_iso(), raw=raw)
+    st.session_halted = True
+    await _cancel_both_quotes(client, st, ts, poll_live_orders=False)
+    msg = (
+        f"MM reconciliation mismatch [{st.series}] {ticker}: "
+        f"ledger YES={ledger_y} NO={ledger_n}; Kalshi YES={kalshi_y} NO={kalshi_n}. Quoting halted."
+    )
+    log.error(msg)
+    _tg_alert(msg)
+
+
 async def _seed_live_inventory_from_portfolio(
     client: _SimpleClient,
     st: MMState,
@@ -968,24 +1469,38 @@ async def _seed_live_inventory_from_portfolio(
     if PAPER_MODE:
         return
     yes_count, no_count, pos = await _fetch_live_market_position(client, ticker)
-    st.yes_prices.clear()
-    st.no_prices.clear()
-    yes_seed = float(yes_mark_cents or 0.0)
-    no_seed = float(no_mark_cents or 0.0)
-    st.yes_prices.extend([yes_seed] * yes_count)
-    st.no_prices.extend([no_seed] * no_count)
+    ledger_y = _ledger.open_qty(ticker=ticker, side="YES")
+    ledger_n = _ledger.open_qty(ticker=ticker, side="NO")
     st.live_y_fill_tracked = yes_count
     st.live_n_fill_tracked = no_count
     _sync_unpaired_yes_timer(st)
+    if yes_count != ledger_y or no_count != ledger_n:
+        _ledger.record_reconcile_mismatch(
+            ticker=ticker,
+            series=st.series,
+            ts=_utc_now_iso(),
+            raw={
+                "source": "session_start",
+                "ledger_yes": ledger_y,
+                "ledger_no": ledger_n,
+                "kalshi_yes": yes_count,
+                "kalshi_no": no_count,
+                "raw_position": pos,
+                "yes_mark_cents": yes_mark_cents,
+                "no_mark_cents": no_mark_cents,
+            },
+        )
+        raise RuntimeError(
+            f"ledger/Kalshi position mismatch for {ticker}: "
+            f"ledger YES={ledger_y} NO={ledger_n}; Kalshi YES={yes_count} NO={no_count}"
+        )
     log.warning(
-        "[%s] LIVE inventory seeded from Kalshi portfolio ticker=%s YES=%d NO=%d "
-        "(mark yes=%.1f¢ no=%.1f¢ raw_position=%r)",
+        "[%s] LIVE inventory verified from ledger+Kalshi ticker=%s YES=%d NO=%d "
+        "(raw_position=%r)",
         st.series,
         ticker,
         yes_count,
         no_count,
-        yes_seed,
-        no_seed,
         pos.get("position_fp") if pos else 0,
     )
 
@@ -1103,219 +1618,85 @@ async def _flatten_all(
     ts: str,
 ) -> None:
     """
-    Session close: FIFO-match YES/NO contracts (inventory model).
-
-    **Paper:** P&L from qualifying YES+NO pairs.
-    **Live:** After portfolio GETs, prefer **Kalshi balance Δ** (session start → now)
-    for realized P&L, logging, Telegram, daily ledger, and JSONL.
+    Session close/rotation no longer realizes or clears inventory.
+    Open PositionLots stay in the append-only ledger until a manual close fill
+    or settlement event confirms realized P&L.
     """
-    paired_qualifying: list[tuple[float, float]] = []
-    discarded_arb_pairs = 0
-    pnl_pairs = 0.0
+    close_iso = _utc_now_iso()
+    intent = DEFAULT_CLOSE_INTENT if reason == "HARD_CLOSE" else "LET_SETTLE"
+    if st.ticker:
+        _ledger.record_close_intent(
+            ticker=st.ticker,
+            series=st.series,
+            intent=intent,
+            ts=close_iso,
+        )
+        if PAPER_MODE and reason == "HARD_CLOSE" and intent == "FORCE_CLOSE":
+            yes_qty = _ledger.open_qty(ticker=st.ticker, side="YES")
+            no_qty = _ledger.open_qty(ticker=st.ticker, side="NO")
+            pnl = 0.0
+            if yes_qty:
+                pnl += _ledger.record_manual_close(
+                    ticker=st.ticker,
+                    series=st.series,
+                    side="YES",
+                    qty=yes_qty,
+                    exit_price_cents=_yes_bid,
+                    order_id="PAPER_FORCE_CLOSE",
+                    ts=close_iso,
+                )
+            if no_qty:
+                pnl += _ledger.record_manual_close(
+                    ticker=st.ticker,
+                    series=st.series,
+                    side="NO",
+                    qty=no_qty,
+                    exit_price_cents=_no_bid,
+                    order_id="PAPER_FORCE_CLOSE",
+                    ts=close_iso,
+                )
+            log.info("[%s] PAPER FORCE_CLOSE %s ledger_pnl=$%+.4f", st.series, st.ticker, pnl)
 
-    while st.yes_prices and st.no_prices:
-        yc = st.yes_prices.popleft()
-        nc = st.no_prices.popleft()
-        pair_sum = yc + nc
-        if (
-            MIN_PAIRED_YES_NO_COST_CENTS <= pair_sum <= MAX_PAIRED_YES_NO_COST_CENTS
-        ):
-            paired_qualifying.append((yc, nc))
-            pnl_pairs += _pair_pnl_usd(yc, nc)
-        else:
-            discarded_arb_pairs += 1
-
-    orphan_y = 0
-    while st.yes_prices:
-        st.yes_prices.popleft()
-        orphan_y += 1
-
-    orphan_n = 0
-    while st.no_prices:
-        st.no_prices.popleft()
-        orphan_n += 1
-
-    live_snap: Optional[dict[str, Any]] = None
-    live_balance_end: Optional[int] = None
-    live_pv_end: Optional[int] = None
-    live_pnl_usd: Optional[float] = None
-
-    if (
-        not PAPER_MODE
-        and client is not None
-        and client._private_key
-        and reason in ("HARD_CLOSE", "SESSION_ROTATION")
-    ):
+    live_diag = ""
+    if not PAPER_MODE and client is not None and client._private_key:
         try:
             live_snap = await _fetch_live_session_pnl(client)
-            live_balance_end = live_snap.get("balance_cents")
-            live_pv_end = live_snap.get("portfolio_value_cents")
-            if (
-                live_balance_end is not None
-                and st.session_live_balance_start_cents is not None
-            ):
-                live_pnl_usd = (live_balance_end - st.session_live_balance_start_cents) / 100.0
-                log.info(
-                    "[%s] %s kalshi_balance Δ¢ %s→%s realized=$%+.4f | nonzero_pos=%s | %s",
-                    st.series,
-                    reason,
-                    st.session_live_balance_start_cents,
-                    live_balance_end,
-                    live_pnl_usd,
-                    live_snap.get("positions_nonzero"),
-                    str(live_snap.get("positions_hint"))[:200],
-                )
-            elif live_snap:
-                log.warning(
-                    "[%s] %s live balance Δ unavailable (start=%r end=%r) — pair P&L fallback",
-                    st.series,
-                    reason,
-                    st.session_live_balance_start_cents,
-                    live_balance_end,
-                )
+            live_diag = (
+                f"\nKalshi diagnostic balance={live_snap.get('balance_cents')}¢ "
+                f"portfolio_value={live_snap.get('portfolio_value_cents')}¢ "
+                f"positions={live_snap.get('positions_nonzero')}"
+            )
         except Exception as exc:
-            log.warning(
-                "[%s] %s portfolio/balance fetch failed: %s — pair P&L fallback",
-                st.series,
-                reason,
-                exc,
-            )
+            live_diag = f"\nKalshi diagnostic unavailable: {exc}"
 
-    close_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    live_balance_delta_already_recorded = (
-        not PAPER_MODE
-        and live_pnl_usd is not None
-        and close_iso[:10] in _balance_delta_recorded
-    )
-    realized_usd = pnl_pairs
-    if not PAPER_MODE and live_pnl_usd is not None:
-        realized_usd = 0.0 if live_balance_delta_already_recorded else live_pnl_usd
-
-    if reason == "HARD_CLOSE":
-        if PAPER_MODE:
-            _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
-        elif live_pnl_usd is not None:
-            _append_mm_trades_balance_close(
-                st.series,
-                st.ticker,
-                paired_qualifying,
-                close_iso,
-                reason,
-                live_pnl_usd,
-                st.session_live_balance_start_cents,
-                live_balance_end,
-                live_pv_end,
-            )
-        else:
-            _append_mm_trades_hard_close(st.series, paired_qualifying, close_iso)
-    elif reason == "SESSION_ROTATION" and not PAPER_MODE and live_pnl_usd is not None:
-        _append_mm_trades_balance_close(
-            st.series,
-            st.ticker,
-            paired_qualifying,
-            close_iso,
-            reason,
-            live_pnl_usd,
-            st.session_live_balance_start_cents,
-            live_balance_end,
-            live_pv_end,
-        )
-
-    total_move = (
-        paired_qualifying or discarded_arb_pairs or orphan_y or orphan_n
-        or live_pnl_usd is not None
-    )
+    summary = _ledger.summary(series=st.series, ticker=st.ticker or None)
     log.info(
-        "[%s] %s %s | qualifying_pairs=%d discarded_arb_pairs=%d "
-        "orphan_YES=%d orphan_NO=%d | pair_model=$%+.4f | realized=$%+.4f%s",
+        "[%s] %s %s | close_intent=%s | ledger open YES=%d NO=%d lots=%d "
+        "realized=$%+.4f exposure=$%.4f",
         st.series,
         ts,
         reason,
-        len(paired_qualifying),
-        discarded_arb_pairs,
-        orphan_y,
-        orphan_n,
-        pnl_pairs,
-        realized_usd,
-        (" (kalshi_balance)" if (not PAPER_MODE and live_pnl_usd is not None) else ""),
+        intent,
+        summary["open_yes"],
+        summary["open_no"],
+        summary["open_lots"],
+        summary["realized_pnl"],
+        summary["open_exposure_usd"],
     )
-
-    lines = []
-    for i, (yc, nc) in enumerate(paired_qualifying, 1):
-        pu = _pair_pnl_usd(yc, nc)
-        lines.append(f"  {i}) YES@{yc:.0f}¢ + NO@{nc:.0f}¢ (${pu:+.4f})")
-    discard_line = (
-        (
-            f"discarded paired (YES+NO not in {MIN_PAIRED_YES_NO_COST_CENTS}–"
-            f"{MAX_PAIRED_YES_NO_COST_CENTS}¢): "
-            f"{discarded_arb_pairs} ($0 P&L)\n"
-        )
-        if discarded_arb_pairs
-        else ""
-    )
-    kalshi_blk = ""
-    if (
-        not PAPER_MODE
-        and live_snap
-        and (
-            live_balance_end is not None
-            or live_snap.get("portfolio_value_cents") is not None
-        )
-    ):
-        ks = live_snap.get("balance_cents")
-        kalshi_blk = (
-            f"Kalshi portfolio/balance snapshot\n"
-            f"balance: {st.session_live_balance_start_cents}¢ → {ks}¢\n"
-            f"portfolio_value: {live_snap.get('portfolio_value_cents')}¢\n"
-        )
-        if live_pnl_usd is not None:
-            kalshi_blk += f"Realized Δ (balance): ${live_pnl_usd:+.4f}\n"
-        else:
-            kalshi_blk += "Realized Δ: n/a (no session balance_start snapshot)\n"
-        kalshi_blk += (
-            f"market_positions (non-zero): "
-            f"{live_snap.get('positions_nonzero', 0)}\n"
-            f"{live_snap.get('positions_hint', '')[:900]}\n"
-        )
-
-    if not PAPER_MODE and live_pnl_usd is not None:
-        pnl_footer = (
-            "internal deque pair-model (not authoritative for live): "
-            f"${pnl_pairs:+.4f}\n"
-        )
-    else:
-        pnl_footer = f"pair-model P&L: ${pnl_pairs:+.4f}\n"
-
-    cum_after = st.session_pnl + realized_usd
-
     body = (
         f"MM [{st.series}] {reason}\n"
-        + (kalshi_blk if kalshi_blk else "")
         + f"ticker {st.ticker}\n"
-        + f"realized credited: ${realized_usd:+.4f}\n"
-        + f"pairs {MIN_PAIRED_YES_NO_COST_CENTS}≤YES+NO≤{MAX_PAIRED_YES_NO_COST_CENTS}¢: "
-        + f"{len(paired_qualifying)}\n"
-        + ("\n".join(lines) if lines else "  (none — paired fills outside cost band)\n")
-        + discard_line
-        + pnl_footer
-        + f"discarded unpaired: YES×{orphan_y} NO×{orphan_n} (not in P&L)\n"
-        + f"cumulative sess (after this close): ${cum_after:+.4f}"
+        + f"close intent: {intent}\n"
+        + f"open lots: YES×{summary['open_yes']} NO×{summary['open_no']}\n"
+        + f"ledger realized: ${summary['realized_pnl']:+.4f}\n"
+        + f"open exposure: ${summary['open_exposure_usd']:.4f}"
+        + live_diag
     )
-
-    if total_move:
-        log.info("[%s] session close detail:\n%s", st.series, body.replace("\n", " | "))
-
     tg_close_reasons = ("HARD_CLOSE", "SESSION_ROTATION")
     if reason in tg_close_reasons and not st.telegram_close_sent:
-        mode_tag = "📄 PAPER" if PAPER_MODE else "🟢 LIVE"
+        mode_tag = "PAPER" if PAPER_MODE else "LIVE"
         _tg_alert(f"{mode_tag}\n{body}"[:3900])
         st.telegram_close_sent = True
-
-    if realized_usd:
-        st.session_pnl += realized_usd
-        _record_realized_pnl(realized_usd)
-        if realized_usd <= -SESSION_HALT_MIN_LOSS_USD:
-            st.session_halted = True
 
 
 async def _cancel_both_quotes(
@@ -1354,13 +1735,14 @@ async def _post_both_sides(
 
     ticker = raw.get("ticker", "") or st.ticker
     blocked = (
-        _get_today_pnl() <= -DAILY_LOSS_LIMIT_USD
+        _today_risk_pnl() <= -DAILY_LOSS_LIMIT_USD
         or st.session_halted
+        or st.series in _ledger.reconcile_halted_series
     )
     post_yes = (
         not blocked
         and not _live_yes_orders_absolutely_blocked(st)
-        and len(st.yes_prices) + ORDER_COUNT <= _max_yes_inventory()
+        and _yes_count(st) + ORDER_COUNT <= _max_yes_inventory()
         and not st.skip_yes_tight_spread
     )
     if post_yes and y_lim + no_bid > float(YES_LIMIT_PLUS_NO_BID_MAX):
@@ -1390,10 +1772,10 @@ async def _post_both_sides(
         )
         st.yes_order_id = ""
         st.posted_yes_limit = 0.0
-    elif len(st.yes_prices) >= _max_yes_inventory():
+    elif _yes_count(st) >= _max_yes_inventory():
         log.info(
             "[%s] %s SKIP YES quote — at YES cap (%d contracts)",
-            st.series, ts, len(st.yes_prices),
+            st.series, ts, _yes_count(st),
         )
         st.yes_order_id = ""
         st.posted_yes_limit = 0.0
@@ -1407,17 +1789,17 @@ async def _post_both_sides(
             st.live_n_fill_tracked = 0
     else:
         if not blocked and (
-            len(st.yes_prices) < 1
-            or len(st.no_prices) - len(st.yes_prices) >= MAX_UNPAIRED_NO_BACKLOG
+            _yes_count(st) < 1
+            or _no_count(st) - _yes_count(st) >= MAX_UNPAIRED_NO_BACKLOG
         ):
             why = (
                 "yes_inv==0"
-                if len(st.yes_prices) < 1
+                if _yes_count(st) < 1
                 else "unpaired backlog (no-yes)>=%d" % MAX_UNPAIRED_NO_BACKLOG
             )
             log.info(
                 "[%s] %s SKIP NO quote — %s (y=%d n=%d)",
-                st.series, ts, why, len(st.yes_prices), len(st.no_prices),
+                st.series, ts, why, _yes_count(st), _no_count(st),
             )
         st.no_order_id = ""
         st.posted_no_limit = 0.0
@@ -1432,6 +1814,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
     while True:
         try:
+            await _settle_open_series_lots(client, st)
             raw = await fetch_active_market(client, series)
             if raw is None:
                 if st.ticker:
@@ -1450,13 +1833,11 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             mid = (yes_bid + yes_ask) / 2.0 if (yes_bid or yes_ask) else yes_bid
             mins_left = (secs_left or 0) / 60.0
 
-            # New session — flatten at last window's mids (paper settlement)
+            # New session — record close intent; open lots remain in the ledger.
             if ticker != st.ticker and st.ticker:
                 ts0 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 await _cancel_both_quotes(client, st, ts0)
-                pyb = st.prev_yes_bid or yes_bid
-                pnb = st.prev_no_bid or no_bid
-                await _flatten_all(client, st, pyb, pnb, "SESSION_ROTATION", ts0)
+                await _flatten_all(client, st, st.prev_yes_bid or yes_bid, st.prev_no_bid or no_bid, "SESSION_ROTATION", ts0)
                 log.info("[%s] Session rotation %s → %s", series, st.ticker, ticker)
 
             if ticker != st.ticker:
@@ -1532,7 +1913,22 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                     st.live_y_fill_tracked = 0
 
             # Risk: daily circuit
-            if _get_today_pnl() <= -DAILY_LOSS_LIMIT_USD:
+            if not st.session_halted and _risk_pnl_with_open_exposure(st) <= -SESSION_HALT_MIN_LOSS_USD:
+                st.session_halted = True
+                _ledger.append(LedgerEvent(
+                    event_type="risk_halt",
+                    ts=_utc_now_iso(),
+                    ticker=st.ticker,
+                    series=st.series,
+                    pnl_dollars=_risk_pnl_with_open_exposure(st),
+                    status="halted",
+                    raw={"reason": "session_loss_limit", "limit": -SESSION_HALT_MIN_LOSS_USD},
+                ))
+                if st.yes_order_id or st.no_order_id:
+                    await _cancel_both_quotes(client, st, ts)
+                log.warning("[%s] Session loss limit — no quotes", series)
+
+            if _today_risk_pnl() <= -DAILY_LOSS_LIMIT_USD:
                 if st.yes_order_id or st.no_order_id:
                     await _cancel_both_quotes(client, st, ts)
                 log.warning("[%s] Daily loss limit — no quotes", series)
@@ -1555,21 +1951,24 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             else:
                 await _live_poll_resting_orders(client, st, ts, series)
                 await _live_market_sell_yes_inventory_if_stale(client, st, ticker, ts, series)
+                await _reconcile_ledger_with_kalshi(client, st, ticker, ts)
 
             await _cancel_resting_no_if_ineligible(client, st, ts)
 
             # 30s check: live order resting + mid drift (fills come from polled GET each loop)
             now = time.time()
             want_yes = (
-                _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
+                _today_risk_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
+                and st.series not in _ledger.reconcile_halted_series
                 and not _live_yes_orders_absolutely_blocked(st)
-                and len(st.yes_prices) + ORDER_COUNT <= _max_yes_inventory()
+                and _yes_count(st) + ORDER_COUNT <= _max_yes_inventory()
                 and not st.skip_yes_tight_spread
             )
             want_no = (
-                _get_today_pnl() > -DAILY_LOSS_LIMIT_USD
+                _today_risk_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
+                and st.series not in _ledger.reconcile_halted_series
                 and _eligible_to_post_no(st)
             )
             if now - st.last_requote_check >= REQUOTE_CHECK_INTERVAL_SEC:
@@ -1600,10 +1999,10 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 st.mid_at_post or mid,
                 f"{st.posted_yes_limit:.0f}" if st.posted_yes_limit else "—",
                 f"{st.posted_no_limit:.0f}" if st.posted_no_limit else "—",
-                len(st.yes_prices),
-                len(st.no_prices),
-                min(len(st.yes_prices), len(st.no_prices)),
-                st.session_pnl,
+                _yes_count(st),
+                _no_count(st),
+                min(_yes_count(st), _no_count(st)),
+                _series_realized_pnl(st),
                 _get_today_pnl(),
                 st.session_halted,
             )
@@ -1622,7 +2021,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
 
 async def main() -> None:
-    # assert PAPER_MODE, "Paper mode enforced for safety"  # disabled: intentional live trading
+    assert PAPER_MODE, "PAPER_MODE must stay True until ledger validation passes"
     log.info("=" * 62)
     log.info("Kalshi MARKET MAKER — PAPER MODE (quotes simulated / no live Orders unless PAPER_MODE changed)")
     log.info("Series: %s | window: last %d min | HARD_CLOSE=%ds before expiry",

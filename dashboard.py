@@ -30,6 +30,7 @@ COINBASE_LOG      = BASE / "coinbase.log"
 MM_LOG            = BASE / "market_maker.log"
 COINBASE_TRADES   = BASE / "coinbase_trades.jsonl"
 MM_TRADES         = BASE / "market_maker_trades.jsonl"
+MM_LEDGER         = BASE / "market_maker_ledger.jsonl"
 ENV_FILE          = BASE / ".env"
 
 
@@ -292,6 +293,49 @@ def _load_jsonl(path: Path) -> list[dict]:
     except Exception:
         pass
     return records
+
+
+def _compute_mm_ledger_summary() -> dict[str, Any]:
+    open_lots: dict[str, dict[str, Any]] = {}
+    realized = 0.0
+    mismatches = 0
+    last_reconcile_status = "ok"
+    for row in _load_jsonl(MM_LEDGER):
+        et = str(row.get("event_type") or "")
+        lot_ids = row.get("lot_ids") if isinstance(row.get("lot_ids"), list) else []
+        if et == "fill":
+            raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+            lot = raw.get("lot") if isinstance(raw.get("lot"), dict) else {}
+            lot_id = str((lot_ids or [row.get("lot_id") or lot.get("lot_id")])[0])
+            if lot_id:
+                open_lots[lot_id] = {
+                    "lot_id": lot_id,
+                    "ticker": str(row.get("ticker") or lot.get("ticker") or ""),
+                    "series": str(row.get("series") or lot.get("series") or ""),
+                    "side": str(row.get("side") or lot.get("side") or ""),
+                    "qty": int(float(row.get("qty") or lot.get("qty") or 0)),
+                    "entry_price_cents": float(row.get("price_cents") or lot.get("entry_price_cents") or 0),
+                }
+        elif et in ("manual_close", "settlement"):
+            realized += float(row.get("pnl_dollars") or 0)
+            for lot_id in lot_ids:
+                open_lots.pop(str(lot_id), None)
+        elif et == "reconcile_mismatch":
+            mismatches += 1
+            last_reconcile_status = "halted"
+    open_yes = sum(int(l.get("qty") or 0) for l in open_lots.values() if str(l.get("side")).upper() == "YES")
+    open_no = sum(int(l.get("qty") or 0) for l in open_lots.values() if str(l.get("side")).upper() == "NO")
+    exposure = sum(float(l.get("entry_price_cents") or 0) / 100.0 for l in open_lots.values())
+    return {
+        "open_lots": len(open_lots),
+        "open_yes": open_yes,
+        "open_no": open_no,
+        "realized_pnl": round(realized, 4),
+        "unsettled_exposure": round(exposure, 4),
+        "reconciliation_status": last_reconcile_status,
+        "reconcile_mismatches": mismatches,
+        "recent_open_lots": list(open_lots.values())[-20:],
+    }
 
 
 # ── market_maker.PAPER_MODE (shared with /api/mode) ─────────────────────────────
@@ -1132,6 +1176,7 @@ def _compute_mm_stats(mm_trades: Optional[list] = None) -> dict:
     wins = sum(1 for t in mm_today if (t.get("pnl_dollars") or t.get("pnl") or 0) > 0)
     total = len(mm_today)
     pnl = sum((t.get("pnl_dollars") or t.get("pnl") or 0) for t in mm_today)
+    ledger = _compute_mm_ledger_summary()
     last = _last_log_line(MM_LOG)
     return {
         "running":  running,
@@ -1143,6 +1188,7 @@ def _compute_mm_stats(mm_trades: Optional[list] = None) -> dict:
         "losses":   total - wins,
         "win_rate": round(wins / total * 100, 1) if total else 0,
         "pnl":      round(pnl, 4),
+        "ledger":   ledger,
     }
 
 
@@ -1202,6 +1248,7 @@ def _compute_terminal_data() -> dict:
             "dashboard_mm": {
                 "paper": bool(paper_mm),
                 "equity_pnl_title": "PAPER P&L" if paper_mm else "LIVE P&L",
+                "ledger": _compute_mm_ledger_summary(),
             },
             "streak":    _compute_streak_mm(mm_mode),
             "market_open": _probe_market_open_cached(),
@@ -1276,7 +1323,8 @@ def _get_status() -> dict:
                              "pnl": round(cb_pnl,4), "recent": cb_recent, "today": today_prefix},
         "kalshi":           {"total": total, "wins": wins, "losses": losses,
                              "win_rate": round(wins/total*100,1) if total else 0,
-                             "pnl": round(pnl,4), "recent": recent_trades},
+                             "pnl": round(pnl,4), "recent": recent_trades,
+                             "ledger": _compute_mm_ledger_summary()},
         "polymarket_trades": poly_all[-10:],
         "polymarket_logs":   poly_logs,
         "cutoff":            today_prefix,
@@ -1328,8 +1376,17 @@ def api_mode():
 @auth_required
 def api_toggle_mode():
     """
-    Flip PAPER_MODE in market_maker.py, restart market_maker.py detached.
+    Live toggles are disabled until the ledger validation gate passes.
     """
+    if _read_market_maker_paper_mode() is True:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "PAPER_MODE is locked on until ledger validation passes",
+                "mode": "PAPER",
+                "paper": True,
+            }
+        ), 400
     new_paper, err = _toggle_market_maker_paper_mode_in_file()
     if err:
         log.warning("toggle-mode: %s", err)
