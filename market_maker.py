@@ -497,7 +497,7 @@ class MarketMakerLedger:
             if ticker:
                 self.close_intents[ticker] = str(row.get("intent") or "LET_SETTLE")
             return
-        if event_type in ("reconcile_mismatch", "risk_halt"):
+        if event_type == "reconcile_mismatch":
             ev = self._event_from_row(row)
             if ev.series:
                 self.reconcile_halted_series.add(ev.series)
