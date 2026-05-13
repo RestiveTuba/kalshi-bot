@@ -789,7 +789,7 @@ def _risk_pnl_with_open_exposure(st: MMState) -> float:
 
 def _today_risk_pnl() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return _ledger.realized_pnl(date=today) - _ledger.open_exposure_usd()
+    return _ledger.realized_pnl(date=today)
 
 
 def _reset_session_state(st: MMState) -> None:
