@@ -1951,14 +1951,14 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                     st.live_y_fill_tracked = 0
 
             # Risk: daily circuit
-            if not st.session_halted and _risk_pnl_with_open_exposure(st) <= -SESSION_HALT_MIN_LOSS_USD:
+            if not st.session_halted and _series_realized_pnl(st) <= -SESSION_HALT_MIN_LOSS_USD:
                 st.session_halted = True
                 _ledger.append(LedgerEvent(
                     event_type="risk_halt",
                     ts=_utc_now_iso(),
                     ticker=st.ticker,
                     series=st.series,
-                    pnl_dollars=_risk_pnl_with_open_exposure(st),
+                    pnl_dollars=_series_realized_pnl(st),
                     status="halted",
                     raw={"reason": "session_loss_limit", "limit": -SESSION_HALT_MIN_LOSS_USD},
                 ))
