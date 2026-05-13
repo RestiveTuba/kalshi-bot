@@ -779,12 +779,9 @@ def _no_count(st: MMState, ticker: Optional[str] = None) -> int:
     return _ledger.open_qty(series=st.series, ticker=ticker, side="NO")
 
 
-def _series_realized_pnl(st: MMState) -> float:
-    return _ledger.realized_pnl(series=st.series)
-
-
-def _risk_pnl_with_open_exposure(st: MMState) -> float:
-    return _ledger.realized_pnl(series=st.series) - _ledger.open_exposure_usd(series=st.series)
+def _ticker_realized_pnl(st: MMState) -> float:
+    """Realized P&L for only the current 15-min contract, not cumulative across series."""
+    return _ledger.realized_pnl(ticker=st.ticker)
 
 
 def _today_risk_pnl() -> float:
@@ -1951,14 +1948,14 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                     st.live_y_fill_tracked = 0
 
             # Risk: daily circuit
-            if not st.session_halted and _series_realized_pnl(st) <= -SESSION_HALT_MIN_LOSS_USD:
+            if not st.session_halted and _ticker_realized_pnl(st) <= -SESSION_HALT_MIN_LOSS_USD:
                 st.session_halted = True
                 _ledger.append(LedgerEvent(
                     event_type="risk_halt",
                     ts=_utc_now_iso(),
                     ticker=st.ticker,
                     series=st.series,
-                    pnl_dollars=_series_realized_pnl(st),
+                    pnl_dollars=_ticker_realized_pnl(st),
                     status="halted",
                     raw={"reason": "session_loss_limit", "limit": -SESSION_HALT_MIN_LOSS_USD},
                 ))
@@ -2083,7 +2080,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 _yes_count(st),
                 _no_count(st),
                 min(_yes_count(st), _no_count(st)),
-                _series_realized_pnl(st),
+                _ticker_realized_pnl(st),
                 _get_today_pnl(),
                 st.session_halted,
             )
