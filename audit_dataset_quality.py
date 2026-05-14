@@ -213,10 +213,11 @@ def audit_dataset():
     if time_ranges[3]:
         print(f"  Last minute:           {time_ranges[3]:5d} snapshots")
     
-    if all(t for t in time_ranges):
-        print(f"  ✓ Snapshots span multiple time horizons (good for training)")
+    relevant_time_ranges_present = all(time_ranges[1:])
+    if relevant_time_ranges_present:
+        print(f"  ✓ Snapshots span the relevant 15m-contract horizons")
     else:
-        missing = [h for h, t in zip(["1hr+", "10min-1hr", "1-10min", "last minute"], time_ranges) if not t]
+        missing = [h for h, t in zip(["10min-1hr", "1-10min", "last minute"], time_ranges[1:]) if not t]
         print(f"  ✗ Missing time horizons: {', '.join(missing)}")
     
     # ===== AUDIT 5: Trainability decision =====
@@ -232,7 +233,7 @@ def audit_dataset():
         ) if settled_by_series else False,
         "Snapshot coverage": avg_snapshots_per_contract >= 3 if total_usable_contracts > 0 else False,
         "Feature coverage": labeled_rows > 0 and labeled_feature_nulls[1] > 0.95 * labeled_rows and labeled_feature_nulls[3] > 0.95 * labeled_rows,
-        "Time distribution": all(time_ranges),
+        "Time distribution": relevant_time_ranges_present,
     }
     
     print()
