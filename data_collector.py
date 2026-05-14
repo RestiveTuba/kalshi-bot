@@ -95,13 +95,19 @@ def fetch_coinbase_candle(symbol, timestamp_iso):
     try:
         dt = datetime.fromisoformat(timestamp_iso.replace("Z", "+00:00"))
         ts = int(dt.timestamp())
+        start = datetime.fromtimestamp(ts - 900, timezone.utc).isoformat().replace("+00:00", "Z")
+        end = datetime.fromtimestamp(ts + 900, timezone.utc).isoformat().replace("+00:00", "Z")
         url = (f"https://api.exchange.coinbase.com/products/{symbol}/candles"
-               f"?start={ts-900}&end={ts+900}&granularity=900")
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+               f"?start={start}&end={end}&granularity=900")
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": "kalshi-data-collector/1.0",
+        })
         with urllib.request.urlopen(req, timeout=10) as r:
             candles = json.loads(r.read().decode())
             if candles and isinstance(candles, list):
-                return float(candles[0][4])
+                closest = min(candles, key=lambda candle: abs(int(candle[0]) - ts))
+                return float(closest[4])
     except Exception as e:
         log.debug("Coinbase error for %s: %s", symbol, e)
     return None
