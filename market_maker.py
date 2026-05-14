@@ -2133,7 +2133,7 @@ async def main() -> None:
     log.info(
         "Inventory cap: paper YES≤%d live YES≤%d (live hard-block new YES when yes_inv≥%d) ×%s/leg | "
         "paper YES %.0f%%/poll NO %.0f%%/poll | "
-        "YES off for session if YES_lim+NO_bid>%d | NO halted when no-yes>=%d | "
+        "YES off for session if YES_lim+NO_lim>%d | NO halted when no-yes>=%d | "
         "halt session>$%.2f day>$%.2f",
         MAX_YES_INVENTORY_PAPER,
         MAX_YES_INVENTORY_LIVE,
@@ -2141,7 +2141,7 @@ async def main() -> None:
         ORDER_COUNT,
         PAPER_YES_FILL_PROBABILITY_PER_POLL * 100,
         PAPER_NO_FILL_PROBABILITY_PER_POLL * 100,
-        YES_LIMIT_PLUS_NO_BID_MAX,
+        MAX_PAIRED_YES_NO_COST_CENTS,
         MAX_UNPAIRED_NO_BACKLOG,
         SESSION_HALT_MIN_LOSS_USD,
         DAILY_LOSS_LIMIT_USD,
