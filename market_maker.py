@@ -777,11 +777,11 @@ def _record_realized_pnl(pnl: float) -> None:
 
 
 def _yes_count(st: MMState, ticker: Optional[str] = None) -> int:
-    return _ledger.open_qty(series=st.series, ticker=ticker, side="YES")
+    return _ledger.open_qty(series=st.series, ticker=ticker or st.ticker or None, side="YES")
 
 
 def _no_count(st: MMState, ticker: Optional[str] = None) -> int:
-    return _ledger.open_qty(series=st.series, ticker=ticker, side="NO")
+    return _ledger.open_qty(series=st.series, ticker=ticker or st.ticker or None, side="NO")
 
 
 def _ticker_realized_pnl(st: MMState) -> float:
