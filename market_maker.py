@@ -794,6 +794,11 @@ def _today_risk_pnl() -> float:
     return _ledger.realized_pnl(date=today)
 
 
+def _today_enabled_risk_pnl() -> float:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return sum(_ledger.realized_pnl(series=series, date=today) for series in ENABLED_SERIES)
+
+
 def _reset_session_state(st: MMState) -> None:
     st.ticker = ""
     st.prev_yes_bid = 0.0
@@ -1747,7 +1752,7 @@ async def _post_both_sides(
 
     ticker = raw.get("ticker", "") or st.ticker
     blocked = (
-        _today_risk_pnl() <= -DAILY_LOSS_LIMIT_USD
+        _today_enabled_risk_pnl() <= -DAILY_LOSS_LIMIT_USD
         or st.session_halted
         or st.series in _ledger.reconcile_halted_series
     )
@@ -1967,13 +1972,14 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                     await _cancel_both_quotes(client, st, ts)
                 log.warning("[%s] Session loss limit — no quotes", series)
 
-            if _today_risk_pnl() <= -DAILY_LOSS_LIMIT_USD:
+            today_enabled_risk = _today_enabled_risk_pnl()
+            if today_enabled_risk <= -DAILY_LOSS_LIMIT_USD:
                 if st.yes_order_id or st.no_order_id:
                     await _cancel_both_quotes(client, st, ts)
                 log.warning(
-                    "[%s] LOOP skip quoting: daily loss gate risk_pnl=$%+.4f limit=$-%.2f",
+                    "[%s] LOOP skip quoting: daily loss gate enabled_risk_pnl=$%+.4f limit=$-%.2f",
                     series,
-                    _today_risk_pnl(),
+                    today_enabled_risk,
                     DAILY_LOSS_LIMIT_USD,
                 )
                 await asyncio.sleep(POLL_INTERVAL_SEC)
@@ -2008,7 +2014,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             # 30s check: live order resting + mid drift (fills come from polled GET each loop)
             now = time.time()
             want_yes = (
-                _today_risk_pnl() > -DAILY_LOSS_LIMIT_USD
+                _today_enabled_risk_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
                 and st.series not in _ledger.reconcile_halted_series
                 and not _live_yes_orders_absolutely_blocked(st)
@@ -2016,14 +2022,14 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 and not st.skip_yes_tight_spread
             )
             want_no = (
-                _today_risk_pnl() > -DAILY_LOSS_LIMIT_USD
+                _today_enabled_risk_pnl() > -DAILY_LOSS_LIMIT_USD
                 and not st.session_halted
                 and st.series not in _ledger.reconcile_halted_series
                 and _eligible_to_post_no(st)
             )
             log.info(
                 "[%s] LOOP quote decision want_yes=%s want_no=%s halted=%s reconcile_halted=%s "
-                "skip_yes_tight_spread=%s y=%d n=%d today_risk=$%+.4f",
+                "skip_yes_tight_spread=%s y=%d n=%d enabled_risk=$%+.4f",
                 series,
                 want_yes,
                 want_no,
@@ -2032,7 +2038,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 st.skip_yes_tight_spread,
                 _yes_count(st),
                 _no_count(st),
-                _today_risk_pnl(),
+                _today_enabled_risk_pnl(),
             )
             if now - st.last_requote_check >= REQUOTE_CHECK_INTERVAL_SEC:
                 mid_drift = (
