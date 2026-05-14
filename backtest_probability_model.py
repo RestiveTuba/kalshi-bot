@@ -45,7 +45,6 @@ Success Criteria (model has edge):
 
 import sqlite3
 import json
-import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
