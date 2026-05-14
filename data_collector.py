@@ -12,6 +12,7 @@ DB_PATH = Path(__file__).resolve().parent / "kalshi_data.db"
 LOG_PATH = Path(__file__).resolve().parent / "data_collector.log"
 POLL_INTERVAL_SECS = 900
 SNAPSHOT_LOOP_SECS = 10
+MAX_NEW_SETTLED_PER_SERIES_PER_CYCLE = 20
 SERIES = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
 COINBASE_SYMBOLS = {"KXBTC15M": "BTC-USD", "KXETH15M": "ETH-USD", "KXSOL15M": "SOL-USD"}
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -445,6 +446,9 @@ def run_collection(conn):
                     new_count += 1
                     log.info("  NEW %s | %s | spot_ret=%s%%", ticker, features["settlement"],
                         f"{features['spot_return_pct']:.2f}" if features["spot_return_pct"] is not None else "N/A")
+                    if new_count >= MAX_NEW_SETTLED_PER_SERIES_PER_CYCLE:
+                        log.info("[%s] settled backfill cycle cap reached (%d)", series, new_count)
+                        break
                 time.sleep(0.1)
         except Exception as e:
             log.error("[%s] error: %s", series, e)
@@ -460,10 +464,8 @@ def run_collection(conn):
 def main():
     log.info("Data collector starting")
     conn = init_db(DB_PATH)
-    run_collection(conn)
-    print_stats(conn)
     last_snapshot_by_ticker = {}
-    next_settled_collection_at = time.time() + POLL_INTERVAL_SECS
+    next_settled_collection_at = time.time()
     while True:
         collect_active_snapshots(conn, last_snapshot_by_ticker)
         if time.time() >= next_settled_collection_at:
