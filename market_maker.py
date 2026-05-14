@@ -66,7 +66,9 @@ MAX_UNPAIRED_NO_BACKLOG = 3  # forbid NO quoting when no_inv - yes_inv >= this (
 YES_LIMIT_PLUS_NO_BID_MAX = 99
 # Paired YES+NO P&L: only when total cost in [MIN, MAX] ¢ ($1 payout); excludes overpay (sum > $1)
 MIN_PAIRED_YES_NO_COST_CENTS = 94
-MAX_PAIRED_YES_NO_COST_CENTS = 99
+MAX_PAIRED_YES_NO_COST_CENTS = float(
+    os.environ.get("MAX_PAIRED_YES_NO_COST_CENTS", "99")
+)
 
 DAILY_LOSS_LIMIT_USD       = 5.0   # test: halt quotes when cumulative day P&L <= -this
 SESSION_HALT_MIN_LOSS_USD  = 0.50  # test: halt current session after one close this bad
@@ -1770,7 +1772,7 @@ async def _post_both_sides(
         st.skip_yes_tight_spread = True
         post_yes = False
         log.info(
-            "[%s] %s SKIP YES for session — YES_lim+NO_lim=%.1f+%.1f=%.1f>%d",
+            "[%s] %s SKIP YES for session — YES_lim+NO_lim=%.1f+%.1f=%.1f>%.1f",
             st.series,
             ts,
             y_lim,
@@ -1945,7 +1947,7 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
             ):
                 st.skip_yes_tight_spread = True
                 log.info(
-                    "[%s] %s SKIP YES for session — YES_lim+NO_lim=%.1f+%.1f=%.1f>%d",
+                    "[%s] %s SKIP YES for session — YES_lim+NO_lim=%.1f+%.1f=%.1f>%.1f",
                     series,
                     ts,
                     y_lim_gate,
@@ -2133,7 +2135,7 @@ async def main() -> None:
     log.info(
         "Inventory cap: paper YES≤%d live YES≤%d (live hard-block new YES when yes_inv≥%d) ×%s/leg | "
         "paper YES %.0f%%/poll NO %.0f%%/poll | "
-        "YES off for session if YES_lim+NO_lim>%d | NO halted when no-yes>=%d | "
+        "YES off for session if YES_lim+NO_lim>%.1f | NO halted when no-yes>=%d | "
         "halt session>$%.2f day>$%.2f",
         MAX_YES_INVENTORY_PAPER,
         MAX_YES_INVENTORY_LIVE,
