@@ -841,6 +841,10 @@ def _target_no_limit(no_bid: float) -> float:
     return min(no_bid + 1.0, float(MAX_LIMIT_CENTS))
 
 
+def _paired_quote_cost_too_high(yes_limit: float, no_limit: float) -> bool:
+    return yes_limit + no_limit > float(MAX_PAIRED_YES_NO_COST_CENTS)
+
+
 def _order_filled_contracts(o: dict[str, Any]) -> int:
     """Best-effort filled count from Kalshi order object (handles _fp aliases)."""
     for k in (
@@ -1762,17 +1766,17 @@ async def _post_both_sides(
         and _yes_count(st) + ORDER_COUNT <= _max_yes_inventory()
         and not st.skip_yes_tight_spread
     )
-    if post_yes and y_lim + no_bid > float(YES_LIMIT_PLUS_NO_BID_MAX):
+    if post_yes and _paired_quote_cost_too_high(y_lim, n_lim):
         st.skip_yes_tight_spread = True
         post_yes = False
         log.info(
-            "[%s] %s SKIP YES for session — YES_lim+NO_bid=%.1f+%.1f=%.1f>%d",
+            "[%s] %s SKIP YES for session — YES_lim+NO_lim=%.1f+%.1f=%.1f>%d",
             st.series,
             ts,
             y_lim,
-            no_bid,
-            y_lim + no_bid,
-            YES_LIMIT_PLUS_NO_BID_MAX,
+            n_lim,
+            y_lim + n_lim,
+            MAX_PAIRED_YES_NO_COST_CENTS,
         )
 
     if post_yes:
@@ -1935,18 +1939,19 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
                 )
 
             y_lim_gate = _target_yes_limit(yes_bid)
+            n_lim_gate = _target_no_limit(no_bid)
             if not st.skip_yes_tight_spread and (
-                y_lim_gate + no_bid > float(YES_LIMIT_PLUS_NO_BID_MAX)
+                _paired_quote_cost_too_high(y_lim_gate, n_lim_gate)
             ):
                 st.skip_yes_tight_spread = True
                 log.info(
-                    "[%s] %s SKIP YES for session — YES_lim+NO_bid=%.1f+%.1f=%.1f>%d",
+                    "[%s] %s SKIP YES for session — YES_lim+NO_lim=%.1f+%.1f=%.1f>%d",
                     series,
                     ts,
                     y_lim_gate,
-                    no_bid,
-                    y_lim_gate + no_bid,
-                    YES_LIMIT_PLUS_NO_BID_MAX,
+                    n_lim_gate,
+                    y_lim_gate + n_lim_gate,
+                    MAX_PAIRED_YES_NO_COST_CENTS,
                 )
                 if st.yes_order_id:
                     if not PAPER_MODE and client._private_key:
