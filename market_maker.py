@@ -65,7 +65,7 @@ MAX_PAIRED_YES_NO_COST_CENTS = 99
 
 DAILY_LOSS_LIMIT_USD       = 5.0   # test: halt quotes when cumulative day P&L <= -this
 SESSION_HALT_MIN_LOSS_USD  = 0.50  # test: halt current session after one close this bad
-DEFAULT_CLOSE_INTENT       = os.environ.get("MM_CLOSE_INTENT", "LET_SETTLE").upper()
+HARD_CLOSE_INTENT          = "FORCE_CLOSE"
 
 _MAX_RETRIES  = 3
 _BASE_BACKOFF = 0.5
@@ -1626,12 +1626,11 @@ async def _flatten_all(
     ts: str,
 ) -> None:
     """
-    Session close/rotation no longer realizes or clears inventory.
-    Open PositionLots stay in the append-only ledger until a manual close fill
-    or settlement event confirms realized P&L.
+    Session rotation records intent and leaves inventory for settlement.
+    Hard close forces paper inventory out at current bid before expiry.
     """
     close_iso = _utc_now_iso()
-    intent = DEFAULT_CLOSE_INTENT if reason == "HARD_CLOSE" else "LET_SETTLE"
+    intent = HARD_CLOSE_INTENT if reason == "HARD_CLOSE" else "LET_SETTLE"
     if st.ticker:
         _ledger.record_close_intent(
             ticker=st.ticker,
