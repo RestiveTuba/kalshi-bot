@@ -76,7 +76,7 @@ def kalshi_get(endpoint, params=None):
 def fetch_settled_markets(series):
     all_m, cursor = [], None
     while True:
-        params = {"series_ticker": series, "status": "finalized", "limit": "200"}
+        params = {"series_ticker": series, "status": "settled", "limit": "200"}
         if cursor:
             params["cursor"] = cursor
         data = kalshi_get("markets", params)
