@@ -35,6 +35,11 @@ import ssl
 # Constants
 # ---------------------------------------------------------------------------
 SERIES                     = ["KXBTC15M", "KXETH15M", "KXSOL15M"]
+ENABLED_SERIES             = [
+    s.strip()
+    for s in os.environ.get("ENABLED_SERIES", ",".join(SERIES)).split(",")
+    if s.strip()
+]
 ACTIVATE_MINS_BEFORE_CLOSE = 8
 HARD_CLOSE_SECS             = 120
 PAPER_MODE                  = True  # must stay True unless you change code + accept live risk
@@ -2099,10 +2104,14 @@ async def run_series_mm(client: _SimpleClient, series: str) -> None:
 
 async def main() -> None:
     assert PAPER_MODE, "PAPER_MODE must stay True until ledger validation passes"
+    enabled = [s for s in SERIES if s in ENABLED_SERIES]
+    if not enabled:
+        raise RuntimeError("ENABLED_SERIES disabled every market-maker series")
+    disabled = [s for s in SERIES if s not in enabled]
     log.info("=" * 62)
     log.info("Kalshi MARKET MAKER — PAPER MODE (quotes simulated / no live Orders unless PAPER_MODE changed)")
-    log.info("Series: %s | window: last %d min | HARD_CLOSE=%ds before expiry",
-             ", ".join(SERIES), ACTIVATE_MINS_BEFORE_CLOSE, HARD_CLOSE_SECS)
+    log.info("Series enabled: %s | disabled: %s | window: last %d min | HARD_CLOSE=%ds before expiry",
+             ", ".join(enabled), ", ".join(disabled) or "none", ACTIVATE_MINS_BEFORE_CLOSE, HARD_CLOSE_SECS)
     log.info(
         "Quotes: YES=min(yes_bid+1,%d)c NO=min(no_bid+1,%d)c | chk=%ds | reprices if Δmid≥%.1fc",
         MAX_LIMIT_CENTS,
@@ -2127,7 +2136,7 @@ async def main() -> None:
         DAILY_LOSS_LIMIT_USD,
     )
     client = _SimpleClient()
-    tasks = [asyncio.create_task(run_series_mm(client, s)) for s in SERIES]
+    tasks = [asyncio.create_task(run_series_mm(client, s)) for s in enabled]
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
