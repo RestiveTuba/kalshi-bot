@@ -23,7 +23,7 @@ Grid sweeps:
   CORR_WINDOW_SECS    : 45, 90, 120   (proxy: signal must persist N secs before entry)
 
 The data fetch takes ~1-2 min for 500 markets; the 324 simulations run in <1 s.
-Full results are saved to grid_results.json; top 10 are printed to stdout.
+Fee-aware results are saved to grid_results_fee_aware.json; top 10 are printed to stdout.
 """
 from __future__ import annotations
 
@@ -58,6 +58,14 @@ MAX_TRADES_PER_SESSION: int  = 3
 CONTRACTS            : int   = 20      # matches live bot; P&L is per-20-contract position
 MIN_SECS_FOR_ENTRY   : float = 60.0   # grid-search optimal
 MAX_ENTRY_PRICE      : float = 98.9   # never buy ≥99¢ — only 1¢ margin left
+
+# Kalshi standard fee model for crypto contracts. The API expresses prices in
+# cents; the documented fee is ceil(0.07 * price * (100 - price) / 100) cents
+# per contract. Momentum entries buy contracts and exits sell/settle them, so
+# the default fee model charges the buy entry only.
+KALSHI_FEE_RATE      : float = 0.07
+APPLY_FEES           : bool  = True
+FEE_ON_EXIT          : bool  = False
 
 # ── Grid search parameter space ───────────────────────────────────────────
 GRID = {
@@ -221,7 +229,46 @@ class TradeResult:
     entry_ts: int         # unix seconds
     exit_ts: int          # unix seconds
     exit_reason: str      # STOP_LOSS | HARD_CLOSE | SESSION_END
-    pnl: float            # dollars (1 contract)
+    gross_pnl: float      # dollars before fees
+    fee_dollars: float    # dollars charged by Kalshi fee model
+    pnl: float            # dollars after fees
+
+
+def kalshi_fee_cents(price_cents: float, contracts: int = CONTRACTS) -> int:
+    """Return Kalshi standard fee in cents for buying `contracts` at price."""
+    if contracts <= 0:
+        return 0
+    price = max(0.0, min(100.0, float(price_cents)))
+    per_contract_cents = math.ceil(KALSHI_FEE_RATE * price * (100.0 - price) / 100.0)
+    return int(per_contract_cents * contracts)
+
+
+def _make_trade_result(
+    *,
+    ticker: str,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    entry_ts: int,
+    exit_ts: int,
+    exit_reason: str,
+) -> TradeResult:
+    gross_pnl = (exit_price - entry_price) * CONTRACTS / 100.0
+    fees_cents = 0
+    if APPLY_FEES:
+        fees_cents += kalshi_fee_cents(entry_price, CONTRACTS)
+        if FEE_ON_EXIT:
+            fees_cents += kalshi_fee_cents(exit_price, CONTRACTS)
+    fee_dollars = fees_cents / 100.0
+    return TradeResult(
+        ticker=ticker, side=side,
+        entry_price=entry_price, exit_price=exit_price,
+        entry_ts=entry_ts, exit_ts=exit_ts,
+        exit_reason=exit_reason,
+        gross_pnl=round(gross_pnl, 4),
+        fee_dollars=round(fee_dollars, 4),
+        pnl=round(gross_pnl - fee_dollars, 4),
+    )
 
 
 def _candle_to_prices(c: dict) -> tuple[float, float]:
@@ -290,12 +337,11 @@ def simulate_session(
         # ── Hard close ────────────────────────────────────────────────────
         if position_side is not None and secs_left <= HARD_CLOSE_SECS:
             exit_price = yes_bid if position_side == "YES" else no_bid
-            pnl = (exit_price - entry_price) * CONTRACTS / 100.0
-            results.append(TradeResult(
+            results.append(_make_trade_result(
                 ticker=ticker, side=position_side,
                 entry_price=entry_price, exit_price=exit_price,
                 entry_ts=entry_ts, exit_ts=candle_ts,
-                exit_reason="HARD_CLOSE", pnl=round(pnl, 4),
+                exit_reason="HARD_CLOSE",
             ))
             position_side = None
             peak_price = 0.0
@@ -310,12 +356,11 @@ def simulate_session(
                 peak_price = held
             trail_level = peak_price - trailing_stop_cents
             if held < trail_level:
-                pnl = (held - entry_price) * CONTRACTS / 100.0
-                results.append(TradeResult(
+                results.append(_make_trade_result(
                     ticker=ticker, side=position_side,
                     entry_price=entry_price, exit_price=held,
                     entry_ts=entry_ts, exit_ts=candle_ts,
-                    exit_reason="TRAIL_STOP", pnl=round(pnl, 4),
+                    exit_reason="TRAIL_STOP",
                 ))
                 position_side = None
                 peak_price = 0.0
@@ -327,12 +372,11 @@ def simulate_session(
         if stop_loss is not None and position_side is not None:
             held = yes_bid if position_side == "YES" else no_bid
             if held < stop_loss:
-                pnl = (held - entry_price) * CONTRACTS / 100.0
-                results.append(TradeResult(
+                results.append(_make_trade_result(
                     ticker=ticker, side=position_side,
                     entry_price=entry_price, exit_price=held,
                     entry_ts=entry_ts, exit_ts=candle_ts,
-                    exit_reason="STOP_LOSS", pnl=round(pnl, 4),
+                    exit_reason="STOP_LOSS",
                 ))
                 position_side = None
                 peak_price = 0.0
@@ -400,12 +444,11 @@ def simulate_session(
         yes_bid, yes_ask = _candle_to_prices(last_c)
         no_bid = 100.0 - yes_ask
         exit_price = yes_bid if position_side == "YES" else no_bid
-        pnl = (exit_price - entry_price) * CONTRACTS / 100.0
-        results.append(TradeResult(
+        results.append(_make_trade_result(
             ticker=ticker, side=position_side,
             entry_price=entry_price, exit_price=exit_price,
             entry_ts=entry_ts, exit_ts=last_ts,
-            exit_reason="SESSION_END", pnl=round(pnl, 4),
+            exit_reason="SESSION_END",
         ))
 
     return results
@@ -427,6 +470,8 @@ def compute_stats(
         return {}
 
     pnls = [t.pnl for t in all_trades]
+    gross_pnls = [t.gross_pnl for t in all_trades]
+    fees = [t.fee_dollars for t in all_trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
 
@@ -445,16 +490,23 @@ def compute_stats(
     for t in all_trades:
         r = t.exit_reason
         if r not in by_reason:
-            by_reason[r] = {"count": 0, "total_pnl": 0.0}
+            by_reason[r] = {"count": 0, "total_gross_pnl": 0.0, "total_fees": 0.0, "total_pnl": 0.0}
         by_reason[r]["count"] += 1
+        by_reason[r]["total_gross_pnl"] += t.gross_pnl
+        by_reason[r]["total_fees"] += t.fee_dollars
         by_reason[r]["total_pnl"] += t.pnl
 
     return {
+        "fee_model": "kalshi_standard_entry_fee_only",
         "total_sessions_with_trades": len(session_pnls),
         "total_trades": len(all_trades),
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": win_rate,
+        "avg_gross_pnl_per_trade": statistics.mean(gross_pnls),
+        "total_gross_pnl": sum(gross_pnls),
+        "avg_fee_per_trade": statistics.mean(fees),
+        "total_fees": sum(fees),
         "avg_pnl_per_trade": avg_pnl,
         "total_pnl": total,
         "best_trade": max(pnls),
@@ -478,15 +530,21 @@ def print_results(stats: dict, series: str, n_markets: int, n_fetched: int) -> N
     print(f"  Total trades    : {stats['total_trades']}")
     print(SEP)
     print(f"  Win rate        : {stats['win_rate']:.1%}  ({stats['wins']}W / {stats['losses']}L)")
-    print(f"  Avg P&L / trade : ${stats['avg_pnl_per_trade']:+.4f}")
-    print(f"  Total P&L       : ${stats['total_pnl']:+.4f}")
+    print(f"  Avg gross/trade : ${stats['avg_gross_pnl_per_trade']:+.4f}")
+    print(f"  Avg fee / trade : ${stats['avg_fee_per_trade']:+.4f}")
+    print(f"  Avg net / trade : ${stats['avg_pnl_per_trade']:+.4f}")
+    print(f"  Gross / Fees    : ${stats['total_gross_pnl']:+.4f} / ${stats['total_fees']:+.4f}")
+    print(f"  Total net P&L   : ${stats['total_pnl']:+.4f}")
     print(f"  Best trade      : ${stats['best_trade']:+.4f}")
     print(f"  Worst trade     : ${stats['worst_trade']:+.4f}")
     print(f"  Sharpe (annual) : {stats['sharpe_annualised']:.3f}")
     print(SEP)
     print("  By exit reason:")
     for reason, d in sorted(stats["by_exit_reason"].items()):
-        print(f"    {reason:<16} {d['count']:>4} trades   ${d['total_pnl']:+.4f}")
+        print(
+            f"    {reason:<16} {d['count']:>4} trades   "
+            f"gross=${d['total_gross_pnl']:+.4f} fees=${d['total_fees']:+.4f} net=${d['total_pnl']:+.4f}"
+        )
     print(f"{'═' * 56}\n")
 
 
@@ -504,17 +562,17 @@ def print_grid_results(
     n_fetched: int,
     series: str = "KXBTC15M",
 ) -> None:
-    W = 110
+    W = 118
     print(f"\n{'═' * W}")
-    print(f"  KXBTC15M Grid Search — {n_fetched} markets (of {n_requested} requested), 324 parameter combinations")
-    print(f"  NOTE: corr_window is a signal-persistence proxy (live uses cross-series correlation)")
+    print(f"  {series} Fee-Aware Grid Search — {n_fetched} markets (of {n_requested} requested), 324 parameter combinations")
+    print(f"  NOTE: fees use Kalshi standard entry fee only; corr_window is a signal-persistence proxy")
     print(f"{'═' * W}")
 
     hdr = (
         f"  {'#':>2}  {'entry':>5}  {'conv':>4}  {'min_s':>5}  "
         f"{'utc_block':>12}  {'corr_w':>6}  "
         f"{'trades':>6}  {'win%':>6}  "
-        f"{'avg_pnl':>8}  {'total_pnl':>10}  {'sharpe':>7}"
+        f"{'avg_net':>8}  {'fees':>8}  {'total_net':>10}  {'sharpe':>7}"
     )
     print(hdr)
     print(f"  {'─' * (W - 4)}")
@@ -534,6 +592,7 @@ def print_grid_results(
             f"{s['total_trades']:>6}  "
             f"{s['win_rate']:>5.1%}  "
             f"${s['avg_pnl_per_trade']:>+7.4f}  "
+            f"${s['total_fees']:>+7.2f}  "
             f"${s['total_pnl']:>+9.4f}  "
             f"{s['sharpe_annualised']:>7.3f}"
         )
@@ -558,7 +617,7 @@ async def run_grid_search(series: str, n_markets: int) -> None:
     """
     Phase 1: Fetch all candlestick data (once, ~1-2 min for 500 markets).
     Phase 2: Simulate all 324 parameter combinations in-memory (<1 s).
-    Phase 3: Print top 10 by Sharpe; save full results to grid_results.json.
+    Phase 3: Print top 10 by Sharpe; save full fee-aware results to grid_results_fee_aware.json.
     """
     client = KalshiClient()
     try:
@@ -640,7 +699,7 @@ async def run_grid_search(series: str, n_markets: int) -> None:
         print_grid_results(all_results[:10], n_markets, len(market_data), series)
 
         # Save full results
-        out_path = Path(__file__).parent / "grid_results.json"
+        out_path = Path(__file__).parent / "grid_results_fee_aware.json"
         serializable = []
         for r in all_results:
             p = r["params"]
@@ -648,6 +707,12 @@ async def run_grid_search(series: str, n_markets: int) -> None:
             if not s:
                 continue
             serializable.append({
+                "fee_model": {
+                    "type": "kalshi_standard_entry_fee_only",
+                    "rate": KALSHI_FEE_RATE,
+                    "contracts": CONTRACTS,
+                    "fee_on_exit": FEE_ON_EXIT,
+                },
                 "params": {
                     "entry_threshold":      p.entry_threshold,
                     "conviction_threshold": p.conviction_threshold,
