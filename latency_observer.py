@@ -304,7 +304,7 @@ def maybe_record_spot_event(
 
 
 async def fetch_active_market(client: KalshiPublicClient, series: str) -> Optional[dict[str, Any]]:
-    data = await client.get("markets", {"series_ticker": series, "limit": 100})
+    data = await client.get("markets", {"series_ticker": series, "status": "open", "limit": 100})
     markets = data.get("markets") or []
     now = datetime.now(timezone.utc)
     active = []
