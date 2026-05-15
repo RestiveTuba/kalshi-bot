@@ -86,6 +86,16 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def kalshi_fee_cents(price_cents: float, contracts: int = 1) -> int:
+    price = max(0.0, min(100.0, float(price_cents)))
+    per_contract_cents = math.ceil(0.07 * price * (100.0 - price) / 100.0)
+    return int(per_contract_cents * contracts)
+
+
+def iso_from_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 class KalshiPublicClient:
     def __init__(self) -> None:
         self.base_url = "https://api.elections.kalshi.com/trade-api/v2/"
@@ -435,6 +445,105 @@ def analyze(db_path: Path, args: argparse.Namespace) -> None:
         print(
             f"{ev['ts']} {ev['series']} {ev['direction']} {ev['move_bps']:.1f}bps "
             f"mid0={base_mid:.1f} mid_last={float(last_mid):.1f} snaps={n} reprice={r}"
+        )
+
+
+    analyze_taker_opportunities(conn)
+
+
+def analyze_taker_opportunities(conn: sqlite3.Connection) -> None:
+    """Approximate taker edge after spot events using recorded top-of-book quotes."""
+    horizons = (5, 10, 30, 60)
+
+    def snap_at(series: str, ts: float) -> Optional[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT * FROM kalshi_snapshots
+            WHERE series = ? AND ts >= ? AND mid_yes IS NOT NULL
+            ORDER BY ts LIMIT 1
+            """,
+            (series, iso_from_ts(ts)),
+        ).fetchone()
+
+    def snaps_until(series: str, start_ts: float, end_ts: float) -> list[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT * FROM kalshi_snapshots
+            WHERE series = ? AND ts >= ? AND ts <= ? AND mid_yes IS NOT NULL
+            ORDER BY ts
+            """,
+            (series, iso_from_ts(start_ts), iso_from_ts(end_ts)),
+        ).fetchall()
+
+    rows: list[dict[str, Any]] = []
+    events = conn.execute("SELECT * FROM spot_events ORDER BY ts").fetchall()
+    for ev in events:
+        ev_ts = parse_ts(ev["ts"])
+        series = ev["series"]
+        side = "YES" if ev["direction"] == "UP" else "NO"
+        entry = snap_at(series, ev_ts)
+        if not entry:
+            continue
+        entry_price = float(entry["yes_ask"] if side == "YES" else entry["no_ask"] or 0.0)
+        if entry_price <= 0:
+            continue
+        fee_cents = kalshi_fee_cents(entry_price)
+        row: dict[str, Any] = {
+            "ts": ev["ts"],
+            "series": series,
+            "direction": ev["direction"],
+            "move_bps": float(ev["move_bps"]),
+            "side": side,
+            "entry_price": entry_price,
+            "fee_cents": fee_cents,
+        }
+        for horizon in horizons:
+            snap = snap_at(series, ev_ts + horizon)
+            if snap:
+                exit_bid = float(snap["yes_bid"] if side == "YES" else snap["no_bid"] or 0.0)
+                row[f"net_{horizon}s"] = (exit_bid - entry_price) - fee_cents
+        window = snaps_until(series, ev_ts, ev_ts + 60)
+        if window:
+            best_bid = max(float(snap["yes_bid"] if side == "YES" else snap["no_bid"] or 0.0) for snap in window)
+            worst_bid = min(float(snap["yes_bid"] if side == "YES" else snap["no_bid"] or 0.0) for snap in window)
+            row["best_net_60s"] = (best_bid - entry_price) - fee_cents
+            row["worst_net_60s"] = (worst_bid - entry_price) - fee_cents
+        rows.append(row)
+
+    print("\nTaker-entry approximation:")
+    print("  Buy YES after UP events or NO after DOWN events at event ask; exit at later bid; includes one-contract entry fee.")
+    if not rows:
+        print("  No analyzable taker rows.")
+        return
+
+    for horizon in horizons:
+        vals = [row[f"net_{horizon}s"] for row in rows if f"net_{horizon}s" in row]
+        if vals:
+            print(
+                f"  h={horizon:>2}s n={len(vals):>2} "
+                f"avg={sum(vals)/len(vals):>+6.2f}c positive={sum(v > 0 for v in vals):>2}/{len(vals)}"
+            )
+    best_vals = [row["best_net_60s"] for row in rows if "best_net_60s" in row]
+    if best_vals:
+        print(
+            f"  best-within-60s n={len(best_vals):>2} "
+            f"avg={sum(best_vals)/len(best_vals):>+6.2f}c positive={sum(v > 0 for v in best_vals):>2}/{len(best_vals)}"
+        )
+
+    print("\nRecent taker rows:")
+    for row in rows[-20:]:
+        nets = " ".join(
+            "." if f"net_{h}s" not in row else f"{row[f'net_{h}s']:+.1f}c"
+            for h in horizons
+        )
+        best = row.get("best_net_60s")
+        worst = row.get("worst_net_60s")
+        print(
+            f"{row['ts']} {row['series']} {row['direction']} {row['move_bps']:.1f}bps "
+            f"buy={row['side']}@{row['entry_price']:.1f} fee={row['fee_cents']}c "
+            f"net[5,10,30,60]={nets} "
+            f"best60={'.' if best is None else f'{best:+.1f}c'} "
+            f"worst60={'.' if worst is None else f'{worst:+.1f}c'}"
         )
 
 
